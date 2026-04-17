@@ -10,6 +10,8 @@
 // `public/index.html` on top of the self-hosted single-threaded Z3 wasm.
 
 mod frontend;
+mod sysroot;
+mod vir_bridge;
 
 use std::sync::{Arc, Mutex};
 
@@ -32,37 +34,27 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = error)]
-    fn console_error(msg: &str);
+    pub(crate) fn console_error(msg: &str);
 }
 
 #[wasm_bindgen(start)]
 fn init() {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
+    sysroot::install();
 }
 
-/// Result of one query — surfaced to JS field-by-field (no JSON).
+/// Dump of the VIR-driven pipeline — surfaced to JS field-by-field (no JSON).
 #[wasm_bindgen]
-#[derive(Clone)]
 pub struct Query {
-    #[wasm_bindgen(getter_with_clone)]
-    pub label: String,
-    /// S-expression dump of the VIR krate (empty for AIR-text queries).
+    /// S-expression dump of the VIR krate.
     #[wasm_bindgen(getter_with_clone)]
     pub vir: String,
-    /// AIR — input script for AIR-text queries, pipeline-produced commands
-    /// for the VIR-driven query.
+    /// AIR commands produced by the pipeline.
     #[wasm_bindgen(getter_with_clone)]
     pub air: String,
     #[wasm_bindgen(getter_with_clone)]
     pub verdict: String,
     pub proved: bool,
-}
-
-#[wasm_bindgen]
-pub struct Output {
-    pub all_expected: bool,
-    #[wasm_bindgen(getter_with_clone)]
-    pub queries: Vec<Query>,
 }
 
 fn no_span() -> Span {
@@ -79,12 +71,6 @@ fn mk_path(segments: &[&str]) -> Path {
         krate: None,
         segments: Arc::new(segments.iter().map(|s| Arc::new(s.to_string())).collect()),
     })
-}
-
-fn krate_to_string(krate: &vir::ast::Krate) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    vir::printer::write_krate(&mut buf, krate, &COMPACT_TONODEOPTS);
-    String::from_utf8(buf).unwrap_or_default()
 }
 
 fn commands_to_string(commands: &[Command]) -> String {
@@ -214,15 +200,9 @@ fn build_lemma_krate() -> vir::ast::Krate {
     })
 }
 
-struct VirPipeline {
-    krate: vir::ast::Krate,
-    commands: Vec<Command>,
-    arch_word_bits: ArchWordBits,
-}
-
 /// Drive the lemma krate through GlobalCtx::new → simplify_krate → prune →
-/// Ctx::new → ast_to_sst_krate → poly → func_*_to_air.
-fn run_vir_pipeline() -> Result<VirPipeline, VirErr> {
+/// Ctx::new → ast_to_sst_krate → poly → func_*_to_air, then execute via air.
+fn run_vir_query() -> Result<Query, VirErr> {
     let krate_in = build_lemma_krate();
     let crate_name = Arc::new("explorer".to_string());
     let module_path = mk_path(&["root"]);
@@ -309,48 +289,27 @@ fn run_vir_pipeline() -> Result<VirPipeline, VirErr> {
     }
     ctx.fun = None;
 
-    Ok(VirPipeline {
-        krate,
-        commands,
-        arch_word_bits: ctx.arch_word_bits,
-    })
-}
-
-fn run_vir_query() -> Query {
-    let label = "VIR-driven: proof fn lemma() ensures true {}".to_string();
-    let r = match run_vir_pipeline() {
-        Ok(r) => r,
-        Err(e) => {
-            return Query {
-                label,
-                vir: String::new(),
-                air: String::new(),
-                verdict: format!("VirErr: {:?}", e.note),
-                proved: false,
-            };
-        }
-    };
-
-    let vir_dump = krate_to_string(&r.krate);
-    let air_dump = commands_to_string(&r.commands);
+    let mut vir_buf: Vec<u8> = Vec::new();
+    vir::printer::write_krate(&mut vir_buf, &krate, &COMPACT_TONODEOPTS);
+    let vir_dump = String::from_utf8(vir_buf).unwrap_or_default();
+    let air_dump = commands_to_string(&commands);
 
     // Prepend the Verus prelude before executing (not shown in the UI dump).
     let prelude = vir::context::Ctx::prelude(vir::prelude::PreludeConfig {
-        arch_word_bits: r.arch_word_bits,
+        arch_word_bits: ctx.arch_word_bits,
         solver: SmtSolver::Z3,
     });
-    let mut all = Vec::with_capacity(prelude.len() + r.commands.len());
+    let mut all = Vec::with_capacity(prelude.len() + commands.len());
     all.extend(prelude.iter().cloned());
-    all.extend(r.commands.iter().cloned());
+    all.extend(commands.iter().cloned());
 
     let (verdict, proved) = execute(&all);
-    Query {
-        label,
+    Ok(Query {
         vir: vir_dump.trim_end().to_string(),
         air: air_dump.trim_end().to_string(),
         verdict,
         proved,
-    }
+    })
 }
 
 /// Run the rustc front-end on `src` (virtual path), stop after crate-root
@@ -362,11 +321,6 @@ pub fn parse_source(src: &str) -> String {
 }
 
 #[wasm_bindgen]
-pub fn run() -> Output {
-    let vir_q = run_vir_query();
-    let all_expected = vir_q.proved;
-    Output {
-        all_expected,
-        queries: vec![vir_q],
-    }
+pub fn run() -> Query {
+    run_vir_query().unwrap_or_else(|e| panic!("VirErr: {:?}", e.note))
 }

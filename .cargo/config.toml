@@ -6,6 +6,11 @@
 [env]
 RUSTC_BOOTSTRAP = "1"
 CFG_RELEASE = "1.94.0"
+# Baked into each rmeta's header; rustc rejects rmetas whose stamp doesn't
+# match `rustc $CFG_VERSION`. Must match what stable 1.94.0 (the toolchain
+# pinned in `rust-toolchain.toml`) self-reports via `rustc --version`. Update
+# together with `rust-toolchain.toml`.
+CFG_VERSION = "1.94.0 (4a4ef493e 2026-03-02)"
 # rustc_metadata checks `env!("CFG_RELEASE_CHANNEL") == "dev"` for a diagnostic
 # hint about missing std. "stable" matches what 1.94.0 release builds use.
 CFG_RELEASE_CHANNEL = "stable"

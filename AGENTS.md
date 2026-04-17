@@ -7,3 +7,4 @@
 - Think first, then pick the real fix — even if it's two layers up.
 - No fallbacks for impossible cases. No flags or scaffolding for hypothetical futures.
 - Run `make` after changes to confirm the wasm build is green before handing off.
+- Only `wasm32-unknown-unknown` is a supported target. Don't add `#[cfg(not(target_arch = "wasm32"))]` branches, native fallbacks, or dual-target stubs — if it wouldn't run in the browser, it doesn't need to compile.

@@ -112,7 +112,7 @@ impl Point {
 }
 </textarea>
     <button id="parse-run" disabled>Parse</button>
-    <pre id="parse-out"></pre>
+    <div id="parse-out" class="query"></div>
   </section>
 
   <section id="run-section">
@@ -169,36 +169,28 @@ impl Point {
     const runQueries = () => {
       out.textContent = '';
       try {
-        log('Running AIR queries through air::context::Context…');
+        log('Running VIR → AIR pipeline through air::context::Context…');
         log('');
-        const r = run();
+        const q = run();
 
-        for (const q of r.queries) {
-          const div = block('query');
-          const h = document.createElement('h3');
-          h.textContent = q.label + ' — verdict: ' + q.verdict + (q.proved ? ' [proved]' : ' [refuted]');
-          h.className = q.proved ? 'ok' : 'bad';
-          div.appendChild(h);
-          const addBlock = (title, body) => {
-            if (!body) return;
-            const label = document.createElement('div');
-            label.className = 'muted';
-            label.textContent = title;
-            div.appendChild(label);
-            const pre = document.createElement('pre');
-            pre.textContent = body;
-            div.appendChild(pre);
-          };
-          addBlock('VIR', q.vir);
-          addBlock(q.vir ? 'Generated AIR' : 'AIR', q.air);
-        }
-
-        log('');
-        if (r.all_expected) {
-          log('all queries matched expectations', 'ok');
-        } else {
-          log('some queries did NOT match expectations', 'bad');
-        }
+        const div = block('query');
+        const h = document.createElement('h3');
+        h.textContent = 'proof fn lemma() ensures true {} — verdict: ' + q.verdict
+          + (q.proved ? ' [proved]' : ' [refuted]');
+        h.className = q.proved ? 'ok' : 'bad';
+        div.appendChild(h);
+        const addBlock = (title, body) => {
+          if (!body) return;
+          const label = document.createElement('div');
+          label.className = 'muted';
+          label.textContent = title;
+          div.appendChild(label);
+          const pre = document.createElement('pre');
+          pre.textContent = body;
+          div.appendChild(pre);
+        };
+        addBlock('VIR', q.vir);
+        addBlock('Generated AIR', q.air);
       } catch (e) {
         log('Driver crashed: ' + (e?.message ?? e), 'bad');
         console.error(e);
@@ -213,11 +205,29 @@ impl Point {
     const parseInput = document.getElementById('parse-input');
     const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
+    const addParseBlock = (title, body) => {
+      if (!body) return;
+      const label = document.createElement('div');
+      label.className = 'muted';
+      label.textContent = title;
+      parseOut.appendChild(label);
+      const pre = document.createElement('pre');
+      pre.textContent = body;
+      parseOut.appendChild(pre);
+    };
     const runParse = () => {
+      parseOut.textContent = '';
       try {
-        parseOut.textContent = parse_source(parseInput.value);
+        const text = parse_source(parseInput.value);
+        // Split on "=== NAME ===" markers; the preamble (before any marker)
+        // goes under an "output" block so panic messages aren't dropped.
+        const chunks = text.split(/^=== (\w+) ===$/m);
+        if (chunks[0].trim()) addParseBlock('output', chunks[0].trimEnd());
+        for (let i = 1; i < chunks.length; i += 2) {
+          addParseBlock(chunks[i], chunks[i + 1].trim());
+        }
       } catch (e) {
-        parseOut.textContent = 'Parse crashed: ' + (e?.message ?? e);
+        addParseBlock('error', 'Parse crashed: ' + (e?.message ?? e));
         console.error(e);
       }
     };

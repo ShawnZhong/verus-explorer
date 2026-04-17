@@ -5,11 +5,48 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use rustc_errors::emitter::HumanEmitter;
 use rustc_errors::registry::Registry;
+use rustc_errors::{AutoStream, ColorChoice};
 use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::FileName;
 use rustc_span::source_map::FileLoader;
+
+use crate::console_error;
+
+// wasm32 has panic=abort, so `catch_unwind` can't recover from rustc's
+// `abort_if_errors`. Route rustc's emitter to `console.error` so diagnostics
+// are visible *before* the abort trap fires.
+struct ConsoleWriter {
+    buf: Vec<u8>,
+}
+
+impl ConsoleWriter {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+}
+
+impl io::Write for ConsoleWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            console_error(&String::from_utf8_lossy(&self.buf));
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ConsoleWriter {
+    fn drop(&mut self) {
+        let _ = io::Write::flush(self);
+    }
+}
 
 // rustc's `SourceMap::with_inputs` eagerly calls `current_directory()` during
 // session setup, but wasm32 `std::env::current_dir()` returns Unsupported.
@@ -33,27 +70,32 @@ impl FileLoader for VirtualFileLoader {
 }
 
 /// Parse `src` via rustc_interface, force HIR lowering, and dump AST + HIR
-/// top-level items. `#![no_core]` + `#![feature(no_core)]` are injected via
-/// `-Zcrate-attr` to suppress the auto `extern crate core/std` that name
-/// resolution would otherwise try (and fail, since we ship no sysroot
-/// metadata). Bodies referencing lang items (`+`, `Sized`, generics) won't
-/// typeck under no_core, but HIR lowering itself is a syntactic transform
-/// ahead of typeck so it still runs.
+/// top-level items. `--sysroot=/virtual` pairs with the virtual sysroot
+/// callbacks installed in `lib::init` — rustc's crate locator finds
+/// `libcore.rmeta` (and friends), plus our prebuilt `libverus_builtin.rmeta`,
+/// in the embedded bundle instead of on disk. We inject `#![no_std]` so
+/// only `core` is needed from std, and prepend `extern crate verus_builtin;`
+/// so the builtin crate is linked and its `#[rustc_diagnostic_item]`
+/// registrations fire — that's what Verus keys its builtin lookups off of.
+
 pub fn parse_source(src: &str) -> String {
     let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    // `--sysroot` is mandatory on wasm32: default_sysroot() hits
-    // current_dll_path() which we stub to a dummy (see filesearch.rs patch).
     let argv: Vec<String> = [
         "--edition=2021",
         "--crate-type=lib",
         "--crate-name=v",
         "--sysroot=/virtual",
-        "-Zcrate-attr=feature(no_core)",
-        "-Zcrate-attr=no_core",
+        "--cfg=verus_keep_ghost",
+        "-Zcrate-attr=no_std",
+        "-Zcrate-attr=feature(register_tool)",
+        "-Zcrate-attr=register_tool(verus)",
+        "-Zcrate-attr=register_tool(verifier)",
     ]
     .into_iter()
     .map(String::from)
     .collect();
+
+    let src = format!("extern crate verus_builtin;\n{src}");
 
     let dump_clone = dump.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -75,7 +117,13 @@ pub fn parse_source(src: &str) -> String {
             file_loader: Some(Box::new(VirtualFileLoader)),
             locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
             lint_caps: Default::default(),
-            psess_created: None,
+            psess_created: Some(Box::new(|psess| {
+                let writer: Box<dyn io::Write + Send> = Box::new(ConsoleWriter::new());
+                let dst = AutoStream::new(writer, ColorChoice::Never);
+                let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
+                    .sm(Some(psess.clone_source_map()));
+                psess.dcx().set_emitter(Box::new(emitter));
+            })),
             hash_untracked_state: None,
             register_lints: None,
             override_queries: None,
@@ -113,6 +161,24 @@ pub fn parse_source(src: &str) -> String {
                         tcx.def_path_str(def_id)
                     )
                     .unwrap();
+                }
+                writeln!(out).unwrap();
+                writeln!(out, "=== VIR ===").unwrap();
+                match crate::vir_bridge::build_vir(compiler, tcx) {
+                    Ok(krate) => {
+                        let mut buf: Vec<u8> = Vec::new();
+                        vir::printer::write_krate(
+                            &mut buf,
+                            &krate,
+                            &vir::printer::COMPACT_TONODEOPTS,
+                        );
+                        out.push_str(&String::from_utf8_lossy(&buf));
+                    }
+                    Err(errs) => {
+                        for e in errs {
+                            writeln!(out, "  vir error: {}", e.note).unwrap();
+                        }
+                    }
                 }
             });
             *dump_clone.lock().unwrap() = out;
