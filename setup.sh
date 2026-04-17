@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euxo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")"
 
 git submodule update --init --recursive
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+source "${HOME}/.cargo/env"
+cargo install wasm-pack
 
 EMSDK_VERSION="3.1.74"
 third_party/emsdk/emsdk install "${EMSDK_VERSION}"
