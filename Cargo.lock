@@ -1893,6 +1893,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "stable_deref_trait"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
 name = "stdx"
 version = "0.0.0"
 dependencies = [
@@ -2184,6 +2190,10 @@ name = "triomphe"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd69c5aa8f924c7519d6372789a74eac5b94fb0f8fcf0d4a97eb0bfc3e785f39"
+dependencies = [
+ "serde",
+ "stable_deref_trait",
+]
 
 [[package]]
 name = "tt"
@@ -2274,11 +2284,17 @@ name = "verus-explorer"
 version = "0.1.0"
 dependencies = [
  "air",
+ "base-db",
+ "cfg",
  "hir",
+ "hir-expand",
  "ide-db",
+ "paths",
  "sise",
+ "span",
  "syntax",
- "test-fixture",
+ "triomphe",
+ "vfs",
  "vir",
  "wasm-bindgen",
 ]
