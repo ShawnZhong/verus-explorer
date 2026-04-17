@@ -13,8 +13,6 @@
 // SMT is routed through the wasm32 `SmtProcess` shim in
 // `air/src/smt_process.rs`, which calls the `Z3_*` wrappers installed by
 // `public/index.html` on top of the self-hosted single-threaded Z3 wasm.
-
-mod ra_frontend;
 mod vir_query;
 
 use std::sync::Arc;
@@ -147,30 +145,6 @@ fn run_air_text_query(label: &str, air_script: &str) -> Query {
     }
 }
 
-/// Sample Rust source used by `run_ra_query` — a placeholder for what
-/// the user will eventually type into a Monaco editor (see the roadmap).
-/// Exercised end-to-end by the release bundle every time `run()` is
-/// invoked, so the JS smoke path covers the RA front end.
-const RA_SAMPLE_SOURCE: &str = "fn add(a: i32, b: i32) -> i32 { a + b }";
-
-/// Run the RA front end on a fixed sample source and report what was
-/// lowered. Output appears as a tile in the UI alongside the AIR / VIR
-/// queries, visibly wiring the source-end of the pipeline into `run()`.
-/// HIR is not yet translated into a `vir::ast::Krate` — that is the
-/// `ra_to_vir` work described in `docs/roadmap.md`.
-fn run_ra_query() -> Query {
-    let label = "RA: source → HIR fn".to_string();
-    let hir =
-        ra_frontend::first_fn_hir(RA_SAMPLE_SOURCE).unwrap_or_else(|| "<no function>".to_string());
-    let air = format!("source:\n    {}\n\nHIR:\n    {}", RA_SAMPLE_SOURCE, hir);
-    Query {
-        label,
-        air,
-        verdict: "lowered".to_string(),
-        proved: true,
-    }
-}
-
 fn run_vir_query() -> Query {
     let label = "VIR-driven: proof fn lemma() ensures true {}".to_string();
     let r = match vir_query::run_vir_pipeline() {
@@ -203,14 +177,6 @@ fn run_vir_query() -> Query {
     }
 }
 
-/// RA-powered: lower the first `fn` in `source` into HIR and return a
-/// small summary string. Wired up as a smoke test that the
-/// rust-analyzer front end is reachable from JS end-to-end.
-#[wasm_bindgen]
-pub fn source_to_hir(source: &str) -> String {
-    ra_frontend::first_fn_hir(source).unwrap_or_else(|| "<no function>".to_string())
-}
-
 #[wasm_bindgen]
 pub fn run() -> Output {
     let mut all_expected = true;
@@ -227,7 +193,6 @@ pub fn run() -> Output {
         all_expected = false;
     }
     queries.push(vir_q);
-    queries.push(run_ra_query());
     Output {
         all_expected,
         queries,

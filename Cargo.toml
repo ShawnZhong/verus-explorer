@@ -12,18 +12,6 @@ air = { path = "third_party/verus/source/air" }
 sise = "0.6.0"
 wasm-bindgen = "0.2"
 
-# rust-analyzer front-end — path deps into the vendored submodule at
-# third_party/rust-analyzer. Only the crates actually named in `use`
-# statements are declared here; hir-def / hir-ty come in transitively.
-base-db     = { path = "third_party/rust-analyzer/crates/base-db" }
-hir         = { path = "third_party/rust-analyzer/crates/hir" }
-hir-expand  = { path = "third_party/rust-analyzer/crates/hir-expand" }
-ide-db      = { path = "third_party/rust-analyzer/crates/ide-db" }
-paths       = { path = "third_party/rust-analyzer/crates/paths" }
-span        = { path = "third_party/rust-analyzer/crates/span" }
-syntax      = { path = "third_party/rust-analyzer/crates/syntax" }
-triomphe    = "0.1"
-
 [profile.release]
 opt-level = "s"
 lto = true

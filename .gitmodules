@@ -8,6 +8,6 @@
 	path = third_party/z3
 	url = https://github.com/Z3Prover/z3.git
 	branch = z3-4.16.0
-[submodule "third_party/rust-analyzer"]
-	path = third_party/rust-analyzer
-	url = https://github.com/rust-lang/rust-analyzer
+[submodule "third_party/rust"]
+	path = third_party/rust
+	url = https://github.com/rust-lang/rust
