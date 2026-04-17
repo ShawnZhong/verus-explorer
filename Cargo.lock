@@ -2285,7 +2285,6 @@ version = "0.1.0"
 dependencies = [
  "air",
  "base-db",
- "cfg",
  "hir",
  "hir-expand",
  "ide-db",
@@ -2294,7 +2293,6 @@ dependencies = [
  "span",
  "syntax",
  "triomphe",
- "vfs",
  "vir",
  "wasm-bindgen",
 ]

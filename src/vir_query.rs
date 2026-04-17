@@ -11,7 +11,7 @@ use air::context::SmtSolver;
 use air::messages::Reporter;
 use vir::ast::{
     Arch, ArchWordBits, BodyVisibility, Constant, ExprX, FunX, Function, FunctionAttrsX,
-    FunctionKind, FunctionX, ItemKind, KrateX, Module, ModuleX, Mode, Opaqueness, Param, ParamX,
+    FunctionKind, FunctionX, ItemKind, KrateX, Mode, Module, ModuleX, Opaqueness, Param, ParamX,
     Path, PathX, SpannedTyped, TypX, VarIdent, VarIdentDisambiguate, VirErr, Visibility,
 };
 use vir::ast_util::unit_typ;
@@ -20,7 +20,12 @@ use vir::def::Spanned;
 use vir::messages::Span;
 
 fn no_span() -> Span {
-    Span { raw_span: Arc::new(()), id: 0, data: vec![], as_string: "no_span".to_string() }
+    Span {
+        raw_span: Arc::new(()),
+        id: 0,
+        data: vec![],
+        as_string: "no_span".to_string(),
+    }
 }
 
 fn mk_path(segments: &[&str]) -> Path {
@@ -53,10 +58,14 @@ fn build_lemma_function(module_path: &Path) -> Function {
     Spanned::new(
         span,
         FunctionX {
-            name: Arc::new(FunX { path: mk_path(&["root", "lemma"]) }),
+            name: Arc::new(FunX {
+                path: mk_path(&["root", "lemma"]),
+            }),
             proxy: None,
             kind: FunctionKind::Static,
-            visibility: Visibility { restricted_to: None },
+            visibility: Visibility {
+                restricted_to: None,
+            },
             body_visibility: BodyVisibility::public(),
             opaqueness: Opaqueness::Opaque,
             owning_module: Some(module_path.clone()),
@@ -86,8 +95,13 @@ fn build_lemma_function(module_path: &Path) -> Function {
 
 fn build_lemma_krate() -> vir::ast::Krate {
     let module_path = mk_path(&["root"]);
-    let module: Module =
-        Spanned::new(no_span(), ModuleX { path: module_path.clone(), reveals: None });
+    let module: Module = Spanned::new(
+        no_span(),
+        ModuleX {
+            path: module_path.clone(),
+            reveals: None,
+        },
+    );
     Arc::new(KrateX {
         functions: vec![build_lemma_function(&module_path)],
         reveal_groups: vec![],
@@ -99,7 +113,9 @@ fn build_lemma_krate() -> vir::ast::Krate {
         external_fns: vec![],
         external_types: vec![],
         path_as_rust_names: vec![],
-        arch: Arch { word_bits: ArchWordBits::Either32Or64 },
+        arch: Arch {
+            word_bits: ArchWordBits::Either32Or64,
+        },
         opaque_types: vec![],
     })
 }
@@ -123,7 +139,12 @@ pub fn run_vir_pipeline() -> Result<VirPipelineResult, VirErr> {
     let mut trace = String::new();
 
     let krate = build_lemma_krate();
-    writeln!(trace, "[1/6] built Krate with {} function(s)", krate.functions.len()).unwrap();
+    writeln!(
+        trace,
+        "[1/6] built Krate with {} function(s)",
+        krate.functions.len()
+    )
+    .unwrap();
 
     let crate_name = Arc::new("explorer".to_string());
     let mut global_ctx = GlobalCtx::new(
@@ -193,11 +214,20 @@ pub fn run_vir_pipeline() -> Result<VirPipelineResult, VirErr> {
     writeln!(trace, "[5/6] Ctx::new ok").unwrap();
 
     let reporter = Reporter {};
-    let bucket_funs = pruned_krate.functions.iter().map(|f| f.x.name.clone()).collect();
+    let bucket_funs = pruned_krate
+        .functions
+        .iter()
+        .map(|f| f.x.name.clone())
+        .collect();
     let krate_sst =
         vir::ast_to_sst_crate::ast_to_sst_krate(&mut ctx, &reporter, &bucket_funs, &pruned_krate)?;
     let krate_sst = vir::poly::poly_krate_for_module(&mut ctx, &krate_sst);
-    writeln!(trace, "[6/6] ast_to_sst + poly ok ({} fn-sst)", krate_sst.functions.len()).unwrap();
+    writeln!(
+        trace,
+        "[6/6] ast_to_sst + poly ok ({} fn-sst)",
+        krate_sst.functions.len()
+    )
+    .unwrap();
 
     // Emit AIR commands the same way verify_bucket does, but only the bits we
     // need for a single trivial proof function.
@@ -208,8 +238,16 @@ pub fn run_vir_pipeline() -> Result<VirPipelineResult, VirErr> {
             ctx.func_map.get(&f.x.name).expect("function in func_map"),
             false,
         );
-        commands.extend(vir::sst_to_air_func::func_name_to_air(&ctx, &reporter, f)?.iter().cloned());
-        commands.extend(vir::sst_to_air_func::func_decl_to_air(&mut ctx, f)?.iter().cloned());
+        commands.extend(
+            vir::sst_to_air_func::func_name_to_air(&ctx, &reporter, f)?
+                .iter()
+                .cloned(),
+        );
+        commands.extend(
+            vir::sst_to_air_func::func_decl_to_air(&mut ctx, f)?
+                .iter()
+                .cloned(),
+        );
         let (axiom_decls, _axiom_checks) =
             vir::sst_to_air_func::func_axioms_to_air(&mut ctx, f, /* public_body */ true)?;
         commands.extend(axiom_decls.iter().cloned());
@@ -225,10 +263,26 @@ pub fn run_vir_pipeline() -> Result<VirPipelineResult, VirErr> {
     }
     ctx.fun = None;
 
-    let n_decl = commands.iter().filter(|c| matches!(&***c, CommandX::Global(_))).count();
-    let n_check = commands.iter().filter(|c| matches!(&***c, CommandX::CheckValid(_))).count();
-    writeln!(trace, "AIR: {} commands ({} declarations, {} check-valid)", commands.len(), n_decl, n_check)
-        .unwrap();
+    let n_decl = commands
+        .iter()
+        .filter(|c| matches!(&***c, CommandX::Global(_)))
+        .count();
+    let n_check = commands
+        .iter()
+        .filter(|c| matches!(&***c, CommandX::CheckValid(_)))
+        .count();
+    writeln!(
+        trace,
+        "AIR: {} commands ({} declarations, {} check-valid)",
+        commands.len(),
+        n_decl,
+        n_check
+    )
+    .unwrap();
 
-    Ok(VirPipelineResult { commands, arch_word_bits: ctx.arch_word_bits, trace })
+    Ok(VirPipelineResult {
+        commands,
+        arch_word_bits: ctx.arch_word_bits,
+        trace,
+    })
 }

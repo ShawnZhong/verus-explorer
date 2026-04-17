@@ -54,7 +54,7 @@ $(Z3)/build/libz3.a:                          # step 1: build Z3 as a static lib
     emcmake cmake -S $(Z3) -B $(Z3)/build \
       -DZ3_BUILD_LIBZ3_SHARED=OFF \
       -DZ3_SINGLE_THREADED=ON \
-      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_BUILD_TYPE=MinSizeRel
 
 $(DIST)/z3.wasm: $(Z3)/build/libz3.a           # step 2: link into z3.{js,wasm}
     emcc -x c /dev/null $(Z3)/build/libz3.a \

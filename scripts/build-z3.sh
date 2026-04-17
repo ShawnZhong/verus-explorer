@@ -20,14 +20,13 @@ emcmake cmake -S third_party/z3 -B build \
   -DZ3_ENABLE_EXAMPLE_TARGETS=OFF \
   -DZ3_INCLUDE_GIT_HASH=OFF \
   -DZ3_INCLUDE_GIT_DESCRIBE=OFF \
-  -DCMAKE_C_FLAGS="-fwasm-exceptions -flto" \
-  -DCMAKE_CXX_FLAGS="-fwasm-exceptions -flto" \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_C_FLAGS="-fwasm-exceptions" \
+  -DCMAKE_CXX_FLAGS="-fwasm-exceptions" \
+  -DCMAKE_BUILD_TYPE=MinSizeRel
 cmake --build build -j"$(nproc)"
 
 emcc -x c /dev/null build/libz3.a \
     -fwasm-exceptions \
-    -flto \
     -Oz \
     -s WASM_BIGINT \
     -s ENVIRONMENT=web \

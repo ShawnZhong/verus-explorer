@@ -139,7 +139,12 @@ fn run_air_text_query(label: &str, air_script: &str) -> Query {
         .collect();
 
     let (verdict, proved) = execute(&commands);
-    Query { label: label.to_string(), air: air_script.trim().to_string(), verdict, proved }
+    Query {
+        label: label.to_string(),
+        air: air_script.trim().to_string(),
+        verdict,
+        proved,
+    }
 }
 
 /// Sample Rust source used by `run_ra_query` — a placeholder for what
@@ -149,16 +154,21 @@ fn run_air_text_query(label: &str, air_script: &str) -> Query {
 const RA_SAMPLE_SOURCE: &str = "fn add(a: i32, b: i32) -> i32 { a + b }";
 
 /// Run the RA front end on a fixed sample source and report what was
-/// inferred. Output appears as a tile in the UI alongside the AIR / VIR
+/// lowered. Output appears as a tile in the UI alongside the AIR / VIR
 /// queries, visibly wiring the source-end of the pipeline into `run()`.
-/// Inferred types are not yet translated into a `vir::ast::Krate` — that
-/// is the `ra_to_vir` work described in `docs/roadmap.md`.
+/// HIR is not yet translated into a `vir::ast::Krate` — that is the
+/// `ra_to_vir` work described in `docs/roadmap.md`.
 fn run_ra_query() -> Query {
-    let label = "RA: source → inferred tail type".to_string();
-    let inferred = ra_frontend::infer_first_fn_tail(RA_SAMPLE_SOURCE)
-        .unwrap_or_else(|| "<no tail expr>".to_string());
-    let air = format!("source:\n    {}\n\ntail expr type: {}", RA_SAMPLE_SOURCE, inferred);
-    Query { label, air, verdict: "inferred".to_string(), proved: true }
+    let label = "RA: source → HIR fn".to_string();
+    let hir =
+        ra_frontend::first_fn_hir(RA_SAMPLE_SOURCE).unwrap_or_else(|| "<no function>".to_string());
+    let air = format!("source:\n    {}\n\nHIR:\n    {}", RA_SAMPLE_SOURCE, hir);
+    Query {
+        label,
+        air,
+        verdict: "lowered".to_string(),
+        proved: true,
+    }
 }
 
 fn run_vir_query() -> Query {
@@ -185,16 +195,20 @@ fn run_vir_query() -> Query {
     all.extend(r.commands.iter().cloned());
 
     let (verdict, proved) = execute(&all);
-    Query { label, air: r.trace.trim_end().to_string(), verdict, proved }
+    Query {
+        label,
+        air: r.trace.trim_end().to_string(),
+        verdict,
+        proved,
+    }
 }
 
-/// RA-powered: infer the type of the tail expression of the first `fn`
-/// in `source`. Returns the displayed type or a placeholder string if
-/// no tail expression was found. Wired up as a smoke test that the
+/// RA-powered: lower the first `fn` in `source` into HIR and return a
+/// small summary string. Wired up as a smoke test that the
 /// rust-analyzer front end is reachable from JS end-to-end.
 #[wasm_bindgen]
-pub fn infer_rust_tail_type(source: &str) -> String {
-    ra_frontend::infer_first_fn_tail(source).unwrap_or_else(|| "<no tail expr>".to_string())
+pub fn source_to_hir(source: &str) -> String {
+    ra_frontend::first_fn_hir(source).unwrap_or_else(|| "<no function>".to_string())
 }
 
 #[wasm_bindgen]
@@ -214,5 +228,8 @@ pub fn run() -> Output {
     }
     queries.push(vir_q);
     queries.push(run_ra_query());
-    Output { all_expected, queries }
+    Output {
+        all_expected,
+        queries,
+    }
 }
