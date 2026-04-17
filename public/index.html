@@ -65,6 +65,23 @@
       margin: .3em 0;
       font-size: .85em;
     }
+
+    textarea {
+      width: 100%;
+      min-height: 10em;
+      font: inherit;
+      padding: .5em;
+      box-sizing: border-box;
+    }
+
+    section {
+      margin-top: 2rem;
+    }
+
+    section h2 {
+      font-size: 1rem;
+      margin: 0 0 .4em;
+    }
   </style>
 </head>
 
@@ -81,11 +98,26 @@
   <button id="run" disabled>Loading…</button>
   <pre id="out">Initializing Z3 and wasm…</pre>
 
+  <section id="lex-section">
+    <h2>rustc_lexer (vendored, wasm32)</h2>
+    <p class="muted">Tokens produced by <code>rustc_lexer::tokenize</code> running in
+      the browser — same crate rustc uses. First rustc-internal crate pulled in
+      from <code>third_party/rust/compiler/</code>.</p>
+    <textarea id="lex-input" spellcheck="false">fn main() {
+    // hello
+    let x: i32 = 0x2a;
+    println!("ans={}", x + 1);
+}
+</textarea>
+    <button id="lex-run" disabled>Lex</button>
+    <pre id="lex-out"></pre>
+  </section>
+
   <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config). -->
   <script src="./z3.js"></script>
 
   <script type="module">
-    import init, { run } from './verus_explorer.js';
+    import init, { run, lex_source } from './verus_explorer.js';
 
     const out = document.getElementById('out');
     const button = document.getElementById('run');
@@ -123,11 +155,7 @@
 
     await init();
 
-    out.textContent = 'Ready.';
-    button.disabled = false;
-    button.textContent = 'Run';
-
-    button.addEventListener('click', () => {
+    const runQueries = () => {
       out.textContent = '';
       try {
         log('Running AIR queries through air::context::Context…');
@@ -140,9 +168,18 @@
           h.textContent = q.label + ' — verdict: ' + q.verdict + (q.proved ? ' [proved]' : ' [refuted]');
           h.className = q.proved ? 'ok' : 'bad';
           div.appendChild(h);
-          const pre = document.createElement('pre');
-          pre.textContent = q.air;
-          div.appendChild(pre);
+          const addBlock = (title, body) => {
+            if (!body) return;
+            const label = document.createElement('div');
+            label.className = 'muted';
+            label.textContent = title;
+            div.appendChild(label);
+            const pre = document.createElement('pre');
+            pre.textContent = body;
+            div.appendChild(pre);
+          };
+          addBlock('VIR', q.vir);
+          addBlock(q.vir ? 'Generated AIR' : 'AIR', q.air);
         }
 
         log('');
@@ -156,7 +193,27 @@
         log('Driver crashed: ' + (e?.message ?? e), 'bad');
         console.error(e);
       }
-    });
+    };
+
+    button.disabled = false;
+    button.textContent = 'Run again';
+    button.addEventListener('click', runQueries);
+    runQueries();
+
+    const lexInput = document.getElementById('lex-input');
+    const lexOut = document.getElementById('lex-out');
+    const lexButton = document.getElementById('lex-run');
+    const runLex = () => {
+      try {
+        lexOut.textContent = lex_source(lexInput.value);
+      } catch (e) {
+        lexOut.textContent = 'Lex crashed: ' + (e?.message ?? e);
+        console.error(e);
+      }
+    };
+    lexButton.disabled = false;
+    lexButton.addEventListener('click', runLex);
+    runLex();
   </script>
 
 </body>

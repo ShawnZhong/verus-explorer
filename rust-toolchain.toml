@@ -1,3 +1,6 @@
 [toolchain]
+# Matches Verus's pin and the third_party/rust submodule's 1.94.0 tag, so the
+# whole tree builds with one toolchain. RUSTC_BOOTSTRAP=1 (in .cargo/config.toml)
+# unlocks the `#![feature(...)]` gates in the vendored rustc_* crates.
 channel = "1.94.0"
 targets = ["wasm32-unknown-unknown"]

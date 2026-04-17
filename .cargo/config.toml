@@ -1,0 +1,5 @@
+# Unlocks `#![feature(...)]` on stable — required because the vendored
+# `third_party/rust/compiler/rustc_*` crates use unstable feature gates, while
+# rust-toolchain.toml pins stable 1.94.0 for Verus.
+[env]
+RUSTC_BOOTSTRAP = "1"

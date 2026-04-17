@@ -844,6 +844,74 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rustc-stable-hash"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
+
+[[package]]
+name = "rustc_arena"
+version = "0.0.0"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "rustc_hashes"
+version = "0.0.0"
+dependencies = [
+ "rustc-stable-hash",
+]
+
+[[package]]
+name = "rustc_index"
+version = "0.0.0"
+dependencies = [
+ "rustc_index_macros",
+ "rustc_macros",
+ "rustc_serialize",
+ "smallvec",
+]
+
+[[package]]
+name = "rustc_index_macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "rustc_lexer"
+version = "0.0.0"
+dependencies = [
+ "memchr",
+ "unicode-ident",
+ "unicode-properties",
+]
+
+[[package]]
+name = "rustc_macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "synstructure",
+]
+
+[[package]]
+name = "rustc_serialize"
+version = "0.0.0"
+dependencies = [
+ "indexmap 2.14.0",
+ "rustc_hashes",
+ "smallvec",
+ "thin-vec",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1056,6 +1124,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "thin-vec"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "259cdf8ed4e4aca6f1e9d011e10bd53f524a2d0637d7b28450f6c64ac298c4c6"
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1098,6 +1172,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-properties"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
 name = "unicode-width"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1132,6 +1212,9 @@ name = "verus-explorer"
 version = "0.1.0"
 dependencies = [
  "air",
+ "rustc_arena",
+ "rustc_index",
+ "rustc_lexer",
  "sise",
  "vir",
  "wasm-bindgen",

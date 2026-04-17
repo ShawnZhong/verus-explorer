@@ -1,9 +1,11 @@
 [submodule "third_party/verus"]
 	path = third_party/verus
 	url = https://github.com/ShawnZhong/verus.git
+	branch = main
 [submodule "third_party/emsdk"]
 	path = third_party/emsdk
 	url = https://github.com/emscripten-core/emsdk.git
+	branch = 5.0.6
 [submodule "third_party/z3"]
 	path = third_party/z3
 	url = https://github.com/Z3Prover/z3.git
@@ -11,3 +13,4 @@
 [submodule "third_party/rust"]
 	path = third_party/rust
 	url = https://github.com/rust-lang/rust
+	branch = 1.94.0
