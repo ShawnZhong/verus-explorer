@@ -20,4 +20,16 @@ echo "--- installing+activating emsdk ${EMSDK_VERSION}"
 "${EMSDK_DIR}/emsdk" install "${EMSDK_VERSION}"
 "${EMSDK_DIR}/emsdk" activate "${EMSDK_VERSION}"
 
+# dist/ is a git worktree on gh-pages — builds write straight into the tree
+# we push to Pages. Idempotent: skip if dist/ is already a valid worktree.
+if [[ ! -e "${PROJ_ROOT}/dist/.git" ]]; then
+  echo "--- creating dist/ as a gh-pages worktree"
+  git -C "${PROJ_ROOT}" worktree prune
+  if git -C "${PROJ_ROOT}" fetch origin gh-pages 2>/dev/null; then
+    git -C "${PROJ_ROOT}" worktree add -B gh-pages dist origin/gh-pages
+  else
+    git -C "${PROJ_ROOT}" worktree add --orphan -b gh-pages dist
+  fi
+fi
+
 echo "--- setup done"
