@@ -12,6 +12,16 @@ air = { path = "third_party/verus/source/air" }
 sise = "0.6.0"
 wasm-bindgen = "0.2"
 
+# rust-analyzer front-end — path deps into the vendored submodule at
+# third_party/rust-analyzer. Only the crates actually named in `use`
+# statements are declared here; base-db / hir-def / hir-ty / vfs / span
+# come in transitively through these. test-fixture gives us a single-file
+# RootDatabase setup without needing a full cargo workspace on disk.
+hir          = { path = "third_party/rust-analyzer/crates/hir" }
+ide-db       = { path = "third_party/rust-analyzer/crates/ide-db" }
+syntax       = { path = "third_party/rust-analyzer/crates/syntax" }
+test-fixture = { path = "third_party/rust-analyzer/crates/test-fixture" }
+
 [profile.release]
 opt-level = "s"
 lto = true

@@ -12,31 +12,28 @@
 DIST  := dist
 BUILD := build
 
-dev: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
-	wasm-pack build --dev --target web --out-dir $(DIST)/pkg
+dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
+	wasm-pack build --$@ --target web --out-dir $(DIST) --no-typescript
+	rm -f $(DIST)/package.json $(DIST)/.gitignore
 
-release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
-	wasm-pack build --release --target web --out-dir $(DIST)/pkg
-
-$(DIST)/z3.js $(DIST)/z3.wasm &: scripts/build-z3.sh | $(DIST)
-	./scripts/build-z3.sh
-	cp $(BUILD)/z3.js $(BUILD)/z3.wasm $(DIST)
+$(DIST)/z3.%: $(BUILD)/z3.% | $(DIST)
+	cp $< $@
 $(DIST)/index.html: public/index.html | $(DIST)
 	cp $< $@
 
 $(DIST):
 	git worktree add --orphan -b gh-pages $(DIST)
 
+$(BUILD)/z3.js $(BUILD)/z3.wasm &: scripts/build-z3.sh
+	./scripts/build-z3.sh
+
 serve:
 	python3 -m http.server --directory $(DIST) 8000
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
-# and force-pushes, so there's no history either locally or remotely. wasm-pack
-# drops an ignore-everything .gitignore in pkg/ on each build; remove it so
-# the built artefacts actually stage.
+# and force-pushes, so there's no history either locally or remotely.
 deploy: release
 	cd $(DIST) && \
-	rm -f pkg/.gitignore && \
 	git checkout --orphan _deploy && \
 	git add -A && \
 	git commit -m "deploy $$(git -C .. rev-parse --short HEAD)" && \

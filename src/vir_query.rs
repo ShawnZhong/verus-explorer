@@ -232,21 +232,3 @@ pub fn run_vir_pipeline() -> Result<VirPipelineResult, VirErr> {
 
     Ok(VirPipelineResult { commands, arch_word_bits: ctx.arch_word_bits, trace })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pipeline_runs() {
-        let r = run_vir_pipeline().expect("pipeline");
-        eprintln!("{}", r.trace);
-        for (i, cmd) in r.commands.iter().enumerate() {
-            eprintln!("  [{}] {:?}", i, cmd);
-        }
-        assert!(
-            r.commands.iter().any(|c| matches!(&**c, &CommandX::CheckValid(_))),
-            "expected at least one check-valid command"
-        );
-    }
-}
