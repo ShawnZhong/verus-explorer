@@ -29,6 +29,7 @@ emcc -x c /dev/null build/libz3.a \
     -fwasm-exceptions \
     -flto \
     -Oz \
+    -s WASM_BIGINT \
     -s ENVIRONMENT=web \
     -s MODULARIZE=1 \
     -s EXPORT_NAME=initZ3 \
