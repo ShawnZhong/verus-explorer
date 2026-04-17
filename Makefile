@@ -4,10 +4,9 @@
 #   make          # dev build into dist/ (fast, skips wasm-opt)
 #   make release  # optimized build into dist/
 #   make serve    # dev build + serve dist/ on :8000
-#   make package  # release build + tar dist/ into verus-explorer.tar.gz
 #   make clean    # remove build artifacts (keeps third_party/)
 
-.PHONY: dev release package serve clean
+.PHONY: dev release serve clean
 
 # emsdk_env.sh determines its own location via $BASH_SOURCE, so this Makefile
 # requires bash, not POSIX sh.
@@ -26,9 +25,6 @@ dev: $(DIST)/index.html $(DIST)/z3.wasm
 
 release: $(DIST)/index.html $(DIST)/z3.wasm
 	wasm-pack build --release --target web --out-dir $(DIST)/pkg
-
-package: release
-	tar --dereference -C $(DIST) -czf verus-explorer.tar.gz .
 
 serve: dev
 	python3 -m http.server --directory $(DIST) 8000
@@ -74,4 +70,4 @@ $(DIST):
 	mkdir -p $@
 
 clean:
-	rm -rf target $(DIST) verus-explorer.tar.gz
+	rm -rf target $(DIST)
