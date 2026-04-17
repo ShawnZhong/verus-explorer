@@ -1,0 +1,201 @@
+diff --git a/source/Cargo.lock b/source/Cargo.lock
+index e8100171..db16a6a8 100644
+--- a/source/Cargo.lock
++++ b/source/Cargo.lock
+@@ -50,6 +50,7 @@ dependencies = [
+  "serde",
+  "sise",
+  "smt-scope",
++ "wasm-bindgen",
+  "win32job",
+  "yansi",
+ ]
+diff --git a/source/air/Cargo.toml b/source/air/Cargo.toml
+index 4a1bebd3..e2d34392 100644
+--- a/source/air/Cargo.toml
++++ b/source/air/Cargo.toml
+@@ -18,6 +18,11 @@ yansi = "0.5"
+ [target.'cfg(windows)'.dependencies]
+ win32job = "1"
+ 
++# wasm32 has no subprocesses; the wasm SmtProcess shim calls a JS-side Z3 via
++# wasm-bindgen. Native builds do not pull this in.
++[target.'cfg(target_arch = "wasm32")'.dependencies]
++wasm-bindgen = "0.2"
++
+ [features]
+ singular = []
+ 
+diff --git a/source/air/src/smt_process.rs b/source/air/src/smt_process.rs
+index 7e7f2bb9..dd4baca3 100644
+--- a/source/air/src/smt_process.rs
++++ b/source/air/src/smt_process.rs
+@@ -1,4 +1,15 @@
+ use crate::context::SmtSolver;
++
++#[cfg(not(target_arch = "wasm32"))]
++pub use native::{CommandsHandle, SmtProcess};
++
++#[cfg(target_arch = "wasm32")]
++pub use wasm::{CommandsHandle, SmtProcess};
++
++#[cfg(not(target_arch = "wasm32"))]
++mod native {
++
++use super::SmtSolver;
+ use std::io::{BufRead, BufReader, Write};
+ use std::process::{Child, ChildStdin, ChildStdout};
+ use std::sync::mpsc::{Receiver, Sender, channel};
+@@ -240,3 +251,94 @@ impl Drop for SmtProcess {
+         }
+     }
+ }
++
++} // mod native
++
++#[cfg(target_arch = "wasm32")]
++mod wasm {
++    // wasm32 has no subprocesses or threads — Z3 is provided by the host (JS),
++    // which async-loads the Emscripten module and stashes it at globalThis.Z3.
++    // The bindings below are 1:1 wrappers over the Z3 C API, reached via
++    // ccall on the stashed module. Each SmtProcess owns a Z3_context, created
++    // in launch() and freed in Drop — symmetric to native, where launch()
++    // spawns a z3 subprocess.
++
++    use super::SmtSolver;
++    use std::io::Write;
++
++    // The host page (e.g. explorer/public/index.html) is responsible for
++    // defining these on globalThis as ccall wrappers over the emscripten
++    // Z3 module. They're declared as plain JS functions so wasm-bindgen can
++    // marshal Rust <-> JS types; the emscripten-side marshalling lives in
++    // the ccall calls on the JS side.
++    #[wasm_bindgen::prelude::wasm_bindgen]
++    #[allow(non_snake_case)]
++    extern "C" {
++        fn Z3_mk_config() -> u32;
++        fn Z3_mk_context(cfg: u32) -> u32;
++        fn Z3_del_config(cfg: u32);
++        fn Z3_eval_smtlib2_string(ctx: u32, script: &str) -> String;
++        fn Z3_del_context(ctx: u32);
++    }
++
++    pub struct SmtProcess {
++        z3_ctx: u32,
++    }
++
++    impl SmtProcess {
++        pub fn launch(_solver: &SmtSolver, _transcript_log: Option<Box<dyn Write>>) -> Self {
++            let cfg = Z3_mk_config();
++            let z3_ctx = Z3_mk_context(cfg);
++            Z3_del_config(cfg);
++            SmtProcess { z3_ctx }
++        }
++
++        pub(crate) fn set_transcript_log(&mut self, _writer: Box<dyn Write>) {}
++
++        pub(crate) fn send_commands(&mut self, commands: Vec<u8>) -> Vec<String> {
++            self.send_commands_async(commands).wait()
++        }
++
++        pub(crate) fn send_commands_async<'a>(
++            &'a mut self,
++            commands: Vec<u8>,
++        ) -> CommandsHandle<'a> {
++            let script = std::str::from_utf8(&commands)
++                .expect("non-utf8 in SMT commands sent to wasm Z3 bridge");
++            let raw = Z3_eval_smtlib2_string(self.z3_ctx, script);
++            // Z3_eval_smtlib2_string returns the solver's stdout. Split on newlines
++            // and drop empties to match what the native pipe-reader produces.
++            let lines: Vec<String> = raw
++                .lines()
++                .map(|l| l.trim_end_matches('\r').to_string())
++                .filter(|l| !l.is_empty())
++                .collect();
++            CommandsHandle { _smt_process: self, result: Some(lines) }
++        }
++    }
++
++    impl Drop for SmtProcess {
++        fn drop(&mut self) {
++            Z3_del_context(self.z3_ctx);
++        }
++    }
++
++    pub struct CommandsHandle<'a> {
++        _smt_process: &'a mut SmtProcess,
++        result: Option<Vec<String>>,
++    }
++
++    impl<'a> CommandsHandle<'a> {
++        pub fn wait(mut self) -> Vec<String> {
++            self.result.take().expect("CommandsHandle waited twice")
++        }
++
++        pub fn wait_timeout(
++            self,
++            _timeout: std::time::Duration,
++        ) -> Result<Vec<String>, Self> {
++            // wasm bridge is synchronous — never times out.
++            Ok(self.wait())
++        }
++    }
++}
+diff --git a/source/air/src/smt_verify.rs b/source/air/src/smt_verify.rs
+index 4e4efa5c..1e6f756e 100644
+--- a/source/air/src/smt_verify.rs
++++ b/source/air/src/smt_verify.rs
+@@ -10,6 +10,23 @@ pub use crate::model::{Model, ModelDef};
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
++// Instant::now() panics on wasm32-unknown-unknown (no clock).
++// We only use it to measure elapsed SMT time, which the explorer doesn't read,
++// so a zero-duration stub is fine.
++#[cfg(not(target_arch = "wasm32"))]
++type Instant = std::time::Instant;
++#[cfg(target_arch = "wasm32")]
++struct Instant;
++#[cfg(target_arch = "wasm32")]
++impl Instant {
++    fn now() -> Self {
++        Instant
++    }
++    fn elapsed(&self) -> std::time::Duration {
++        std::time::Duration::ZERO
++    }
++}
++
+ fn label_asserts<'ctx>(
+     context: &mut Context,
+     infos: &mut Vec<AssertionInfo>,
+@@ -171,7 +188,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
+     };
+ 
+     context.smt_log.log_get_info("version");
+-    let smt_init_start_time = std::time::Instant::now();
++    let smt_init_start_time = Instant::now();
+     let smt_data = context.smt_log.take_pipe_data();
+     let early_smt_output = context.get_smt_process().send_commands(smt_data);
+     context.time_smt_init += smt_init_start_time.elapsed();
+@@ -214,7 +231,7 @@ pub(crate) fn smt_check_assertion<'ctx>(
+     context.smt_log.log_word("check-sat");
+ 
+     // Run SMT solver
+-    let smt_run_start_time = std::time::Instant::now();
++    let smt_run_start_time = Instant::now();
+     let smt_data = context.smt_log.take_pipe_data();
+     let commands_handle = context.get_smt_process().send_commands_async(smt_data);
+     let smt_output = if let Some((report_threshold, report_fn)) = report_long_running {
+diff --git a/source/rust_verify/src/verifier.rs b/source/rust_verify/src/verifier.rs
+index 4900bb21..85d8c5d4 100644
+--- a/source/rust_verify/src/verifier.rs
++++ b/source/rust_verify/src/verifier.rs
+@@ -3420,7 +3420,6 @@ impl VerifierCallbacksEraseMacro {
+             self.verifier.encountered_vir_error = true;
+         }
+         if !self.verifier.args.output_json
+-            && !self.verifier.args.no_verify
+             && !self.verifier.encountered_error
+             && !self.verifier.encountered_vir_error
+         {

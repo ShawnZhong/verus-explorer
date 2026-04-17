@@ -1,0 +1,10 @@
+# Cargo build output
+/target/
+
+# Build output (regenerate: `make` or `make release`)
+/dist/
+/verus-explorer.tar.gz
+
+# emsdk + Z3 caches are re-bootstrapped by setup.sh; the verus submodule is tracked.
+/third_party/*
+!/third_party/verus

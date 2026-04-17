@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <title>verus-explorer</title>
+  <style>
+    body {
+      font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace;
+      max-width: 860px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+
+    h1 {
+      font-size: 1.25rem;
+    }
+
+    button {
+      font: inherit;
+      padding: .5em 1em;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: .6;
+    }
+
+    pre {
+      background: #f5f5f5;
+      padding: 1em;
+      border-radius: 6px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+
+    .ok {
+      color: #087a3c;
+      font-weight: bold;
+    }
+
+    .bad {
+      color: #b42318;
+      font-weight: bold;
+    }
+
+    .muted {
+      color: #666;
+    }
+
+    .query {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: .6em .9em;
+      margin-bottom: .8em;
+    }
+
+    .query h3 {
+      font-size: .95rem;
+      margin: 0 0 .4em;
+    }
+
+    .query pre {
+      margin: .3em 0;
+      font-size: .85em;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>verus-explorer</h1>
+  <p class="muted">Real <code>vir</code> + <code>air</code> (from this Verus tree) compiled to
+    wasm32, driving a self-hosted single-threaded Z3 wasm. The button parses an
+    AIR script via <code>air::parser</code>, runs it through
+    <code>air::context::Context::command()</code>, and reports the verdict —
+    SMT goes through Verus's real machinery, not a hardcoded string.
+    No SharedArrayBuffer, no COOP/COEP — works from any static host.</p>
+
+  <button id="run" disabled>Loading…</button>
+  <pre id="out">Initializing Z3 and wasm…</pre>
+
+  <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config). -->
+  <script src="./z3.js"></script>
+
+  <script type="module">
+    import init, { run } from './pkg/verus_explorer.js';
+
+    const out = document.getElementById('out');
+    const button = document.getElementById('run');
+
+    const log = (line, cls) => {
+      const span = document.createElement('span');
+      if (cls) span.className = cls;
+      span.textContent = line + '\n';
+      out.appendChild(span);
+    };
+    const block = (cls) => {
+      const div = document.createElement('div');
+      if (cls) div.className = cls;
+      out.appendChild(div);
+      return div;
+    };
+
+    // Sink for Rust panics — src/lib.rs installs a panic hook that calls this.
+    globalThis.reportPanic = (msg) => log('Panic: ' + msg, 'bad');
+
+    // Async-load the Z3 wasm module and stash it on globalThis. Emscripten
+    // resolves z3.wasm relative to the loading script URL by default, so no
+    // locateFile callback is needed.
+    const Z3 = await globalThis.initZ3();
+
+    // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
+    // wasm-bindgen externs, so each must be a plain JS function on globalThis.
+    // ccall does the emscripten ABI marshalling (malloc+UTF-8 for strings).
+    globalThis.Z3_mk_config = () => Z3.ccall('Z3_mk_config', 'number', [], []);
+    globalThis.Z3_mk_context = (cfg) => Z3.ccall('Z3_mk_context', 'number', ['number'], [cfg]);
+    globalThis.Z3_del_config = (cfg) => Z3.ccall('Z3_del_config', null, ['number'], [cfg]);
+    globalThis.Z3_eval_smtlib2_string = (ctx, script) =>
+      Z3.ccall('Z3_eval_smtlib2_string', 'string', ['number', 'string'], [ctx, script]);
+    globalThis.Z3_del_context = (ctx) => Z3.ccall('Z3_del_context', null, ['number'], [ctx]);
+
+    await init();
+
+    out.textContent = 'Ready.';
+    button.disabled = false;
+    button.textContent = 'Run';
+
+    button.addEventListener('click', () => {
+      out.textContent = '';
+      try {
+        log('Running AIR queries through air::context::Context…');
+        log('');
+        const r = run();
+
+        for (const q of r.queries) {
+          const div = block('query');
+          const h = document.createElement('h3');
+          h.textContent = q.label + ' — verdict: ' + q.verdict + (q.proved ? ' [proved]' : ' [refuted]');
+          h.className = q.proved ? 'ok' : 'bad';
+          div.appendChild(h);
+          const pre = document.createElement('pre');
+          pre.textContent = q.air;
+          div.appendChild(pre);
+        }
+
+        log('');
+        if (r.all_expected) {
+          log('all queries matched expectations', 'ok');
+        } else {
+          log('some queries did NOT match expectations', 'bad');
+        }
+        console.log('run result', r);
+      } catch (e) {
+        log('Driver crashed: ' + (e?.message ?? e), 'bad');
+        console.error(e);
+      }
+    });
+  </script>
+
+</body>
+
+</html>
