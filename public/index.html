@@ -113,13 +113,13 @@
 
     // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
     // wasm-bindgen externs, so each must be a plain JS function on globalThis.
-    // ccall does the emscripten ABI marshalling (malloc+UTF-8 for strings).
-    globalThis.Z3_mk_config = () => Z3.ccall('Z3_mk_config', 'number', [], []);
-    globalThis.Z3_mk_context = (cfg) => Z3.ccall('Z3_mk_context', 'number', ['number'], [cfg]);
-    globalThis.Z3_del_config = (cfg) => Z3.ccall('Z3_del_config', null, ['number'], [cfg]);
-    globalThis.Z3_eval_smtlib2_string = (ctx, script) =>
-      Z3.ccall('Z3_eval_smtlib2_string', 'string', ['number', 'string'], [ctx, script]);
-    globalThis.Z3_del_context = (ctx) => Z3.ccall('Z3_del_context', null, ['number'], [ctx]);
+    // cwrap returns a pre-bound callable that handles the emscripten ABI
+    // marshalling (malloc+UTF-8 for strings).
+    globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
+    globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
+    globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
+    globalThis.Z3_eval_smtlib2_string = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
+    globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
 
     await init();
 

@@ -9,72 +9,39 @@
 
 .PHONY: dev release serve deploy clean
 
-# emsdk_env.sh determines its own location via $BASH_SOURCE, so this Makefile
-# requires bash, not POSIX sh.
-SHELL := /bin/bash
-
 DIST  := dist
 BUILD := build
-EMSDK := third_party/emsdk
-Z3    := third_party/z3
 
-# Each recipe that needs emcc/emcmake must source emsdk_env.sh first because
-# Make spawns a fresh shell per recipe line.
-EMSDK_ENV := source $(EMSDK)/emsdk_env.sh >/dev/null
-
-dev: $(DIST)/index.html $(DIST)/z3.wasm
+dev: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
 	wasm-pack build --dev --target web --out-dir $(DIST)/pkg
 
-release: $(DIST)/index.html $(DIST)/z3.wasm
+release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
 	wasm-pack build --release --target web --out-dir $(DIST)/pkg
 
-serve: dev
+$(DIST)/z3.js $(DIST)/z3.wasm &: scripts/build-z3.sh | $(DIST)
+	./scripts/build-z3.sh
+	cp $(BUILD)/z3.js $(BUILD)/z3.wasm $(DIST)
+$(DIST)/index.html: public/index.html | $(DIST)
+	cp $< $@
+
+$(DIST):
+	git worktree add --orphan -b gh-pages $(DIST)
+
+serve:
 	python3 -m http.server --directory $(DIST) 8000
 
-# dist/ is itself a git worktree on gh-pages, so the build writes straight
-# into the tree we publish. wasm-pack drops an ignore-everything .gitignore
-# in pkg/ on each build — remove it so the built artefacts actually commit.
+# Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
+# and force-pushes, so there's no history either locally or remotely. wasm-pack
+# drops an ignore-everything .gitignore in pkg/ on each build; remove it so
+# the built artefacts actually stage.
 deploy: release
-	@sha=$$(git rev-parse --short HEAD); \
-	rm -f $(DIST)/pkg/.gitignore; \
-	cd $(DIST) && git add -A && git commit -m "deploy $$sha" && \
-	  git push origin gh-pages
-
-# libz3.a — the static Z3 library, built with emscripten. Single-threaded so
-# the page works without SharedArrayBuffer / COOP+COEP headers. Flag edits
-# aren't auto-detected by Make; `make clean` or `rm -rf build` to pick up
-# changes to the CMake options below.
-$(BUILD)/libz3.a:
-	$(EMSDK_ENV) && \
-	  emcmake cmake -S $(Z3) -B $(BUILD) \
-	    -DZ3_BUILD_LIBZ3_SHARED=OFF \
-	    -DZ3_SINGLE_THREADED=ON \
-	    -DCMAKE_BUILD_TYPE=Release && \
-	  cmake --build $(BUILD) -j$$(nproc) --target libz3
-
-# Link libz3.a into z3.{js,wasm}. emcc needs at least one TU; we feed it
-# /dev/null as C. All Z3 API symbols come from libz3.a via EXPORTED_FUNCTIONS.
-# ccall handles string marshalling on the wasm stack, so we don't export
-# _malloc/_free.
-$(DIST)/z3.wasm: $(BUILD)/libz3.a
-	$(EMSDK_ENV) && emcc -x c /dev/null $(BUILD)/libz3.a \
-	    -O2 \
-	    -s WASM_BIGINT \
-	    -s MODULARIZE=1 \
-	    -s EXPORT_NAME=initZ3 \
-	    -s EXPORTED_FUNCTIONS='["_Z3_mk_config","_Z3_mk_context","_Z3_del_config","_Z3_eval_smtlib2_string","_Z3_del_context"]' \
-	    -s EXPORTED_RUNTIME_METHODS='["ccall"]' \
-	    -s FILESYSTEM=0 \
-	    -s INITIAL_MEMORY=64MB \
-	    -s ALLOW_MEMORY_GROWTH=1 \
-	    -s MAXIMUM_MEMORY=2GB \
-	    -s TOTAL_STACK=16MB \
-	    -o $(DIST)/z3.js
-
-# Copy (not symlink) because dist/ is a git worktree we push to Pages — a
-# symlink to ../public/index.html would dangle on the gh-pages branch.
-$(DIST)/index.html: public/index.html
-	cp $< $@
+	cd $(DIST) && \
+	rm -f pkg/.gitignore && \
+	git checkout --orphan _deploy && \
+	git add -A && \
+	git commit -m "deploy $$(git -C .. rev-parse --short HEAD)" && \
+	git branch -M gh-pages && \
+	git push --force origin gh-pages
 
 clean:
 	rm -rf target $(BUILD)

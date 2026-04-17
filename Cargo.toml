@@ -16,3 +16,8 @@ wasm-bindgen = "0.2"
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# wasm-pack's default wasm-opt pass (-O ≈ -O3) is slow on a binary this size;
+# -O1 is several times faster with a small size/perf regression.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O1']
