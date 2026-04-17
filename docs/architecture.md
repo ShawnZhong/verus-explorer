@@ -94,7 +94,7 @@ Public surface exposed to JS:
 | `#[wasm_bindgen] fn run() -> Output` | Entry point — clicked by the Run button. |
 | `Output { all_expected: bool, queries: Vec<Query> }` | Aggregate result. |
 | `Query { label, air, verdict, proved }` | One query — what the UI renders. |
-| `#[wasm_bindgen(start)] fn init()` | Installs a Rust panic hook that calls the JS `reportPanic(msg)` import. |
+| `#[wasm_bindgen(start)] fn init()` | Installs a Rust panic hook that forwards panic messages to `console.error`. |
 
 Private helpers:
 
@@ -207,7 +207,7 @@ globalThis.Z3_eval_smtlib2_string = (ctx, script) =>
 
 ### Panic hook
 
-`src/lib.rs` declares `fn reportPanic(msg: &str)` as a wasm-bindgen import. `public/index.html` defines `globalThis.reportPanic` to append the message to `#out` — so Rust panics show up on the page, not just in devtools.
+`src/lib.rs` installs a `std::panic::set_hook` that forwards the message to `console.error` (imported via `#[wasm_bindgen(js_namespace = console, js_name = error)]`).
 
 ### UI
 

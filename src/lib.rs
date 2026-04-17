@@ -13,6 +13,7 @@
 // SMT is routed through the wasm32 `SmtProcess` shim in
 // `air/src/smt_process.rs`, which calls the `Z3_*` wrappers installed by
 // `public/index.html` on top of the self-hosted single-threaded Z3 wasm.
+
 mod frontend;
 
 use std::sync::{Arc, Mutex};
@@ -59,15 +60,15 @@ const QUERIES: &[(&str, &str, bool)] = &[
     ),
 ];
 
-// JS-side sink for Rust panics — defined on globalThis by index.html.
 #[wasm_bindgen]
 extern "C" {
-    fn reportPanic(msg: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(msg: &str);
 }
 
 #[wasm_bindgen(start)]
 fn init() {
-    std::panic::set_hook(Box::new(|info| reportPanic(&info.to_string())));
+    std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
 }
 
 /// Result of one query — surfaced to JS field-by-field (no JSON).
@@ -425,6 +426,14 @@ fn run_vir_query() -> Query {
 #[wasm_bindgen]
 pub fn lex_source(src: &str) -> String {
     frontend::lex_source(src)
+}
+
+/// Run the rustc front-end on `src` (virtual path), stop after crate-root
+/// parsing, and dump the top-level items. Proves rustc_driver::run_compiler
+/// runs on wasm.
+#[wasm_bindgen]
+pub fn parse_source(src: &str) -> String {
+    frontend::parse_source(src)
 }
 
 #[wasm_bindgen]

@@ -11,10 +11,15 @@
 
 DIST  := dist
 BUILD := build
+# wasm-pack's staging directory, kept separate from $(DIST) so its post-build
+# wasm-opt pass only sees our own bundle — otherwise it chokes on
+# $(DIST)/z3.wasm, which uses the WebAssembly exception-handling proposal.
+PKG   := $(DIST)/pkg
 
 dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
-	wasm-pack build --$@ --target web --out-dir $(DIST) --no-typescript
-	rm -f $(DIST)/package.json $(DIST)/.gitignore
+	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
+	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
+	rm -rf $(PKG)
 
 $(DIST)/z3.%: $(BUILD)/z3.% | $(DIST)
 	cp $< $@

@@ -113,11 +113,35 @@
     <pre id="lex-out"></pre>
   </section>
 
+  <section id="parse-section">
+    <h2>rustc_interface::run_compiler → HIR (vendored, wasm32)</h2>
+    <p class="muted">Rustc front-end invoked directly through
+      <code>rustc_interface::run_compiler</code> (skipping
+      <code>rustc_driver</code>'s CLI/ICE/panic-hook glue), source fed via
+      <code>Input::Str</code>, driven past crate-root parsing into
+      <code>create_and_enter_global_ctxt</code> +
+      <code>tcx.resolver_for_lowering()</code> to force macro expansion,
+      name resolution, and HIR lowering. Dumps AST top-level items and
+      HIR free-item def-paths.</p>
+    <textarea id="parse-input" spellcheck="false">fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+struct Point { x: i32, y: i32 }
+
+impl Point {
+    fn origin() -> Self { Point { x: 0, y: 0 } }
+}
+</textarea>
+    <button id="parse-run" disabled>Parse</button>
+    <pre id="parse-out"></pre>
+  </section>
+
   <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config). -->
   <script src="./z3.js"></script>
 
   <script type="module">
-    import init, { run, lex_source } from './verus_explorer.js';
+    import init, { run, lex_source, parse_source } from './verus_explorer.js';
 
     const out = document.getElementById('out');
     const button = document.getElementById('run');
@@ -134,9 +158,6 @@
       out.appendChild(div);
       return div;
     };
-
-    // Sink for Rust panics — src/lib.rs installs a panic hook that calls this.
-    globalThis.reportPanic = (msg) => log('Panic: ' + msg, 'bad');
 
     // Async-load the Z3 wasm module and stash it on globalThis. Emscripten
     // resolves z3.wasm relative to the loading script URL by default, so no
@@ -188,7 +209,6 @@
         } else {
           log('some queries did NOT match expectations', 'bad');
         }
-        console.log('run result', r);
       } catch (e) {
         log('Driver crashed: ' + (e?.message ?? e), 'bad');
         console.error(e);
@@ -214,6 +234,21 @@
     lexButton.disabled = false;
     lexButton.addEventListener('click', runLex);
     runLex();
+
+    const parseInput = document.getElementById('parse-input');
+    const parseOut = document.getElementById('parse-out');
+    const parseButton = document.getElementById('parse-run');
+    const runParse = () => {
+      try {
+        parseOut.textContent = parse_source(parseInput.value);
+      } catch (e) {
+        parseOut.textContent = 'Parse crashed: ' + (e?.message ?? e);
+        console.error(e);
+      }
+    };
+    parseButton.disabled = false;
+    parseButton.addEventListener('click', runParse);
+    runParse();
   </script>
 
 </body>
