@@ -20,7 +20,7 @@ emcmake cmake -S third_party/z3 -B build \
   -DZ3_ENABLE_EXAMPLE_TARGETS=OFF \
   -DZ3_INCLUDE_GIT_HASH=OFF \
   -DZ3_INCLUDE_GIT_DESCRIBE=OFF \
-  -DCMAKE_C_FLAGS="-flto" \
+  -DCMAKE_C_FLAGS="-fwasm-exceptions -flto" \
   -DCMAKE_CXX_FLAGS="-fwasm-exceptions -flto" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j"$(nproc)"
