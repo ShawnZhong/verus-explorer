@@ -1,14 +1,9 @@
 // verus-explorer — browser-based exploration of Verus's internal representations.
 //
 // Compiles `vir` and `air` (as-is, via path dependencies) to wasm32 and exposes
-// a wasm-bindgen entry point that runs two kinds of demo queries through
-// `air::context::Context` end-to-end:
-//
-//   1. AIR-text queries — small `(check-valid …)` snippets parsed straight to
-//      AIR commands.
-//   2. VIR-driven query — a hand-built `vir::ast::Krate` for
-//      `proof fn lemma() ensures true {}` driven through
-//      `simplify_krate → ast_to_sst → poly → sst_to_air`.
+// a wasm-bindgen entry point that drives a hand-built `vir::ast::Krate` for
+// `proof fn lemma() ensures true {}` through
+// `simplify_krate → ast_to_sst → poly → sst_to_air → air::context::Context`.
 //
 // SMT is routed through the wasm32 `SmtProcess` shim in
 // `air/src/smt_process.rs`, which calls the `Z3_*` wrappers installed by
@@ -21,9 +16,7 @@ use std::sync::{Arc, Mutex};
 use air::ast::{Command, CommandX};
 use air::context::{Context, SmtSolver, ValidityResult};
 use air::messages::Reporter;
-use air::parser::Parser;
 use air::printer::{NodeWriter, Printer};
-use sise::Node;
 use vir::ast::{
     Arch, ArchWordBits, BodyVisibility, Constant, ExprX, FunX, FunctionAttrsX, FunctionKind,
     FunctionX, ItemKind, KrateX, Mode, ModuleX, Opaqueness, ParamX, Path, PathX, SpannedTyped,
@@ -35,30 +28,6 @@ use vir::def::Spanned;
 use vir::messages::{Span, VirMessageInterface};
 use vir::printer::COMPACT_TONODEOPTS;
 use wasm_bindgen::prelude::*;
-
-/// Demo AIR scripts — already AIR, not Rust source. Third field is the
-/// expected verdict (true = provable).
-const QUERIES: &[(&str, &str, bool)] = &[
-    (
-        "commutativity of +",
-        r#"
-            (check-valid
-                (declare-const x Int)
-                (declare-const y Int)
-                (assert (= (+ x y) (+ y x))))
-        "#,
-        true,
-    ),
-    (
-        "false claim: x == 0 for all x",
-        r#"
-            (check-valid
-                (declare-const x Int)
-                (assert (= x 0)))
-        "#,
-        false,
-    ),
-];
 
 #[wasm_bindgen]
 extern "C" {
@@ -122,19 +91,21 @@ fn commands_to_string(commands: &[Command]) -> String {
     let printer = Printer::new(Arc::new(VirMessageInterface {}), false, SmtSolver::Z3);
     let mut writer = NodeWriter::new();
     let mut out = String::new();
+    let empty = String::new();
     for cmd in commands {
-        let node = match &**cmd {
-            CommandX::Push => Node::List(vec![Node::Atom("push".to_string())]),
-            CommandX::Pop => Node::List(vec![Node::Atom("pop".to_string())]),
-            CommandX::SetOption(k, v) => Node::List(vec![
-                Node::Atom("set-option".to_string()),
-                Node::Atom((**k).clone()),
-                Node::Atom((**v).clone()),
-            ]),
-            CommandX::Global(decl) => printer.decl_to_node(decl),
-            CommandX::CheckValid(query) => printer.query_to_node(query),
-        };
-        out.push_str(&writer.node_to_string_indent(&String::new(), &node));
+        match &**cmd {
+            CommandX::Push => out.push_str("(push)"),
+            CommandX::Pop => out.push_str("(pop)"),
+            CommandX::SetOption(k, v) => {
+                out.push_str(&format!("(set-option {} {})", k, v));
+            }
+            CommandX::Global(decl) => {
+                out.push_str(&writer.node_to_string_indent(&empty, &printer.decl_to_node(decl)));
+            }
+            CommandX::CheckValid(query) => {
+                out.push_str(&writer.node_to_string_indent(&empty, &printer.query_to_node(query)));
+            }
+        }
         out.push('\n');
     }
     out
@@ -152,53 +123,14 @@ fn execute(commands: &[Command]) -> (String, bool) {
     for command in commands {
         let result = ctx.command(&*msg, &reporter, command, Default::default());
         let is_check = matches!(&**command, CommandX::CheckValid(_));
-        match &result {
-            ValidityResult::Valid(_) if is_check => {}
-            ValidityResult::Invalid(..) if is_check => {
-                (verdict, proved) = ("Invalid".to_string(), false);
-            }
-            ValidityResult::Canceled if is_check => {
-                (verdict, proved) = ("Canceled".to_string(), false);
-            }
-            ValidityResult::UnexpectedOutput(s) if is_check => {
-                (verdict, proved) = (format!("UnexpectedOutput({})", s), false);
-            }
-            ValidityResult::TypeError(e) => {
-                (verdict, proved) = (format!("TypeError({:?})", e), false);
-            }
-            _ => {}
-        }
         if is_check {
+            if !matches!(result, ValidityResult::Valid(_)) && proved {
+                (verdict, proved) = (format!("{:?}", result), false);
+            }
             ctx.finish_query();
         }
     }
     (verdict, proved)
-}
-
-fn run_air_text_query(label: &str, air_script: &str) -> Query {
-    // The AIR parser expects a top-level list of commands; wrap in parens.
-    let bytes = format!("({})", air_script).into_bytes();
-    let mut sise_parser = sise::Parser::new(&bytes);
-    let node = sise::read_into_tree(&mut sise_parser).expect("AIR sise parse");
-    let Node::List(nodes) = node else {
-        panic!("expected list at AIR top level");
-    };
-    let msg = Arc::new(VirMessageInterface {});
-    let commands: Vec<Command> = Parser::new(msg)
-        .nodes_to_commands(&nodes)
-        .expect("AIR parse")
-        .iter()
-        .cloned()
-        .collect();
-
-    let (verdict, proved) = execute(&commands);
-    Query {
-        label: label.to_string(),
-        vir: String::new(),
-        air: air_script.trim().to_string(),
-        verdict,
-        proved,
-    }
 }
 
 /// Hand-built krate for `proof fn lemma() ensures true {}`.
@@ -421,13 +353,6 @@ fn run_vir_query() -> Query {
     }
 }
 
-/// Tokenize Rust source with the vendored `rustc_lexer` and return a
-/// human-readable dump — proves a rustc-internal crate is alive in wasm.
-#[wasm_bindgen]
-pub fn lex_source(src: &str) -> String {
-    frontend::lex_source(src)
-}
-
 /// Run the rustc front-end on `src` (virtual path), stop after crate-root
 /// parsing, and dump the top-level items. Proves rustc_driver::run_compiler
 /// runs on wasm.
@@ -438,22 +363,10 @@ pub fn parse_source(src: &str) -> String {
 
 #[wasm_bindgen]
 pub fn run() -> Output {
-    let mut all_expected = true;
-    let mut queries: Vec<Query> = Vec::new();
-    for (label, script, expected) in QUERIES {
-        let q = run_air_text_query(label, script);
-        if q.proved != *expected {
-            all_expected = false;
-        }
-        queries.push(q);
-    }
     let vir_q = run_vir_query();
-    if !vir_q.proved {
-        all_expected = false;
-    }
-    queries.push(vir_q);
+    let all_expected = vir_q.proved;
     Output {
         all_expected,
-        queries,
+        queries: vec![vir_q],
     }
 }

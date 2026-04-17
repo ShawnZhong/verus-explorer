@@ -6,25 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rustc_errors::registry::Registry;
-use rustc_lexer::{FrontmatterAllowed, tokenize};
 use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::{self, ErrorOutputType, Input};
+use rustc_span::FileName;
 use rustc_span::source_map::FileLoader;
-use rustc_span::{FileName, create_session_globals_then, edition::Edition};
-
-/// Tokenize `src` with rustc_lexer, dumping span + kind per token.
-pub fn lex_source(src: &str) -> String {
-    create_session_globals_then(Edition::Edition2024, &[], None, || {
-        let mut out = String::new();
-        let mut offset = 0usize;
-        for tok in tokenize(src, FrontmatterAllowed::No) {
-            let end = offset + tok.len as usize;
-            writeln!(out, "{offset:>4}..{end:<4} {:?}", tok.kind).unwrap();
-            offset = end;
-        }
-        out
-    })
-}
 
 // rustc's `SourceMap::with_inputs` eagerly calls `current_directory()` during
 // session setup, but wasm32 `std::env::current_dir()` returns Unsupported.
@@ -47,7 +32,13 @@ impl FileLoader for VirtualFileLoader {
     }
 }
 
-/// Parse `src` via rustc_interface and dump top-level AST item kinds/names.
+/// Parse `src` via rustc_interface, force HIR lowering, and dump AST + HIR
+/// top-level items. `#![no_core]` + `#![feature(no_core)]` are injected via
+/// `-Zcrate-attr` to suppress the auto `extern crate core/std` that name
+/// resolution would otherwise try (and fail, since we ship no sysroot
+/// metadata). Bodies referencing lang items (`+`, `Sized`, generics) won't
+/// typeck under no_core, but HIR lowering itself is a syntactic transform
+/// ahead of typeck so it still runs.
 pub fn parse_source(src: &str) -> String {
     let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     // `--sysroot` is mandatory on wasm32: default_sysroot() hits
@@ -57,6 +48,8 @@ pub fn parse_source(src: &str) -> String {
         "--crate-type=lib",
         "--crate-name=v",
         "--sysroot=/virtual",
+        "-Zcrate-attr=feature(no_core)",
+        "-Zcrate-attr=no_core",
     ]
     .into_iter()
     .map(String::from)
@@ -95,6 +88,7 @@ pub fn parse_source(src: &str) -> String {
         rustc_interface::interface::run_compiler(config, |compiler| {
             let krate = rustc_interface::passes::parse(&compiler.sess);
             let mut out = String::new();
+            writeln!(out, "=== AST ===").unwrap();
             writeln!(out, "crate items: {}", krate.items.len()).unwrap();
             for item in &krate.items {
                 writeln!(
@@ -105,17 +99,42 @@ pub fn parse_source(src: &str) -> String {
                 )
                 .unwrap();
             }
+            writeln!(out).unwrap();
+            writeln!(out, "=== HIR ===").unwrap();
+            rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                // Forces macro expansion + name resolution + HIR lowering.
+                let _ = tcx.resolver_for_lowering();
+                for item_id in tcx.hir_free_items() {
+                    let def_id = item_id.owner_id.def_id.to_def_id();
+                    writeln!(
+                        out,
+                        "  {} {}",
+                        tcx.def_kind(def_id).descr(def_id),
+                        tcx.def_path_str(def_id)
+                    )
+                    .unwrap();
+                }
+            });
             *dump_clone.lock().unwrap() = out;
         });
     }));
+    // Always return whatever the closure managed to dump. `run_compiler`
+    // post-processing can panic via `abort_if_errors` after our closure writes
+    // `dump`, which would otherwise shadow a valid HIR dump with "panicked: …".
+    let partial = dump.lock().unwrap().clone();
     match result {
-        Ok(()) => dump.lock().unwrap().clone(),
-        Err(e) => format!(
-            "panicked: {}",
-            e.downcast_ref::<&str>()
+        Ok(()) => partial,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
                 .copied()
                 .or_else(|| e.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<opaque>")
-        ),
+                .unwrap_or("<opaque>");
+            if partial.is_empty() {
+                format!("panicked: {msg}")
+            } else {
+                format!("{partial}\n(post-dump panic: {msg})")
+            }
+        }
     }
 }

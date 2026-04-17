@@ -3819,16 +3819,11 @@ version = "0.1.0"
 dependencies = [
  "air",
  "getrandom 0.3.4",
- "rustc_arena",
- "rustc_data_structures",
  "rustc_driver",
  "rustc_errors",
- "rustc_index",
  "rustc_interface",
- "rustc_lexer",
  "rustc_session",
  "rustc_span",
- "sise",
  "vir",
  "wasm-bindgen",
 ]
