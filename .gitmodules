@@ -1,3 +1,10 @@
 [submodule "third_party/verus"]
 	path = third_party/verus
 	url = https://github.com/ShawnZhong/verus.git
+[submodule "third_party/emsdk"]
+	path = third_party/emsdk
+	url = https://github.com/emscripten-core/emsdk.git
+[submodule "third_party/z3"]
+	path = third_party/z3
+	url = https://github.com/Z3Prover/z3.git
+	branch = z3-4.16.0
