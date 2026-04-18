@@ -16,7 +16,12 @@ BUILD := build
 # $(DIST)/z3.wasm, which uses the WebAssembly exception-handling proposal.
 PKG   := $(DIST)/pkg
 
+# Build the rustc-rlibs workspace member first so the wasm32 rlibs of the
+# rustc compiler crates exist in target/wasm32-unknown-unknown/<profile>/deps,
+# where the explorer's `extern crate rustc_*;` resolves them via the
+# `-L dependency=...` rustflag in `.cargo/config.toml`.
 dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm
+	cd rustc-rlibs && cargo build --target wasm32-unknown-unknown $(if $(filter release,$@),--release,)
 	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
 	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
 	rm -rf $(PKG)

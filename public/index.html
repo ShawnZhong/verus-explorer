@@ -115,39 +115,11 @@ impl Point {
     <div id="parse-out" class="query"></div>
   </section>
 
-  <section id="run-section">
-    <h2>vir + air → Z3</h2>
-    <p class="muted">Real <code>vir</code> + <code>air</code> (from this Verus tree) compiled to
-      wasm32, driving a self-hosted single-threaded Z3 wasm. The button parses an
-      AIR script via <code>air::parser</code>, runs it through
-      <code>air::context::Context::command()</code>, and reports the verdict —
-      SMT goes through Verus's real machinery, not a hardcoded string.
-      No SharedArrayBuffer, no COOP/COEP — works from any static host.</p>
-    <button id="run" disabled>Loading…</button>
-    <pre id="out">Initializing Z3 and wasm…</pre>
-  </section>
-
   <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config). -->
   <script src="./z3.js"></script>
 
   <script type="module">
-    import init, { run, parse_source } from './verus_explorer.js';
-
-    const out = document.getElementById('out');
-    const button = document.getElementById('run');
-
-    const log = (line, cls) => {
-      const span = document.createElement('span');
-      if (cls) span.className = cls;
-      span.textContent = line + '\n';
-      out.appendChild(span);
-    };
-    const block = (cls) => {
-      const div = document.createElement('div');
-      if (cls) div.className = cls;
-      out.appendChild(div);
-      return div;
-    };
+    import init, { parse_source } from './verus_explorer.js';
 
     // Async-load the Z3 wasm module and stash it on globalThis. Emscripten
     // resolves z3.wasm relative to the loading script URL by default, so no
@@ -166,42 +138,6 @@ impl Point {
 
     await init();
 
-    const runQueries = () => {
-      out.textContent = '';
-      try {
-        log('Running VIR → AIR pipeline through air::context::Context…');
-        log('');
-        const q = run();
-
-        const div = block('query');
-        const h = document.createElement('h3');
-        h.textContent = 'proof fn lemma() ensures true {} — verdict: ' + q.verdict
-          + (q.proved ? ' [proved]' : ' [refuted]');
-        h.className = q.proved ? 'ok' : 'bad';
-        div.appendChild(h);
-        const addBlock = (title, body) => {
-          if (!body) return;
-          const label = document.createElement('div');
-          label.className = 'muted';
-          label.textContent = title;
-          div.appendChild(label);
-          const pre = document.createElement('pre');
-          pre.textContent = body;
-          div.appendChild(pre);
-        };
-        addBlock('VIR', q.vir);
-        addBlock('Generated AIR', q.air);
-      } catch (e) {
-        log('Driver crashed: ' + (e?.message ?? e), 'bad');
-        console.error(e);
-      }
-    };
-
-    button.disabled = false;
-    button.textContent = 'Run again';
-    button.addEventListener('click', runQueries);
-    runQueries();
-
     const parseInput = document.getElementById('parse-input');
     const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
@@ -215,6 +151,36 @@ impl Point {
       pre.textContent = body;
       parseOut.appendChild(pre);
     };
+    // AIR_* sections share one pre block + a stage toggle. Each button swaps
+    // the visible body so users can compare initial / middle / final / smt
+    // without scrolling.
+    const addAirToggle = (stages) => {
+      const order = ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
+      const present = order.filter(k => stages[k]);
+      if (present.length === 0) return;
+      const bar = document.createElement('div');
+      bar.style.display = 'flex';
+      bar.style.gap = '.4em';
+      bar.style.margin = '.4em 0';
+      const pre = document.createElement('pre');
+      const buttons = {};
+      const show = (key) => {
+        pre.textContent = stages[key];
+        for (const [k, b] of Object.entries(buttons)) {
+          b.disabled = (k === key);
+        }
+      };
+      for (const key of present) {
+        const b = document.createElement('button');
+        b.textContent = key.toLowerCase().replace('air_', 'air ');
+        b.addEventListener('click', () => show(key));
+        bar.appendChild(b);
+        buttons[key] = b;
+      }
+      parseOut.appendChild(bar);
+      parseOut.appendChild(pre);
+      show(present[0]);
+    };
     const runParse = () => {
       parseOut.textContent = '';
       try {
@@ -223,9 +189,17 @@ impl Point {
         // goes under an "output" block so panic messages aren't dropped.
         const chunks = text.split(/^=== (\w+) ===$/m);
         if (chunks[0].trim()) addParseBlock('output', chunks[0].trimEnd());
+        const air = {};
         for (let i = 1; i < chunks.length; i += 2) {
-          addParseBlock(chunks[i], chunks[i + 1].trim());
+          const name = chunks[i];
+          const body = chunks[i + 1].trim();
+          if (name.startsWith('AIR_') || name === 'SMT') {
+            if (body) air[name] = body;
+          } else {
+            addParseBlock(name, body);
+          }
         }
+        addAirToggle(air);
       } catch (e) {
         addParseBlock('error', 'Parse crashed: ' + (e?.message ?? e));
         console.error(e);

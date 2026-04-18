@@ -12,5 +12,5 @@
 	branch = z3-4.16.0
 [submodule "third_party/rust"]
 	path = third_party/rust
-	url = https://github.com/rust-lang/rust
-	branch = 1.94.0
+	url = https://github.com/ShawnZhong/rust.git
+	branch = main

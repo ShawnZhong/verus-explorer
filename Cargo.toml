@@ -10,14 +10,11 @@ crate-type = ["cdylib", "rlib"]
 vir = { path = "third_party/verus/source/vir" }
 air = { path = "third_party/verus/source/air" }
 rust_verify = { path = "third_party/verus/source/rust_verify" }
-rustc_driver = { path = "third_party/rust/compiler/rustc_driver" }
-rustc_errors = { path = "third_party/rust/compiler/rustc_errors" }
-rustc_hir_analysis = { path = "third_party/rust/compiler/rustc_hir_analysis" }
-rustc_interface = { path = "third_party/rust/compiler/rustc_interface" }
-rustc_middle = { path = "third_party/rust/compiler/rustc_middle" }
-rustc_session = { path = "third_party/rust/compiler/rustc_session" }
-rustc_span = { path = "third_party/rust/compiler/rustc_span" }
 wasm-bindgen = "0.2"
+# rustc_* crates that this crate uses directly are not declared here — they
+# are produced as rlibs by `rustc-rlibs/` and resolved at link time via
+# `-L dependency=...` (set in `.cargo/config.toml`). See `src/lib.rs` for
+# the corresponding `extern crate rustc_*;` declarations.
 
 # Force getrandom 0.3's `wasm_js` feature on so its wasm32 backend compiles —
 # see the companion `.cargo/config.toml` rustflag. `rand` (pulled in by

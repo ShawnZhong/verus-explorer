@@ -1,0 +1,66 @@
+[package]
+name = "rustc-rlibs"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Sole purpose: force Cargo to compile wasm32 rlibs of the rustc compiler
+# crates that `rust_verify`, `rustc_mir_build` (Verus fork), and
+# `verus-explorer` resolve via `extern crate rustc_*;`. There is no
+# `rustc-dev` distribution for `wasm32-unknown-unknown`, so we cross-compile
+# them ourselves and let the explorer find them via `-L dependency=...` (set
+# in `.cargo/config.toml`). This crate is built explicitly by `make`; nothing
+# depends on it directly.
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+# All rustc crates referenced via `extern crate rustc_*;` in rust_verify or
+# rustc_mir_build (Verus fork) — paths point at the vendored rustc tree.
+rustc_abi = { path = "../third_party/rust/compiler/rustc_abi" }
+rustc_arena = { path = "../third_party/rust/compiler/rustc_arena" }
+rustc_ast = { path = "../third_party/rust/compiler/rustc_ast" }
+rustc_data_structures = { path = "../third_party/rust/compiler/rustc_data_structures" }
+rustc_driver = { path = "../third_party/rust/compiler/rustc_driver" }
+rustc_error_messages = { path = "../third_party/rust/compiler/rustc_error_messages" }
+rustc_errors = { path = "../third_party/rust/compiler/rustc_errors" }
+rustc_fluent_macro = { path = "../third_party/rust/compiler/rustc_fluent_macro" }
+rustc_hir = { path = "../third_party/rust/compiler/rustc_hir" }
+rustc_hir_analysis = { path = "../third_party/rust/compiler/rustc_hir_analysis" }
+rustc_hir_pretty = { path = "../third_party/rust/compiler/rustc_hir_pretty" }
+rustc_hir_typeck = { path = "../third_party/rust/compiler/rustc_hir_typeck" }
+rustc_index = { path = "../third_party/rust/compiler/rustc_index" }
+rustc_infer = { path = "../third_party/rust/compiler/rustc_infer" }
+rustc_interface = { path = "../third_party/rust/compiler/rustc_interface" }
+rustc_lint = { path = "../third_party/rust/compiler/rustc_lint" }
+rustc_macros = { path = "../third_party/rust/compiler/rustc_macros" }
+rustc_middle = { path = "../third_party/rust/compiler/rustc_middle" }
+rustc_pattern_analysis = { path = "../third_party/rust/compiler/rustc_pattern_analysis" }
+rustc_query_system = { path = "../third_party/rust/compiler/rustc_query_system" }
+rustc_resolve = { path = "../third_party/rust/compiler/rustc_resolve" }
+rustc_session = { path = "../third_party/rust/compiler/rustc_session" }
+rustc_span = { path = "../third_party/rust/compiler/rustc_span" }
+rustc_trait_selection = { path = "../third_party/rust/compiler/rustc_trait_selection" }
+rustc_type_ir = { path = "../third_party/rust/compiler/rustc_type_ir" }
+# Upstream rustc_mir_build, *not* Verus's fork. rustc-rlibs exists solely to
+# produce wasm32 rlibs of the upstream rustc crates — Verus's fork of
+# rustc_mir_build is built separately as a transitive dep of rust_verify
+# (via `rustc_mir_build_verus = { ..., package = "rustc_mir_build" }`) in the
+# explorer's Cargo tree. Using upstream here also sidesteps a parallel-build
+# ordering hazard: the Verus fork's Cargo.toml strips the rustc_* deps it
+# depends on (relying on --extern from Verus's workspace wiring), which leaves
+# Cargo no information to schedule its siblings before it in an isolated build.
+# Upstream's Cargo.toml declares them, so a single-pass cargo build works.
+#
+# Runtime semantics are unchanged: `rustc_mir_build::provide` is identical
+# between upstream and the fork (Verus didn't modify it). Verus's fork only
+# *adds* `verus_provide`, and rust_verify calls it explicitly in verifier.rs
+# to override `thir_body` at provider-registration time.
+rustc_mir_build = { path = "../third_party/rust/compiler/rustc_mir_build" }
+
+# Force getrandom 0.3's `wasm_js` feature on so its wasm32 backend compiles —
+# pulled in transitively via `rand` from `rustc_abi`. See `.cargo/config.toml`
+# for the companion `--cfg=getrandom_backend="wasm_js"` rustflag.
+[target.wasm32-unknown-unknown.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }

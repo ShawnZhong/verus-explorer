@@ -43,15 +43,12 @@ rustflags = ["--check-cfg=cfg(bootstrap)"]
 # bounds".
 # `-L crate=...` (not `dependency=`!) is the kind that participates in
 # `extern crate foo;` source-level resolution. Cargo automatically passes
-# `-L dependency=<deps_dir>`, but that kind only handles transitive rmeta
-# lookups — `extern crate` items missing a `--extern` go through `crate=`/
-# `all=` paths. The explorer's src/lib.rs and rust_verify's lib.rs both have
-# `extern crate rustc_*;` decls without those crates listed in their
-# Cargo.toml deps, so we point `crate=` at the rustc-rlibs deps dir.
-# Absolute path because rustc's CWD varies across dep-crate compilations
-# (it's the manifest dir of whichever dep is being built).
-# TODO: hardcoded absolute path is machine-specific; switch to a rustc-wrapper
-# script that derives the path from its own location for portability.
+# `-L dependency=<deps_dir>`, but that kind is only consulted for transitive
+# rmeta lookups, not for `extern crate` items missing a corresponding `--extern`.
+# rustc_mir_build's lib.rs has `extern crate rustc_abi;` etc. without those
+# crates listed in its Cargo.toml deps, so we point `crate=` at the same deps
+# dir Cargo writes the sibling rlibs into. Absolute path so it resolves the
+# same regardless of which dep-crate's manifest dir rustc was launched in.
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--cfg=getrandom_backend=\"wasm_js\"",
