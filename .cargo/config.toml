@@ -23,13 +23,6 @@ RUSTC_INSTALL_BINDIR = "bin"
 # rustc_session::config::host_tuple() panics if this is missing.
 CFG_COMPILER_HOST_TRIPLE = "wasm32-unknown-unknown"
 
-# `cfg(bootstrap)` is set by rustc's x.py when stage0-building rustc with the
-# previous stable compiler; we build with plain cargo, so it's always unset and
-# the `#[cfg_attr(bootstrap, …)]` attributes are silent no-ops. Declaring it
-# here just silences the `unexpected_cfgs` warning.
-[build]
-rustflags = ["--check-cfg=cfg(bootstrap)"]
-
 # getrandom 0.3 refuses to compile on wasm32-unknown-unknown without an explicit
 # backend cfg (it doesn't assume `Math.random` / `crypto.getRandomValues`).
 # `wasm_js` routes to `crypto.getRandomValues` via wasm-bindgen; we also need
@@ -41,21 +34,30 @@ rustflags = ["--check-cfg=cfg(bootstrap)"]
 # thread, so we need the linker to reserve the stack at module level. With
 # the wasm default (1 MiB) HIR lowering overflows into "memory access out of
 # bounds".
-# `-L crate=...` (not `dependency=`!) is the kind that participates in
-# `extern crate foo;` source-level resolution. Cargo automatically passes
-# `-L dependency=<deps_dir>`, but that kind only handles transitive rmeta
-# lookups — `extern crate` items missing a `--extern` go through `crate=`/
-# `all=` paths. The explorer's src/lib.rs and rust_verify's lib.rs both have
-# `extern crate rustc_*;` decls without those crates listed in their
-# Cargo.toml deps, so we point `crate=` at the rustc-rlibs deps dir.
-# Absolute path because rustc's CWD varies across dep-crate compilations
-# (it's the manifest dir of whichever dep is being built).
+# `-L <path>` (kind defaults to `all`) makes rustc search the path for
+# BOTH direct `extern crate foo;` lookups AND transitive dependency rmeta
+# lookups. The explorer's `src/lib.rs` and Verus's `mir_build_verus` fork
+# both have undeclared `extern crate rustc_*;` items that this resolves.
+# With the unified workspace the path points at the shared target dir
+# (rustc-rlibs is a sibling member; its rlibs land in the same `deps/`).
+# Absolute path because rustc's CWD varies across dep compilations.
 # TODO: hardcoded absolute path is machine-specific; switch to a rustc-wrapper
 # script that derives the path from its own location for portability.
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--cfg=getrandom_backend=\"wasm_js\"",
+    # Declares `cfg(bootstrap)` so `#[cfg(bootstrap)]` attrs across the
+    # vendored rustc tree don't trip the `unexpected_cfgs` lint.
+    # `bootstrap` is set by rustc's x.py when stage0-building rustc with
+    # the previous stable compiler; we build with plain cargo, so it's
+    # always unset and those attrs are silent no-ops. The two host-only
+    # proc-macro crates (`rustc_macros`, `rustc_fluent_macro`) carry the
+    # same declaration in their own Cargo.toml under `[lints.rust]` —
+    # Cargo's stable rustflags tables don't cover host compilations when
+    # `--target` is passed on the command line (that would require the
+    # unstable `-Z host-config` / `-Z target-applies-to-host` flags).
+    "--check-cfg=cfg(bootstrap)",
     "-C", "link-arg=-zstack-size=8388608",
-    "-L", "crate=/Users/szhong/Code/verus-explorer/rustc-rlibs/target/wasm32-unknown-unknown/debug/deps",
-    "-L", "crate=/Users/szhong/Code/verus-explorer/rustc-rlibs/target/wasm32-unknown-unknown/release/deps",
+    "-L", "/Users/szhong/Code/verus-explorer/target/wasm32-unknown-unknown/debug/deps",
+    "-L", "/Users/szhong/Code/verus-explorer/target/wasm32-unknown-unknown/release/deps",
 ]

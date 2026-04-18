@@ -1,3 +1,17 @@
+# Single workspace shared with rustc-rlibs so Cargo resolves deps *once*
+# across both crates: shared Cargo.lock → identical dep versions, shared
+# feature unions → identical crate hashes, shared target/ → rustc-rlibs'
+# wasm32 rlibs land in the deps dir the explorer (and Verus's
+# `mir_build_verus` fork) look in for `extern crate rustc_*;` lookups.
+# Two independent workspaces would resolve features differently and surface
+# as E0460 "possibly newer version of crate" mismatches at link time.
+# `exclude = ["third_party"]` keeps Verus's inner workspace from being
+# absorbed (its members rely on `lints = { workspace = true }` from
+# Verus's own `source/Cargo.toml`).
+[workspace]
+members = ["rustc-rlibs"]
+exclude = ["third_party"]
+
 [package]
 name = "verus-explorer"
 version = "0.1.0"
@@ -19,8 +33,19 @@ wasm-bindgen = "0.2"
 # Force getrandom 0.3's `wasm_js` feature on so its wasm32 backend compiles —
 # see the companion `.cargo/config.toml` rustflag. `rand` (pulled in by
 # rustc_abi) transitively depends on this.
+#
+# `rustc-rlibs` is listed here (not at the top-level `[dependencies]` above)
+# so pulling it into the explorer's dep graph only happens on wasm32 — it's
+# purely a vehicle for forcing Cargo to build wasm32 rlibs of every rustc_*
+# crate the explorer/rust_verify/mir_build fork `extern crate`. Declaring it
+# here (rather than building it via a separate `cargo build -p rustc-rlibs`
+# step in the Makefile) keeps feature resolution in one pass across both
+# trees — otherwise each invocation computes its own union and leaves
+# duplicate rlibs (e.g. `wasm_bindgen` with `[]` vs `[default, std]`) in the
+# shared `deps/` dir, which surfaces as rust-lld "duplicate symbol" errors.
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
+rustc-rlibs = { path = "rustc-rlibs" }
 
 [profile.release]
 opt-level = "s"

@@ -344,7 +344,7 @@ fn feed_module_decls(
     feeder: &mut Feeder,
     ctx: &mut Ctx,
     krate_sst: &KrateSst,
-    visible_dts: &[Datatype],
+    visible_dts: &Vec<Datatype>,
     mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
     feeder.feed_all(&Ctx::prelude(PreludeConfig {
@@ -437,17 +437,14 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
 
 // ---------- top-level entry ----------
 
-/// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
-/// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
-/// the UI splits on. `--sysroot=/virtual` pairs with the virtual sysroot
-/// callbacks installed in `lib::init` — rustc's crate locator finds
-/// `libcore.rmeta` (and friends), plus our prebuilt `libverus_builtin.rmeta`,
-/// in the embedded bundle instead of on disk. We inject `#![no_std]` so only
-/// `core` is needed from std, and prepend `extern crate verus_builtin;` so the
-/// builtin crate is linked and its `#[rustc_diagnostic_item]` registrations
-/// fire — that's what Verus keys its builtin lookups off of.
-pub fn parse_source(src: &str) -> String {
-    let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+// `--sysroot=/virtual` pairs with the virtual sysroot callbacks installed in
+// `lib::init` — rustc's crate locator finds `libcore.rmeta` (and friends), plus
+// our prebuilt `libverus_builtin.rmeta`, in the embedded bundle instead of on
+// disk. `#![no_std]` keeps std out (only `core` is needed), and the caller
+// prepends `extern crate verus_builtin;` so that crate is linked and its
+// `#[rustc_diagnostic_item]` registrations fire — Verus keys its builtin
+// lookups off those.
+fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     let argv: Vec<String> = [
         "--edition=2021",
         "--crate-type=lib",
@@ -463,106 +460,102 @@ pub fn parse_source(src: &str) -> String {
     .map(String::from)
     .collect();
 
-    let src = format!("extern crate verus_builtin;\n{src}");
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+    let matches = rustc_driver::handle_options(&early_dcx, &argv).expect("handle_options");
+    let opts = config::build_session_options(&mut early_dcx, &matches);
 
-    let dump_clone = dump.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
-        let matches = rustc_driver::handle_options(&early_dcx, &argv).expect("handle_options");
-        let opts = config::build_session_options(&mut early_dcx, &matches);
+    rustc_interface::interface::Config {
+        opts,
+        crate_cfg: vec![],
+        crate_check_cfg: vec![],
+        input: Input::Str { name: FileName::Custom("input.rs".into()), input: src },
+        output_file: None,
+        output_dir: None,
+        ice_file: None,
+        file_loader: Some(Box::new(VirtualFileLoader)),
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+        lint_caps: Default::default(),
+        psess_created: Some(Box::new(|psess| {
+            let writer: Box<dyn io::Write + Send> = Box::new(ConsoleWriter::new());
+            let dst = AutoStream::new(writer, ColorChoice::Never);
+            let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
+                .sm(Some(psess.clone_source_map()));
+            psess.dcx().set_emitter(Box::new(emitter));
+        })),
+        hash_untracked_state: None,
+        register_lints: None,
+        override_queries: None,
+        extra_symbols: vec![],
+        make_codegen_backend: None,
+        registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
+        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
+    }
+}
 
-        let config = rustc_interface::interface::Config {
-            opts,
-            crate_cfg: vec![],
-            crate_check_cfg: vec![],
-            input: Input::Str {
-                name: FileName::Custom("input.rs".into()),
-                input: src.to_string(),
-            },
-            output_file: None,
-            output_dir: None,
-            ice_file: None,
-            file_loader: Some(Box::new(VirtualFileLoader)),
-            locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
-            lint_caps: Default::default(),
-            psess_created: Some(Box::new(|psess| {
-                let writer: Box<dyn io::Write + Send> = Box::new(ConsoleWriter::new());
-                let dst = AutoStream::new(writer, ColorChoice::Never);
-                let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
-                    .sm(Some(psess.clone_source_map()));
-                psess.dcx().set_emitter(Box::new(emitter));
-            })),
-            hash_untracked_state: None,
-            register_lints: None,
-            override_queries: None,
-            extra_symbols: vec![],
-            make_codegen_backend: None,
-            registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
-            using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
-        };
+fn run_pipeline(compiler: &Compiler) -> String {
+    let krate = rustc_interface::passes::parse(&compiler.sess);
+    let mut out = String::new();
+    writeln!(out, "=== AST ===").unwrap();
+    writeln!(out, "crate items: {}", krate.items.len()).unwrap();
+    for item in &krate.items {
+        writeln!(
+            out,
+            "  {:?} {}",
+            item.kind.descr(),
+            item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+    rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+        dump_hir(&mut out, tcx);
+        dump_vir_and_verify(&mut out, compiler, tcx);
+    });
+    out
+}
 
-        rustc_interface::interface::run_compiler(config, |compiler| {
-            let krate = rustc_interface::passes::parse(&compiler.sess);
-            let mut out = String::new();
-            writeln!(out, "=== AST ===").unwrap();
-            writeln!(out, "crate items: {}", krate.items.len()).unwrap();
-            for item in &krate.items {
-                writeln!(
-                    out,
-                    "  {:?} {}",
-                    item.kind.descr(),
-                    item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
-                )
-                .unwrap();
+fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
+    writeln!(out, "=== HIR ===").unwrap();
+    // Forces macro expansion + name resolution + HIR lowering.
+    let _ = tcx.resolver_for_lowering();
+    for item_id in tcx.hir_free_items() {
+        let def_id = item_id.owner_id.def_id.to_def_id();
+        writeln!(
+            out,
+            "  {} {}",
+            tcx.def_kind(def_id).descr(def_id),
+            tcx.def_path_str(def_id)
+        )
+        .unwrap();
+    }
+    writeln!(out).unwrap();
+}
+
+fn dump_vir_and_verify(out: &mut String, compiler: &Compiler, tcx: TyCtxt<'_>) {
+    writeln!(out, "=== VIR ===").unwrap();
+    let (krate, global_ctx, crate_name) = match build_vir(compiler, tcx) {
+        Ok(v) => v,
+        Err(errs) => {
+            for e in errs {
+                writeln!(out, "  vir error: {}", e.note).unwrap();
             }
-            writeln!(out).unwrap();
-            writeln!(out, "=== HIR ===").unwrap();
-            rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-                // Forces macro expansion + name resolution + HIR lowering.
-                let _ = tcx.resolver_for_lowering();
-                for item_id in tcx.hir_free_items() {
-                    let def_id = item_id.owner_id.def_id.to_def_id();
-                    writeln!(
-                        out,
-                        "  {} {}",
-                        tcx.def_kind(def_id).descr(def_id),
-                        tcx.def_path_str(def_id)
-                    )
-                    .unwrap();
-                }
-                writeln!(out).unwrap();
-                writeln!(out, "=== VIR ===").unwrap();
-                match build_vir(compiler, tcx) {
-                    Ok((krate, global_ctx, crate_name)) => {
-                        let mut buf: Vec<u8> = Vec::new();
-                        vir::printer::write_krate(
-                            &mut buf,
-                            &krate,
-                            &vir::printer::COMPACT_TONODEOPTS,
-                        );
-                        out.push_str(&String::from_utf8_lossy(&buf));
-                        writeln!(out).unwrap();
-                        match verify_simplified_krate(krate, global_ctx, crate_name) {
-                            Ok(output) => write_verify_output(&mut out, &output),
-                            Err(e) => {
-                                writeln!(out, "  verify error: {}", e.note).unwrap();
-                            }
-                        }
-                    }
-                    Err(errs) => {
-                        for e in errs {
-                            writeln!(out, "  vir error: {}", e.note).unwrap();
-                        }
-                    }
-                }
-            });
-            *dump_clone.lock().unwrap() = out;
-        });
-    }));
-    // Always return whatever the closure managed to dump. `run_compiler`
-    // post-processing can panic via `abort_if_errors` after our closure writes
-    // `dump`, which would otherwise shadow a valid HIR dump with "panicked: …".
-    let partial = dump.lock().unwrap().clone();
+            return;
+        }
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
+    out.push_str(&String::from_utf8_lossy(&buf));
+    writeln!(out).unwrap();
+    match verify_simplified_krate(krate, global_ctx, crate_name) {
+        Ok(output) => write_verify_output(out, &output),
+        Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
+    }
+}
+
+// Always return whatever the closure managed to dump. `run_compiler`
+// post-processing can panic via `abort_if_errors` after our closure writes the
+// dump, which would otherwise shadow a valid dump with "panicked: …".
+fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> String {
     match result {
         Ok(()) => partial,
         Err(e) => {
@@ -578,4 +571,20 @@ pub fn parse_source(src: &str) -> String {
             }
         }
     }
+}
+
+/// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
+/// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
+/// the UI splits on.
+pub fn parse_source(src: &str) -> String {
+    let src = format!("extern crate verus_builtin;\n{src}");
+    let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let dump_clone = dump.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
+            *dump_clone.lock().unwrap() = run_pipeline(compiler);
+        });
+    }));
+    let partial = dump.lock().unwrap().clone();
+    unwrap_dump_or_panic(result, partial)
 }
