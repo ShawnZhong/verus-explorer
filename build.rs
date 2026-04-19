@@ -102,7 +102,7 @@ fn main() {
     // Order vs. the script above doesn't matter — only ordering vs. the
     // staged_lib enumeration below does.
     for name in HOST_PROC_MACRO_CRATES {
-        extract_host_macros_rmeta(&staged_lib, name);
+        extract_proc_macro_rmeta(&staged_lib, name);
     }
 
     // Emit the bundle: every .rmeta in staged_lib, sorted for stable order.
@@ -129,7 +129,7 @@ fn main() {
 // rustc stores crate metadata there for `extern crate` loading; the layout
 // is an 8-byte magic (`rust\0\0\0\x0a`) + u64 LE length, then bytes that
 // are identical to what `rustc --emit=metadata` would emit.
-fn extract_host_macros_rmeta(staged_lib: &Path, crate_name: &str) {
+fn extract_proc_macro_rmeta(staged_lib: &Path, crate_name: &str) {
     let dylib_ext = if cfg!(target_os = "macos") {
         "dylib"
     } else if cfg!(target_os = "windows") {
