@@ -13,6 +13,12 @@
 // `-L dependency=...` rustflag in `.cargo/config.toml`.
 
 #![feature(rustc_private)]
+// `proc_macro_internals` exposes `rustc_proc_macro::bridge::client::ProcMacro`,
+// which we need to build the static descriptor slice registered with
+// `rustc_metadata::proc_macro_registry` (see src/proc_macros.rs). It's gated
+// as "internal to the compiler" — that's precisely what we are here, so
+// silence the `internal_features` lint rather than working around it.
+#![allow(internal_features)]
 #![feature(proc_macro_internals)]
 
 extern crate rustc_driver;
@@ -36,8 +42,12 @@ extern "C" {
     pub(crate) fn console_error(msg: &str);
 }
 
+// `#[wasm_bindgen(start)]` fires when this crate is the final cdylib (the
+// browser build via `wasm-pack build`). Integration tests link us as an
+// rlib into `wasm-bindgen-test`'s own cdylib, so the start hook doesn't
+// run there — those tests call `init()` explicitly.
 #[wasm_bindgen(start)]
-fn init() {
+pub fn init() {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
     sysroot::install();
     proc_macros::install();

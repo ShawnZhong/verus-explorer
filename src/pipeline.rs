@@ -502,6 +502,10 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         "--cfg=verus_keep_ghost",
         "-Zcrate-attr=no_std",
         "-Zcrate-attr=feature(register_tool)",
+        // `verus!` expansion emits `#[...]` attributes on expressions
+        // (e.g. `#[verus::internal(...)] foo`) — unstable without this.
+        "-Zcrate-attr=feature(stmt_expr_attributes)",
+        "-Zcrate-attr=feature(proc_macro_hygiene)",
         "-Zcrate-attr=register_tool(verus)",
         "-Zcrate-attr=register_tool(verifier)",
     ]

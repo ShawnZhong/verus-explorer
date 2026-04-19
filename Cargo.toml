@@ -39,6 +39,11 @@ edition = "2024"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+# Doctests would spawn `rustdoc --test` with its own compiler invocation that
+# doesn't pick up `.cargo/config.toml`'s `-L dependency=...` rustflag for
+# `extern crate rustc_*;` resolution — it would fail with E0463. We have no
+# real doctests anyway.
+doctest = false
 
 [build-dependencies]
 # Used by build.rs to extract the embedded `.rustc` section from the host
