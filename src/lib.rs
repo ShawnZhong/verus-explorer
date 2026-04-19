@@ -40,6 +40,13 @@ use wasm_bindgen::prelude::*;
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = error)]
     pub(crate) fn console_error(msg: &str);
+
+    // Imported from `public/index.html`. Called synchronously from
+    // `pipeline::ConsoleWriter` so each rustc diagnostic lands in the
+    // output panel before rustc's `abort_if_errors` turns into a wasm
+    // `unreachable` trap (see the comment on `ConsoleWriter`).
+    #[wasm_bindgen(js_name = verus_diagnostic)]
+    pub(crate) fn verus_diagnostic(msg: &str);
 }
 
 // `#[wasm_bindgen(start)]` fires when this crate is the final cdylib (the

@@ -36,36 +36,40 @@ use vir::messages::VirMessageInterface;
 use vir::prelude::PreludeConfig;
 use vir::sst::KrateSst;
 
-use crate::console_error;
+use crate::verus_diagnostic;
 
 // ---------- rustc plumbing ----------
 
 // wasm32 has panic=abort, so `catch_unwind` can't recover from rustc's
-// `abort_if_errors`. Route rustc's emitter to `console.error` so diagnostics
-// are visible *before* the abort trap fires, and tee the same bytes into
-// `captured` so `parse_source` can surface them in the UI's DIAGNOSTICS
-// section.
+// `abort_if_errors` (which fires on return from `run_compiler` whenever a
+// diagnostic was emitted). That panic degrades to `unreachable` and traps
+// the wasm instance, so `parse_source` never returns and any error text
+// buffered into the return String is lost.
+//
+// To work around it, we push each diagnostic *synchronously* out to
+// `public/index.html`'s imported `verus_diagnostic` JS function, which
+// appends a styled block to the output panel. Bytes that reach JS before
+// the trap stay in the DOM regardless.
 //
 // rustc's `HumanEmitter` writes a single diagnostic in several
-// `write_all`+`flush` cycles (header, source span, suggestions). Flushing each
-// cycle to `console.error` chops one diagnostic into many devtools entries.
-// We coalesce by emitting only on the blank-line separator that rustc inserts
-// between diagnostics — anything else is held until the next flush. Drop emits
-// the trailing partial buffer so nothing is lost on abort-after-emit.
-struct ConsoleWriter {
+// `write_all`+`flush` cycles (header, source span, suggestions). Flushing
+// each cycle separately would chop one diagnostic into many UI entries. We
+// coalesce by emitting only on the blank-line separator rustc inserts
+// between diagnostics — anything else is held until the next flush. Drop
+// emits the trailing partial buffer so nothing is lost on abort-after-emit.
+struct DomWriter {
     pending: Vec<u8>,
-    captured: SharedBuf,
 }
 
-impl ConsoleWriter {
-    fn new(captured: SharedBuf) -> Self {
-        Self { pending: Vec::new(), captured }
+impl DomWriter {
+    fn new() -> Self {
+        Self { pending: Vec::new() }
     }
     fn emit_complete_blocks(&mut self) {
         while let Some(idx) = find_block_end(&self.pending) {
             let trimmed = &self.pending[..idx];
             if !trimmed.is_empty() {
-                console_error(&String::from_utf8_lossy(trimmed));
+                verus_diagnostic(&String::from_utf8_lossy(trimmed));
             }
             self.pending.drain(..idx + 2);
         }
@@ -76,10 +80,9 @@ fn find_block_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
 }
 
-impl io::Write for ConsoleWriter {
+impl io::Write for DomWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.pending.extend_from_slice(buf);
-        self.captured.0.lock().unwrap().extend_from_slice(buf);
         self.emit_complete_blocks();
         Ok(buf.len())
     }
@@ -89,10 +92,10 @@ impl io::Write for ConsoleWriter {
     }
 }
 
-impl Drop for ConsoleWriter {
+impl Drop for DomWriter {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
-            console_error(&String::from_utf8_lossy(&self.pending));
+            verus_diagnostic(&String::from_utf8_lossy(&self.pending));
             self.pending.clear();
         }
     }
@@ -517,10 +520,7 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
 // prepends `extern crate verus_builtin;` so that crate is linked and its
 // `#[rustc_diagnostic_item]` registrations fire — Verus keys its builtin
 // lookups off those.
-fn build_rustc_config(
-    src: String,
-    diagnostics: SharedBuf,
-) -> rustc_interface::interface::Config {
+fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     let argv: Vec<String> = [
         "--edition=2021",
         "--crate-type=lib",
@@ -556,8 +556,7 @@ fn build_rustc_config(
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps: Default::default(),
         psess_created: Some(Box::new(move |psess| {
-            let writer: Box<dyn io::Write + Send> =
-                Box::new(ConsoleWriter::new(diagnostics));
+            let writer: Box<dyn io::Write + Send> = Box::new(DomWriter::new());
             let dst = AutoStream::new(writer, ColorChoice::Never);
             let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
                 .sm(Some(psess.clone_source_map()));
@@ -677,27 +676,11 @@ pub fn parse_source(src: &str, stages: DumpStages, verify: bool) -> String {
     let src = format!("extern crate vstd;\n{src}");
     let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let dump_clone = dump.clone();
-    let diagnostics = SharedBuf::new();
-    let diagnostics_for_config = diagnostics.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rustc_interface::interface::run_compiler(
-            build_rustc_config(src, diagnostics_for_config),
-            |compiler| {
-                *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
-            },
-        );
+        rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
+            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
+        });
     }));
     let partial = dump.lock().unwrap().clone();
-    let mut output = unwrap_dump_or_panic(result, partial);
-    let diag_text = diagnostics.drain_string();
-    let diag_text = diag_text.trim_end();
-    if !diag_text.is_empty() {
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-        writeln!(output, "=== DIAGNOSTICS ===").unwrap();
-        output.push_str(diag_text);
-        output.push('\n');
-    }
-    output
+    unwrap_dump_or_panic(result, partial)
 }

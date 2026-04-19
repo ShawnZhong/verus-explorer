@@ -1,37 +1,28 @@
-// Bundles wasm32-unknown-unknown rmeta files into the wasm binary so the
-// vendored rustc crates can resolve extern crates without a real filesystem.
-// Bundles, in order:
-//   1. libcore / libcompiler_builtins / liballoc — self-built from the
-//      `rust-src` component into a staged sysroot here. Self-building (rather
-//      than copying rustup's prebuilt rmetas) shaves ~15 MB raw because the
-//      shipped rmetas are compiled with `-Z always-encode-mir=yes` for cross-
-//      crate inlining, which we don't need.
-//   2. libverus_builtin — compiled on demand from Verus's `builtin` crate
-//      source to wasm32 rmeta here, so Verus's diagnostic-item lookups
-//      (`verus::verus_builtin::*`) resolve at runtime.
-//   3. libverus_builtin_macros — `pub macro` stub crate matching the names
-//      `vstd` re-exports; the in-wasm proc-macro registry handles the actual
-//      expansion (see `src/proc_macros.rs`).
-//   4. libvstd — produced by invoking the host `rust_verify` driver against
-//      Verus's real `vstd` source for wasm32, so user code can `use
-//      vstd::prelude::*;` and the verifier loads the matching VIR.
-// Plus `vstd.vir` (bincode-serialized VIR krate), embedded as a separate
-// `VSTD_VIR: &[u8]` constant so `pipeline::build_vir` can hand it to
-// `Verifier::build_vir_crate` as `other_vir_crates`.
+// Bundles wasm32 rmetas into the binary so in-wasm rustc can resolve
+// `extern crate` against a virtual sysroot. Bundles:
+//   1. core / compiler_builtins / alloc — self-built from `rust-src`.
+//      Saves ~15 MB vs rustup's prebuilts (which carry MIR for cross-
+//      crate inlining we never use, since we never codegen).
+//   2. verus_builtin — wasm32 rmeta for Verus's diagnostic-item lookups
+//      (`verus::verus_builtin::*`).
+//   3. verus_builtin_macros + verus_state_machines_macros — host rmeta
+//      extracted from each proc-macro dylib's `.rustc` section. Can't
+//      rebuild for wasm32 (proc-macros are host-only) and can't rebuild
+//      a separate host copy either: rust_verify links these dylibs into
+//      vstd.rmeta's dep table by SVH, and a from-scratch rebuild would
+//      drift on any flag/env difference and surface as E0464 at user-
+//      code load. Extracting from the same dylib pins SVH for free.
+//   4. vstd.rmeta + vstd.vir — built by host rust_verify against the
+//      staged sysroot above. The .vir blob (bincode-serialized VIR krate)
+//      is exposed as a separate `VSTD_VIR: &[u8]` so `pipeline::build_vir`
+//      can hand it to `Verifier::build_vir_crate` as `other_vir_crates`.
 //
-// Steps 1, 2, and 4 are shelled out to `scripts/build-wasm-sysroot.sh`
-// (base / vstd subcommands). Step 3 stays here because it parses Mach-O
-// `.rustc` sections via the `object` crate — awkward to do in shell.
+// Steps 1/2/4 run in `scripts/build-wasm-libs.sh`. Step 3 stays here
+// because it parses Mach-O / ELF `.rustc` sections via the `object` crate.
+// Everything is built with `--sysroot=<staged>` so the SVH chain lines up.
 //
-// Both verus_builtin and vstd are built with `--sysroot=<staged>` so they
-// pick up our self-built libcore (different SVH from rustup's prebuilt) —
-// otherwise the bundle's dep chain would mismatch and surface as E0464 /
-// E0460 at user-code load time.
-//
-// Rlib object code is not bundled (we never codegen).
-//
-// Runs only when building for wasm32. For host/test builds we emit an empty
-// `FILES` table — the host has a real filesystem and doesn't need the bundle.
+// On non-wasm targets we emit empty FILES/VSTD_VIR — the host has a real
+// filesystem and doesn't need the bundle.
 
 use std::env;
 use std::fs;
@@ -53,7 +44,7 @@ const VSTD_RMETA: &str = "libvstd.rmeta";
 const VSTD_VIR: &str = "vstd.vir";
 
 const VERUS_HOST_DIR: &str = "target/verus-host/release";
-const BUILD_SCRIPT: &str = "scripts/build-wasm-sysroot.sh";
+const BUILD_SCRIPT: &str = "scripts/build-wasm-libs.sh";
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
@@ -88,23 +79,13 @@ fn main() {
     let _ = fs::remove_dir_all(&staged_sysroot);
     fs::create_dir_all(&staged_lib).expect("mkdir staged sysroot lib");
 
-    // Phase 1: core + compiler_builtins + alloc + verus_builtin.
-    run_sysroot_script("base", &staged_sysroot);
-
-    // Phase 2: pull each host proc-macro crate's rmeta out of the dylib's
-    // embedded `.rustc` section. Its SVH must match the host dylib that
-    // rust_verify uses as `--extern <name>=...` when compiling vstd — by
-    // reading the bytes from the same dylib, SVH match is guaranteed.
-    for name in HOST_PROC_MACRO_CRATES {
-        let staged_name = format!("lib{name}-explorer.rmeta");
-        extract_host_macros_rmeta(&staged_lib, name, &staged_name);
-    }
-
-    // Phase 3: vstd via the host rust_verify driver. Needs phases 1 + 2
-    // already staged — rust_verify passes the host proc-macro dylibs as
-    // --extern and resolves vstd's `core`/`alloc`/`compiler_builtins`
-    // deps against the rmetas built in phase 1.
-    run_sysroot_script("vstd", &staged_sysroot);
+    // Stage all wasm32 rmetas + vstd.vir in one shot: core, compiler_builtins,
+    // alloc, verus_builtin, vstd.
+    let status = Command::new(BUILD_SCRIPT)
+        .arg(&staged_sysroot)
+        .status()
+        .unwrap_or_else(|e| panic!("spawn {BUILD_SCRIPT}: {e}"));
+    assert!(status.success(), "{BUILD_SCRIPT} failed");
     let vstd_vir_path = staged_lib.join(VSTD_VIR);
     assert!(
         staged_lib.join(VSTD_RMETA).exists(),
@@ -115,8 +96,16 @@ fn main() {
         "expected {VSTD_VIR} in staged sysroot lib after rust_verify --export"
     );
 
+    // Pull each proc-macro dylib's `.rustc` section out as a sibling rmeta in
+    // staged_lib. SVH is guaranteed to match what rust_verify already wrote
+    // into vstd.rmeta's dep table because the bytes come from the same dylib.
+    // Order vs. the script above doesn't matter — only ordering vs. the
+    // staged_lib enumeration below does.
+    for name in HOST_PROC_MACRO_CRATES {
+        extract_host_macros_rmeta(&staged_lib, name);
+    }
+
     // Emit the bundle: every .rmeta in staged_lib, sorted for stable order.
-    let mut src = String::from("pub static FILES: &[(&str, &[u8])] = &[\n");
     let mut entries: Vec<String> = fs::read_dir(&staged_lib)
         .expect("read staged lib")
         .filter_map(|e| e.ok())
@@ -124,32 +113,23 @@ fn main() {
         .filter(|n| n.ends_with(".rmeta"))
         .collect();
     entries.sort();
+    let mut src = String::from("pub static FILES: &[(&str, &[u8])] = &[\n");
     for name in &entries {
-        let staged = staged_lib.join(name);
-        let staged_str = staged.to_str().expect("rmeta path utf8");
-        src.push_str(&format!("    ({name:?}, include_bytes!({staged_str:?})),\n"));
+        let path = staged_lib.join(name);
+        src.push_str(&format!("    ({name:?}, include_bytes!({path:?})),\n"));
     }
     src.push_str("];\n");
-    let vir_str = vstd_vir_path.to_str().expect("vstd.vir path utf8");
-    src.push_str(&format!("pub static VSTD_VIR: &[u8] = include_bytes!({vir_str:?});\n"));
+    src.push_str(&format!(
+        "pub static VSTD_VIR: &[u8] = include_bytes!({vstd_vir_path:?});\n"
+    ));
     fs::write(&bundle_rs, src).expect("write sysroot_bundle.rs");
 }
 
-fn run_sysroot_script(sub: &str, staged_sysroot: &Path) {
-    let status = Command::new(BUILD_SCRIPT)
-        .arg(sub)
-        .arg(staged_sysroot)
-        .status()
-        .unwrap_or_else(|e| panic!("spawn {BUILD_SCRIPT} {sub}: {e}"));
-    assert!(status.success(), "{BUILD_SCRIPT} {sub} failed");
-}
-
-// Pull the rmeta bytes out of a host proc-macro dylib's embedded `.rustc`
-// section. rustc always stores crate metadata there so cargo can load
-// proc-macros via `extern crate`. The section layout is a 16-byte header
-// (`rust\0\0\0\x0a` magic + u64 LE length) followed by the rmeta bytes —
-// which are byte-identical to what `rustc --emit=metadata` would produce.
-fn extract_host_macros_rmeta(staged_lib: &Path, crate_name: &str, staged_name: &str) {
+// Pull rmeta bytes out of a host proc-macro dylib's `.rustc` section.
+// rustc stores crate metadata there for `extern crate` loading; the layout
+// is an 8-byte magic (`rust\0\0\0\x0a`) + u64 LE length, then bytes that
+// are identical to what `rustc --emit=metadata` would emit.
+fn extract_host_macros_rmeta(staged_lib: &Path, crate_name: &str) {
     let dylib_ext = if cfg!(target_os = "macos") {
         "dylib"
     } else if cfg!(target_os = "windows") {
@@ -158,22 +138,18 @@ fn extract_host_macros_rmeta(staged_lib: &Path, crate_name: &str, staged_name: &
         "so"
     };
     let dylib = PathBuf::from(VERUS_HOST_DIR).join(format!("lib{crate_name}.{dylib_ext}"));
-    assert!(
-        dylib.exists(),
-        "missing host proc-macro dylib {:?} — run `make verus-host`",
-        dylib
-    );
+    assert!(dylib.exists(), "missing {dylib:?} — run `make verus-host`");
     let bytes = fs::read(&dylib).expect("read host proc-macro dylib");
     let obj = object::File::parse(&*bytes).expect("parse host proc-macro dylib");
-    let section = obj
+    let data = obj
         .section_by_name(".rustc")
-        .expect(".rustc section in host proc-macro dylib");
-    let data = section.data().expect(".rustc section data");
+        .expect(".rustc section")
+        .data()
+        .expect(".rustc section data");
     assert!(
         data.len() >= 16 && &data[0..8] == b"rust\x00\x00\x00\x0a",
-        "unexpected .rustc section header in {:?}",
-        dylib
+        "unexpected .rustc header in {dylib:?}"
     );
-    let staged = staged_lib.join(staged_name);
+    let staged = staged_lib.join(format!("lib{crate_name}-explorer.rmeta"));
     fs::write(&staged, &data[16..]).expect("write extracted rmeta");
 }

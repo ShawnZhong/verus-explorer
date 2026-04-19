@@ -66,6 +66,11 @@
       font-size: .85em;
     }
 
+    pre.diagnostic {
+      background: #fdf2f2;
+      border-left: 3px solid #b42318;
+    }
+
     textarea {
       width: 100%;
       min-height: 10em;
@@ -178,6 +183,16 @@ fn main() {
     const parseInput = document.getElementById('parse-input');
     const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
+    // Synchronously invoked by Rust (`src/pipeline.rs::DomWriter`) for each
+    // rustc diagnostic while `parse_source` is still running. Landing text in
+    // the DOM here means it survives the `unreachable` trap that rustc's
+    // `abort_if_errors` produces on wasm32 (panic=abort).
+    globalThis.verus_diagnostic = (msg) => {
+      const pre = document.createElement('pre');
+      pre.className = 'diagnostic';
+      pre.textContent = msg;
+      parseOut.appendChild(pre);
+    };
     const dumpAirInitial = document.getElementById('parse-dump-air-initial');
     const dumpAirMiddle = document.getElementById('parse-dump-air-middle');
     const dumpAirFinal = document.getElementById('parse-dump-air-final');
@@ -251,13 +266,21 @@ fn main() {
             sections[name] = body;
           }
         }
-        for (const name of ['output', 'VERDICT', 'DIAGNOSTICS', 'AST', 'HIR', 'VIR']) {
+        for (const name of ['output', 'VERDICT', 'AST', 'HIR', 'VIR']) {
           if (sections[name] !== undefined) addParseBlock(name, sections[name]);
         }
         addAirToggle(air);
       } catch (e) {
-        addParseBlock('error', 'Parse crashed: ' + (e?.message ?? e));
-        console.error(e);
+        // When rustc emits diagnostics, `abort_if_errors` degrades to a wasm
+        // `unreachable` trap that propagates here as `RuntimeError`. The
+        // diagnostic text was already appended to `parse-out` live via
+        // `verus_diagnostic`, so treat the trap as informational rather than
+        // an opaque crash.
+        const hasDiag = parseOut.querySelector('pre.diagnostic');
+        if (!hasDiag) {
+          addParseBlock('error', 'Parse crashed: ' + (e?.message ?? e));
+          console.error(e);
+        }
       } finally {
         parseButton.disabled = false;
       }
