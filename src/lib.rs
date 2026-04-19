@@ -13,20 +13,12 @@
 // `-L dependency=...` rustflag in `.cargo/config.toml`.
 
 #![feature(rustc_private)]
-// `proc_macro_internals` exposes `rustc_proc_macro::bridge::client::ProcMacro`,
-// which we need to build the static descriptor slice registered with
-// `rustc_metadata::proc_macro_registry` (see src/proc_macros.rs). It's gated
-// as "internal to the compiler" — that's precisely what we are here, so
-// silence the `internal_features` lint rather than working around it.
-#![allow(internal_features)]
-#![feature(proc_macro_internals)]
 
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_interface;
 extern crate rustc_metadata;
 extern crate rustc_middle;
-extern crate rustc_proc_macro;
 extern crate rustc_session;
 extern crate rustc_span;
 
