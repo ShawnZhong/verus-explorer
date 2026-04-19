@@ -128,7 +128,7 @@ fn main() {
 
 } // verus!
 </textarea>
-    <button id="parse-run" disabled>Parse</button>
+    <button id="parse-run">Verify</button>
     <span style="margin-left: .6em; display: inline-flex; gap: .8em;">
       <label><input type="checkbox" id="parse-dump-air-initial" /> air initial</label>
       <label><input type="checkbox" id="parse-dump-air-middle" /> air middle</label>
@@ -142,8 +142,6 @@ fn main() {
   <script src="./z3.js"></script>
 
   <script type="module">
-    import init, { parse_source } from './verus_explorer.js';
-
     // Async-load the Z3 wasm module and stash it on globalThis. Emscripten
     // resolves z3.wasm relative to the loading script URL by default, so no
     // locateFile callback is needed.
@@ -159,7 +157,23 @@ fn main() {
     globalThis.Z3_eval_smtlib2_string = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
     globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
 
-    await init();
+    // rustc isn't designed for in-process re-entry — `SESSION_GLOBALS`,
+    // symbol/span interners, and various `OnceLock`s accumulate state across
+    // calls. We side-step the whole class of "what state leaks across calls"
+    // bugs by giving every parse_source a fresh wasm instance: compile the
+    // module once (~580ms), then for each call dynamic-import the
+    // wasm-bindgen JS shim with a nonce (fresh module scope → fresh `wasm`
+    // singleton) and re-instantiate against the cached `WebAssembly.Module`
+    // (~100ms). Old instances become GC-eligible once the prior import drops
+    // out of scope.
+    const verusModule = await WebAssembly.compileStreaming(
+      fetch('./verus_explorer_bg.wasm')
+    );
+    const freshVerus = async () => {
+      const mod = await import(`./verus_explorer.js?nonce=${Date.now()}`);
+      await mod.default({ module_or_path: verusModule });
+      return mod;
+    };
 
     const parseInput = document.getElementById('parse-input');
     const parseOut = document.getElementById('parse-out');
@@ -208,9 +222,11 @@ fn main() {
       parseOut.appendChild(pre);
       show(present[0]);
     };
-    const runParse = () => {
+    const runParse = async () => {
       parseOut.textContent = '';
+      parseButton.disabled = true;
       try {
+        const { parse_source } = await freshVerus();
         const text = parse_source(
           parseInput.value,
           dumpAirInitial.checked,
@@ -235,16 +251,17 @@ fn main() {
             sections[name] = body;
           }
         }
-        for (const name of ['output', 'VERDICT', 'AST', 'HIR', 'VIR']) {
+        for (const name of ['output', 'VERDICT', 'DIAGNOSTICS', 'AST', 'HIR', 'VIR']) {
           if (sections[name] !== undefined) addParseBlock(name, sections[name]);
         }
         addAirToggle(air);
       } catch (e) {
         addParseBlock('error', 'Parse crashed: ' + (e?.message ?? e));
         console.error(e);
+      } finally {
+        parseButton.disabled = false;
       }
     };
-    parseButton.disabled = false;
     parseButton.addEventListener('click', runParse);
     runParse();
   </script>

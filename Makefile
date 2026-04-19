@@ -18,23 +18,6 @@ BUILD := build
 # $(DIST)/z3.wasm, which uses the WebAssembly exception-handling proposal.
 PKG   := $(DIST)/pkg
 
-# Host artifacts that build.rs invokes against vstd source.
-VERUS_HOST_DIR := third_party/verus/source/target/release
-VERUS_HOST_ARTIFACTS := \
-  $(VERUS_HOST_DIR)/rust_verify \
-  $(VERUS_HOST_DIR)/libverus_builtin_macros.dylib \
-  $(VERUS_HOST_DIR)/libverus_state_machines_macros.dylib
-
-# `verus_keep_ghost` is the one cfg load-bearing for our host build: it
-# flips `cfg_erase()` in verus_builtin_macros to its smart `expand_expr`
-# variant instead of unconditionally erasing every ghost `pub use` — the
-# latter makes vstd typecheck fail with ~85 E0603 "private import" errors.
-# `--check-cfg` silences the "unexpected cfg" warnings that would otherwise
-# fire from deps that don't declare these names.
-VERUS_RUSTFLAGS := --cfg=verus_keep_ghost \
-                   --check-cfg=cfg(verus_keep_ghost) \
-                   --check-cfg=cfg(verus_keep_ghost_body)
-
 # `rustc-rlibs` is a wasm32-only path dep of this crate (see Cargo.toml), so
 # wasm-pack's single cargo invocation resolves features across both trees
 # in one pass and builds every rustc_* wasm32 rlib into
@@ -50,16 +33,10 @@ dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm verus-host
 # extracts the rmeta from each dylib's embedded `.rustc` section to bundle
 # into the virtual sysroot — that way vstd.rmeta's dep entries (stable
 # crate id + SVH) line up exactly with what user-code rustc-in-wasm later
-# finds. One `cargo build` covers all three artifacts because rust_verify
-# transitively depends on both proc-macro crates.
-verus-host: $(VERUS_HOST_ARTIFACTS)
-$(VERUS_HOST_ARTIFACTS) &:
-	RUSTFLAGS="$(VERUS_RUSTFLAGS)" cargo build \
-	  --manifest-path third_party/verus/source/Cargo.toml \
-	  -p rust_verify \
-	  -p verus_builtin_macros \
-	  -p verus_state_machines_macros \
-	  --release
+# finds. Phony so each invocation re-checks via cargo (cargo itself skips
+# work when nothing changed).
+verus-host:
+	./scripts/build-host-verus.sh
 
 $(DIST)/z3.%: $(BUILD)/z3.% | $(DIST)
 	cp $< $@
@@ -91,4 +68,4 @@ deploy: release
 	git push --force origin gh-pages
 
 clean:
-	rm -rf target $(BUILD)
+	rm -rf target

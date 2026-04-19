@@ -83,10 +83,24 @@ rustc-rlibs = { path = "rustc-rlibs" }
 [target.wasm32-unknown-unknown.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+# Aggressive size tuning for the rustc-in-wasm bundle:
+# - `opt-level = "z"` favors size over speed (vs. "s" which still respects
+#   loop unrolling/inlining heuristics).
+# - `lto = "fat"` lets LLVM inline + dead-strip across crate boundaries; the
+#   rustc frontend has lots of monomorphized generics that only one caller
+#   actually uses, and fat LTO is what lets DCE see them.
+# - `codegen-units = 1` is required for fat LTO to be effective.
+# - `strip = true` drops the embedded `name` section and DWARF debuginfo
+#   from the final wasm; saves a lot on a binary this large.
+# - `panic = "abort"` removes panic landing pads. wasm32 has no unwinding
+#   anyway (panic = unwind degrades to abort at runtime), but setting it
+#   explicitly lets rustc skip emitting the cleanup edges in MIR/LLVM IR.
 [profile.release]
-opt-level = "s"
-lto = true
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
+strip = true
+panic = "abort"
 
 # Pulling in the whole rustc frontend makes the unoptimized wasm+debuginfo
 # bundle big enough that rust-lld SIGSEGVs during `make dev`. Dropping
@@ -94,7 +108,20 @@ codegen-units = 1
 [profile.dev]
 debug = 0
 
-# wasm-pack's default wasm-opt pass (-O ≈ -O3) is slow on a binary this size;
-# -O1 is several times faster with a small size/perf regression.
+# `-Oz` is wasm-opt's most aggressive size pass — much slower than the `-O1`
+# we used to run, but it deduplicates functions, shrinks locals, and runs
+# more passes than -O3 specifically targeted at code size.
+#
+# `--enable-bulk-memory` (and friends) tells wasm-opt to accept the modern
+# wasm features rustc/LLVM emit by default for `wasm32-unknown-unknown` —
+# without these flags wasm-opt's validator rejects the input with
+# "Bulk memory operations require bulk memory [--enable-bulk-memory]".
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ['-O1']
+wasm-opt = [
+    '-Oz',
+    '--enable-bulk-memory',
+    '--enable-nontrapping-float-to-int',
+    '--enable-sign-ext',
+    '--enable-mutable-globals',
+    '--enable-reference-types',
+]

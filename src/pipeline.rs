@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex};
 
 use air::ast::{Command, CommandX};
 use air::context::{Context, SmtSolver, ValidityResult};
-use air::messages::Reporter;
+use air::messages::{Diagnostics, MessageLevel};
 use rust_verify::buckets::Bucket;
 use rust_verify::cargo_verus_dep_tracker::DepTracker;
 use rust_verify::commands::{OpGenerator, OpKind};
 use rust_verify::config::ArgsX;
 use rust_verify::import_export::{decode_crate_with_metadata, CrateWithMetadata};
-use rust_verify::verifier::Verifier;
+use rust_verify::spans::SpanContext;
+use rust_verify::verifier::{Reporter, Verifier};
 use rustc_errors::emitter::HumanEmitter;
 use rustc_errors::registry::Registry;
 use rustc_errors::{AutoStream, ColorChoice};
@@ -41,7 +42,9 @@ use crate::console_error;
 
 // wasm32 has panic=abort, so `catch_unwind` can't recover from rustc's
 // `abort_if_errors`. Route rustc's emitter to `console.error` so diagnostics
-// are visible *before* the abort trap fires.
+// are visible *before* the abort trap fires, and tee the same bytes into
+// `captured` so `parse_source` can surface them in the UI's DIAGNOSTICS
+// section.
 //
 // rustc's `HumanEmitter` writes a single diagnostic in several
 // `write_all`+`flush` cycles (header, source span, suggestions). Flushing each
@@ -49,17 +52,22 @@ use crate::console_error;
 // We coalesce by emitting only on the blank-line separator that rustc inserts
 // between diagnostics — anything else is held until the next flush. Drop emits
 // the trailing partial buffer so nothing is lost on abort-after-emit.
-#[derive(Default)]
-struct ConsoleWriter(Vec<u8>);
+struct ConsoleWriter {
+    pending: Vec<u8>,
+    captured: SharedBuf,
+}
 
 impl ConsoleWriter {
+    fn new(captured: SharedBuf) -> Self {
+        Self { pending: Vec::new(), captured }
+    }
     fn emit_complete_blocks(&mut self) {
-        while let Some(idx) = find_block_end(&self.0) {
-            let trimmed = &self.0[..idx];
+        while let Some(idx) = find_block_end(&self.pending) {
+            let trimmed = &self.pending[..idx];
             if !trimmed.is_empty() {
                 console_error(&String::from_utf8_lossy(trimmed));
             }
-            self.0.drain(..idx + 2);
+            self.pending.drain(..idx + 2);
         }
     }
 }
@@ -70,7 +78,8 @@ fn find_block_end(buf: &[u8]) -> Option<usize> {
 
 impl io::Write for ConsoleWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.extend_from_slice(buf);
+        self.pending.extend_from_slice(buf);
+        self.captured.0.lock().unwrap().extend_from_slice(buf);
         self.emit_complete_blocks();
         Ok(buf.len())
     }
@@ -82,9 +91,9 @@ impl io::Write for ConsoleWriter {
 
 impl Drop for ConsoleWriter {
     fn drop(&mut self) {
-        if !self.0.is_empty() {
-            console_error(&String::from_utf8_lossy(&self.0));
-            self.0.clear();
+        if !self.pending.is_empty() {
+            console_error(&String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
         }
     }
 }
@@ -121,7 +130,7 @@ impl FileLoader for VirtualFileLoader {
 fn build_vir<'tcx>(
     compiler: &Compiler,
     tcx: TyCtxt<'tcx>,
-) -> Result<(Krate, GlobalCtx, Arc<String>), Vec<VirErr>> {
+) -> Result<(Krate, GlobalCtx, Arc<String>, SpanContext), Vec<VirErr>> {
     let mut args = ArgsX::new();
     // `Vstd::Imported` is the default and matches the user's
     // `extern crate vstd;` injection. The vstd VIR is embedded at compile
@@ -135,9 +144,10 @@ fn build_vir<'tcx>(
     let CrateWithMetadata { krate: vstd_krate, .. } =
         decode_crate_with_metadata(crate::sysroot::bundle::VSTD_VIR)
             .map_err(|e| vec![e])?;
-    let (krate, global_ctx) = Verifier::new(Arc::new(args), None, false, DepTracker::init())
-        .build_vir_crate(compiler, tcx, vec!["vstd".to_string()], vec![vstd_krate])?;
-    Ok((krate, global_ctx, crate_name))
+    let (krate, global_ctx, spans) =
+        Verifier::new(Arc::new(args), None, false, DepTracker::init())
+            .build_vir_crate(compiler, tcx, vec!["vstd".to_string()], vec![vstd_krate])?;
+    Ok((krate, global_ctx, crate_name, spans))
 }
 
 // ---------- VIR → AIR → Z3 ----------
@@ -234,11 +244,11 @@ impl AirBufs {
 
 // Constants shared across every module-level verify pass. Bundled into a
 // struct so `verify_module` and its helpers stay short.
-struct ModuleCtx<'a> {
+struct ModuleCtx<'a, 'tcx> {
     krate: &'a Krate,
     crate_name: &'a Arc<String>,
     msg: &'a Arc<VirMessageInterface>,
-    reporter: &'a Reporter,
+    reporter: &'a Reporter<'tcx>,
     solver: SmtSolver,
     arch_word_bits: ArchWordBits,
 }
@@ -273,13 +283,13 @@ impl io::Write for SharedBuf {
 // Bundles the per-module driver state. `feed`/`feed_all` send each command to
 // Z3 via `air_ctx.command()`; AIR/SMT dumps are captured by the log writers
 // attached to `air_ctx`.
-struct Feeder<'a> {
+struct Feeder<'a, 'tcx> {
     air_ctx: &'a mut Context,
     msg: &'a Arc<VirMessageInterface>,
-    reporter: &'a Reporter,
+    reporter: &'a Reporter<'tcx>,
 }
 
-impl<'a> Feeder<'a> {
+impl<'a, 'tcx> Feeder<'a, 'tcx> {
     fn feed(&mut self, cmd: &Command) -> ValidityResult {
         self.air_ctx.command(&**self.msg, self.reporter, cmd, Default::default())
     }
@@ -290,14 +300,20 @@ impl<'a> Feeder<'a> {
     }
 }
 
-fn verify_simplified_krate(
+fn verify_simplified_krate<'tcx>(
     krate: Krate,
     mut global_ctx: GlobalCtx,
     crate_name: Arc<String>,
     stages: DumpStages,
+    compiler: &'tcx Compiler,
+    spans: &SpanContext,
 ) -> Result<VerifyOutput, VirErr> {
     let msg = Arc::new(VirMessageInterface {});
-    let reporter = Reporter {};
+    // Routes VIR/AIR messages through rustc's `DiagCtxt` — the emitter
+    // attached in `psess_created` (a `HumanEmitter` over a shared string
+    // buffer) formats them with `error: … --> file:line | source` layout
+    // the UI surfaces in its DIAGNOSTICS section.
+    let reporter = Reporter::new(spans, compiler);
     let mctx = ModuleCtx {
         krate: &krate,
         crate_name: &crate_name,
@@ -438,6 +454,14 @@ fn run_queries(
                         for cmd in cmds.commands.iter() {
                             let result = feeder.feed(cmd);
                             if matches!(&**cmd, CommandX::CheckValid(_)) {
+                                // Route the Verus-supplied `Message` (with source
+                                // spans + labels) through the rustc Reporter so
+                                // the emitter renders it as a normal spanned
+                                // error. Without this the caller only sees our
+                                // coarse "Valid / N queries failed" summary.
+                                if let ValidityResult::Invalid(_, Some(err), _) = &result {
+                                    feeder.reporter.report_as(err, MessageLevel::Error);
+                                }
                                 verdicts.push(Verdict::from_result(
                                     &result,
                                     func_name.clone(),
@@ -493,7 +517,10 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
 // prepends `extern crate verus_builtin;` so that crate is linked and its
 // `#[rustc_diagnostic_item]` registrations fire — Verus keys its builtin
 // lookups off those.
-fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
+fn build_rustc_config(
+    src: String,
+    diagnostics: SharedBuf,
+) -> rustc_interface::interface::Config {
     let argv: Vec<String> = [
         "--edition=2021",
         "--crate-type=lib",
@@ -528,8 +555,9 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         file_loader: Some(Box::new(VirtualFileLoader)),
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps: Default::default(),
-        psess_created: Some(Box::new(|psess| {
-            let writer: Box<dyn io::Write + Send> = Box::<ConsoleWriter>::default();
+        psess_created: Some(Box::new(move |psess| {
+            let writer: Box<dyn io::Write + Send> =
+                Box::new(ConsoleWriter::new(diagnostics));
             let dst = AutoStream::new(writer, ColorChoice::Never);
             let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
                 .sm(Some(psess.clone_source_map()));
@@ -592,7 +620,7 @@ fn dump_vir_and_verify(
     verify: bool,
 ) {
     writeln!(out, "=== VIR ===").unwrap();
-    let (krate, global_ctx, crate_name) = match build_vir(compiler, tcx) {
+    let (krate, global_ctx, crate_name, spans) = match build_vir(compiler, tcx) {
         Ok(v) => v,
         Err(errs) => {
             for e in errs {
@@ -611,7 +639,7 @@ fn dump_vir_and_verify(
     if !verify {
         return;
     }
-    match verify_simplified_krate(krate, global_ctx, crate_name, stages) {
+    match verify_simplified_krate(krate, global_ctx, crate_name, stages, compiler, &spans) {
         Ok(output) => write_verify_output(out, &output),
         Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
     }
@@ -649,11 +677,27 @@ pub fn parse_source(src: &str, stages: DumpStages, verify: bool) -> String {
     let src = format!("extern crate vstd;\n{src}");
     let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let dump_clone = dump.clone();
+    let diagnostics = SharedBuf::new();
+    let diagnostics_for_config = diagnostics.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
-        });
+        rustc_interface::interface::run_compiler(
+            build_rustc_config(src, diagnostics_for_config),
+            |compiler| {
+                *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
+            },
+        );
     }));
     let partial = dump.lock().unwrap().clone();
-    unwrap_dump_or_panic(result, partial)
+    let mut output = unwrap_dump_or_panic(result, partial);
+    let diag_text = diagnostics.drain_string();
+    let diag_text = diag_text.trim_end();
+    if !diag_text.is_empty() {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        writeln!(output, "=== DIAGNOSTICS ===").unwrap();
+        output.push_str(diag_text);
+        output.push('\n');
+    }
+    output
 }

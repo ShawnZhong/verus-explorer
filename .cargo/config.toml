@@ -34,15 +34,14 @@ CFG_COMPILER_HOST_TRIPLE = "wasm32-unknown-unknown"
 # thread, so we need the linker to reserve the stack at module level. With
 # the wasm default (1 MiB) HIR lowering overflows into "memory access out of
 # bounds".
-# `-L <path>` (kind defaults to `all`) makes rustc search the path for
-# BOTH direct `extern crate foo;` lookups AND transitive dependency rmeta
-# lookups. The explorer's `src/lib.rs` and Verus's `mir_build_verus` fork
-# both have undeclared `extern crate rustc_*;` items that this resolves.
-# With the unified workspace the path points at the shared target dir
-# (rustc-rlibs is a sibling member; its rlibs land in the same `deps/`).
-# Absolute path because rustc's CWD varies across dep compilations.
-# TODO: hardcoded absolute path is machine-specific; switch to a rustc-wrapper
-# script that derives the path from its own location for portability.
+# `./scripts/rustc-wrapper.sh` injects a profile-aware
+# `-L .../wasm32-unknown-unknown/<profile>/deps` for wasm32 builds so
+# rustc finds rustc-rlibs' output. Kept out of rustflags below because
+# config.toml can't select per-profile values — hardcoding both
+# `debug/deps` and `release/deps` triggers E0464 once both dirs exist.
+[build]
+rustc-wrapper = "./scripts/rustc-wrapper.sh"
+
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--cfg=getrandom_backend=\"wasm_js\"",
@@ -58,6 +57,4 @@ rustflags = [
     # unstable `-Z host-config` / `-Z target-applies-to-host` flags).
     "--check-cfg=cfg(bootstrap)",
     "-C", "link-arg=-zstack-size=8388608",
-    "-L", "/Users/szhong/Code/verus-explorer/target/wasm32-unknown-unknown/debug/deps",
-    "-L", "/Users/szhong/Code/verus-explorer/target/wasm32-unknown-unknown/release/deps",
 ]
