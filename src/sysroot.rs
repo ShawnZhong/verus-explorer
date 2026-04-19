@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-mod bundle {
+pub(crate) mod bundle {
     include!(concat!(env!("OUT_DIR"), "/sysroot_bundle.rs"));
 }
 

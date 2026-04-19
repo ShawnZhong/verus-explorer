@@ -15,7 +15,8 @@ use air::messages::Reporter;
 use rust_verify::buckets::Bucket;
 use rust_verify::cargo_verus_dep_tracker::DepTracker;
 use rust_verify::commands::{OpGenerator, OpKind};
-use rust_verify::config::{ArgsX, Vstd};
+use rust_verify::config::ArgsX;
+use rust_verify::import_export::{decode_crate_with_metadata, CrateWithMetadata};
 use rust_verify::verifier::Verifier;
 use rustc_errors::emitter::HumanEmitter;
 use rustc_errors::registry::Registry;
@@ -41,33 +42,50 @@ use crate::console_error;
 // wasm32 has panic=abort, so `catch_unwind` can't recover from rustc's
 // `abort_if_errors`. Route rustc's emitter to `console.error` so diagnostics
 // are visible *before* the abort trap fires.
-struct ConsoleWriter {
-    buf: Vec<u8>,
-}
+//
+// rustc's `HumanEmitter` writes a single diagnostic in several
+// `write_all`+`flush` cycles (header, source span, suggestions). Flushing each
+// cycle to `console.error` chops one diagnostic into many devtools entries.
+// We coalesce by emitting only on the blank-line separator that rustc inserts
+// between diagnostics — anything else is held until the next flush. Drop emits
+// the trailing partial buffer so nothing is lost on abort-after-emit.
+#[derive(Default)]
+struct ConsoleWriter(Vec<u8>);
 
 impl ConsoleWriter {
-    fn new() -> Self {
-        Self { buf: Vec::new() }
+    fn emit_complete_blocks(&mut self) {
+        while let Some(idx) = find_block_end(&self.0) {
+            let trimmed = &self.0[..idx];
+            if !trimmed.is_empty() {
+                console_error(&String::from_utf8_lossy(trimmed));
+            }
+            self.0.drain(..idx + 2);
+        }
     }
+}
+
+fn find_block_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
 }
 
 impl io::Write for ConsoleWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(buf);
+        self.0.extend_from_slice(buf);
+        self.emit_complete_blocks();
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        if !self.buf.is_empty() {
-            console_error(&String::from_utf8_lossy(&self.buf));
-            self.buf.clear();
-        }
+        self.emit_complete_blocks();
         Ok(())
     }
 }
 
 impl Drop for ConsoleWriter {
     fn drop(&mut self) {
-        let _ = io::Write::flush(self);
+        if !self.0.is_empty() {
+            console_error(&String::from_utf8_lossy(&self.0));
+            self.0.clear();
+        }
     }
 }
 
@@ -105,13 +123,20 @@ fn build_vir<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Result<(Krate, GlobalCtx, Arc<String>), Vec<VirErr>> {
     let mut args = ArgsX::new();
-    args.vstd = Vstd::NoVstd;
+    // `Vstd::Imported` is the default and matches the user's
+    // `extern crate vstd;` injection. The vstd VIR is embedded at compile
+    // time (see `crate::sysroot::bundle::VSTD_VIR`) and passed straight in
+    // as `other_vir_crates` — `args.import` is path-based and doesn't work
+    // on wasm32, so we bypass the filesystem loader.
     args.no_lifetime = true;
     args.no_verify = true;
     args.no_external_by_default = true;
     let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
+    let CrateWithMetadata { krate: vstd_krate, .. } =
+        decode_crate_with_metadata(crate::sysroot::bundle::VSTD_VIR)
+            .map_err(|e| vec![e])?;
     let (krate, global_ctx) = Verifier::new(Arc::new(args), None, false, DepTracker::init())
-        .build_vir_crate(compiler, tcx)?;
+        .build_vir_crate(compiler, tcx, vec!["vstd".to_string()], vec![vstd_krate])?;
     Ok((krate, global_ctx, crate_name))
 }
 
@@ -262,9 +287,8 @@ fn verify_simplified_krate(
         arch_word_bits: krate.arch.word_bits,
     };
     let mut output = VerifyOutput::default();
-    let module_paths: Vec<_> = krate.modules.iter().map(|m| m.x.path.clone()).collect();
-    for module_path in module_paths {
-        global_ctx = verify_module(&mctx, module_path, global_ctx, &mut output)?;
+    for module in &krate.modules {
+        global_ctx = verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output)?;
     }
     Ok(output)
 }
@@ -476,7 +500,7 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps: Default::default(),
         psess_created: Some(Box::new(|psess| {
-            let writer: Box<dyn io::Write + Send> = Box::new(ConsoleWriter::new());
+            let writer: Box<dyn io::Write + Send> = Box::<ConsoleWriter>::default();
             let dst = AutoStream::new(writer, ColorChoice::Never);
             let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
                 .sm(Some(psess.clone_source_map()));
@@ -577,7 +601,11 @@ fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> Str
 /// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
 /// the UI splits on.
 pub fn parse_source(src: &str) -> String {
-    let src = format!("extern crate verus_builtin;\n{src}");
+    // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
+    // code has to be told to link it. vstd's own prelude transitively
+    // re-exports `verus_builtin` items and the `verus_builtin_macros`
+    // proc-macros, so users who do `use vstd::prelude::*;` get everything.
+    let src = format!("extern crate vstd;\n{src}");
     let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let dump_clone = dump.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

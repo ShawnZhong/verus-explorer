@@ -9,8 +9,28 @@
 # absorbed (its members rely on `lints = { workspace = true }` from
 # Verus's own `source/Cargo.toml`).
 [workspace]
-members = ["rustc-rlibs"]
+members = [
+    "rustc-rlibs",
+    # Pulled in as explicit members so they inherit `[workspace.lints]` below
+    # (their own ancestor workspace `third_party/rust/Cargo.toml` doesn't
+    # define it). Listing wins over `exclude` for these specific paths.
+    "third_party/rust/compiler/rustc_macros",
+    "third_party/rust/compiler/rustc_fluent_macro",
+]
 exclude = ["third_party"]
+
+# Inherited by the two vendored proc-macro crates
+# (`third_party/rust/compiler/rustc_macros` and `rustc_fluent_macro`) via
+# `[lints] workspace = true`. Needed because `cfg(bootstrap)` attrs across the
+# vendored rustc tree would otherwise trip `unexpected_cfgs`. `bootstrap` is
+# set by rustc's x.py when stage0-building rustc with the previous stable
+# compiler; we build with plain cargo, so it's always unset and those attrs
+# are silent no-ops. The rest of the rustc tree picks up an equivalent
+# `--check-cfg=cfg(bootstrap)` from `[target.wasm32-unknown-unknown].rustflags`
+# in `.cargo/config.toml` — but stable cargo doesn't apply target rustflags to
+# host proc-macro builds, hence this workspace-lints fallback.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bootstrap)'] }
 
 [package]
 name = "verus-explorer"
@@ -24,6 +44,8 @@ crate-type = ["cdylib", "rlib"]
 vir = { path = "third_party/verus/source/vir" }
 air = { path = "third_party/verus/source/air" }
 rust_verify = { path = "third_party/verus/source/rust_verify" }
+verus_builtin_macros_lib = { path = "third_party/verus/source/builtin_macros_lib" }
+proc-macro2 = "1.0.39"
 wasm-bindgen = "0.2"
 # rustc_* crates that this crate uses directly are not declared here — they
 # are produced as rlibs by `rustc-rlibs/` and resolved at link time via

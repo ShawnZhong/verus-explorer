@@ -103,13 +103,25 @@
       to suppress the auto <code>extern crate core/std</code> — no sysroot
       metadata is bundled, so anything touching lang items
       (<code>+</code>, <code>Sized</code>, generics) won't typeck.</p>
-    <textarea id="parse-input" spellcheck="false">fn id(x: i32) -> i32 { x }
+    <textarea id="parse-input" spellcheck="false">use vstd::prelude::*;
 
-struct Point { x: i32, y: i32 }
+verus! {
 
-impl Point {
-    fn origin() -> Point { Point { x: 0, y: 0 } }
+// Seq<int> is vstd's specification-level sequence. The verifier knows the
+// semantics of empty / push / len / indexing, so every `assert` below is
+// discharged automatically via the SMT encoding.
+fn main() {
+    let s: Seq<int> = Seq::empty().push(1).push(2).push(3);
+    assert(s.len() == 3);
+    assert(s[0] == 1);
+    assert(s[1] == 2);
+    assert(s[2] == 3);
+    assert(s.push(4).len() == 4);
+    assert(s.push(4)[3] == 4);
+    assert(forall|i: int| 0 <= i < s.len() ==> s.push(4)[i] == s[i]);
 }
+
+} // verus!
 </textarea>
     <button id="parse-run" disabled>Parse</button>
     <div id="parse-out" class="query"></div>
@@ -186,18 +198,23 @@ impl Point {
       try {
         const text = parse_source(parseInput.value);
         // Split on "=== NAME ===" markers; the preamble (before any marker)
-        // goes under an "output" block so panic messages aren't dropped.
+        // is panic/stderr fallback. Render order is verdict-first (the answer
+        // the user came for) → pipeline stages (AST/HIR/VIR/AIR toggle).
         const chunks = text.split(/^=== (\w+) ===$/m);
-        if (chunks[0].trim()) addParseBlock('output', chunks[0].trimEnd());
+        const sections = {};
         const air = {};
+        if (chunks[0].trim()) sections.output = chunks[0].trimEnd();
         for (let i = 1; i < chunks.length; i += 2) {
           const name = chunks[i];
           const body = chunks[i + 1].trim();
           if (name.startsWith('AIR_') || name === 'SMT') {
             if (body) air[name] = body;
           } else {
-            addParseBlock(name, body);
+            sections[name] = body;
           }
+        }
+        for (const name of ['output', 'VERDICT', 'AST', 'HIR', 'VIR']) {
+          if (sections[name] !== undefined) addParseBlock(name, sections[name]);
         }
         addAirToggle(air);
       } catch (e) {

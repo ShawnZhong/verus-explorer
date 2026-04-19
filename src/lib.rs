@@ -13,15 +13,19 @@
 // `-L dependency=...` rustflag in `.cargo/config.toml`.
 
 #![feature(rustc_private)]
+#![feature(proc_macro_internals)]
 
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_interface;
+extern crate rustc_metadata;
 extern crate rustc_middle;
+extern crate rustc_proc_macro;
 extern crate rustc_session;
 extern crate rustc_span;
 
 mod pipeline;
+mod proc_macros;
 mod sysroot;
 
 use wasm_bindgen::prelude::*;
@@ -36,6 +40,7 @@ extern "C" {
 fn init() {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
     sysroot::install();
+    proc_macros::install();
 }
 
 /// Run the rustc front-end on `src`, lower HIR → simplified VIR, then drive
