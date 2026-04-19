@@ -1880,6 +1880,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sise",
+ "verus_builtin_macros",
  "vir",
  "win32job",
 ]
@@ -4006,14 +4007,14 @@ dependencies = [
  "proc-macro2",
  "rust_verify",
  "rustc-rlibs",
- "verus_builtin_macros_lib",
+ "verus_builtin_macros",
  "vir",
  "wasm-bindgen",
  "wasm-bindgen-test",
 ]
 
 [[package]]
-name = "verus_builtin_macros_lib"
+name = "verus_builtin_macros"
 version = "0.0.0-2026-04-12-0118"
 dependencies = [
  "proc-macro2",
