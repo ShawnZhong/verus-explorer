@@ -190,18 +190,37 @@ struct AirBufs {
     smt: SharedBuf,
 }
 
+// Each flag gates the corresponding log writer attachment below — attaching a
+// writer makes the air crate serialize every command to text, so unchecked
+// stages save their formatting work entirely.
+#[derive(Clone, Copy, Default)]
+pub struct DumpStages {
+    pub air_initial: bool,
+    pub air_middle: bool,
+    pub air_final: bool,
+    pub smt: bool,
+}
+
 impl AirBufs {
-    fn attach(ctx: &mut Context) -> Self {
+    fn attach(ctx: &mut Context, stages: DumpStages) -> Self {
         let bufs = Self {
             air_initial: SharedBuf::new(),
             air_middle: SharedBuf::new(),
             air_final: SharedBuf::new(),
             smt: SharedBuf::new(),
         };
-        ctx.set_air_initial_log(Box::new(bufs.air_initial.clone()));
-        ctx.set_air_middle_log(Box::new(bufs.air_middle.clone()));
-        ctx.set_air_final_log(Box::new(bufs.air_final.clone()));
-        ctx.set_smt_log(Box::new(bufs.smt.clone()));
+        if stages.air_initial {
+            ctx.set_air_initial_log(Box::new(bufs.air_initial.clone()));
+        }
+        if stages.air_middle {
+            ctx.set_air_middle_log(Box::new(bufs.air_middle.clone()));
+        }
+        if stages.air_final {
+            ctx.set_air_final_log(Box::new(bufs.air_final.clone()));
+        }
+        if stages.smt {
+            ctx.set_smt_log(Box::new(bufs.smt.clone()));
+        }
         bufs
     }
 
@@ -275,6 +294,7 @@ fn verify_simplified_krate(
     krate: Krate,
     mut global_ctx: GlobalCtx,
     crate_name: Arc<String>,
+    stages: DumpStages,
 ) -> Result<VerifyOutput, VirErr> {
     let msg = Arc::new(VirMessageInterface {});
     let reporter = Reporter {};
@@ -288,7 +308,8 @@ fn verify_simplified_krate(
     };
     let mut output = VerifyOutput::default();
     for module in &krate.modules {
-        global_ctx = verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output)?;
+        global_ctx =
+            verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output, stages)?;
     }
     Ok(output)
 }
@@ -298,6 +319,7 @@ fn verify_module(
     module_path: vir::ast::Path,
     global_ctx: GlobalCtx,
     output: &mut VerifyOutput,
+    stages: DumpStages,
 ) -> Result<GlobalCtx, VirErr> {
     let (pruned, prune_info) = vir::prune::prune_krate_for_module_or_krate(
         mctx.krate,
@@ -352,7 +374,7 @@ fn verify_module(
 
     let mut air_ctx = Context::new(mctx.msg.clone(), mctx.solver);
     air_ctx.set_z3_param("air_recommended_options", "true");
-    let bufs = AirBufs::attach(&mut air_ctx);
+    let bufs = AirBufs::attach(&mut air_ctx, stages);
 
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
     feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)?;
@@ -439,6 +461,9 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
         ("AIR_FINAL", &output.air_final),
         ("SMT", &output.smt),
     ] {
+        if body.is_empty() {
+            continue;
+        }
         writeln!(out, "=== {} ===", name).unwrap();
         out.push_str(body.trim_end());
         writeln!(out).unwrap();
@@ -516,7 +541,7 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     }
 }
 
-fn run_pipeline(compiler: &Compiler) -> String {
+fn run_pipeline(compiler: &Compiler, stages: DumpStages, verify: bool) -> String {
     let krate = rustc_interface::passes::parse(&compiler.sess);
     let mut out = String::new();
     writeln!(out, "=== AST ===").unwrap();
@@ -533,7 +558,7 @@ fn run_pipeline(compiler: &Compiler) -> String {
     writeln!(out).unwrap();
     rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
         dump_hir(&mut out, tcx);
-        dump_vir_and_verify(&mut out, compiler, tcx);
+        dump_vir_and_verify(&mut out, compiler, tcx, stages, verify);
     });
     out
 }
@@ -555,7 +580,13 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
     writeln!(out).unwrap();
 }
 
-fn dump_vir_and_verify(out: &mut String, compiler: &Compiler, tcx: TyCtxt<'_>) {
+fn dump_vir_and_verify(
+    out: &mut String,
+    compiler: &Compiler,
+    tcx: TyCtxt<'_>,
+    stages: DumpStages,
+    verify: bool,
+) {
     writeln!(out, "=== VIR ===").unwrap();
     let (krate, global_ctx, crate_name) = match build_vir(compiler, tcx) {
         Ok(v) => v,
@@ -570,7 +601,13 @@ fn dump_vir_and_verify(out: &mut String, compiler: &Compiler, tcx: TyCtxt<'_>) {
     vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
     out.push_str(&String::from_utf8_lossy(&buf));
     writeln!(out).unwrap();
-    match verify_simplified_krate(krate, global_ctx, crate_name) {
+    // Skipping verify short-circuits before `air_ctx.command()` — the first
+    // point that talks to Z3. Everything above (parse/HIR/VIR) is pure Rust,
+    // so tests can exercise the pipeline without a Z3 runtime installed.
+    if !verify {
+        return;
+    }
+    match verify_simplified_krate(krate, global_ctx, crate_name, stages) {
         Ok(output) => write_verify_output(out, &output),
         Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
     }
@@ -600,7 +637,7 @@ fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> Str
 /// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
 /// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
 /// the UI splits on.
-pub fn parse_source(src: &str) -> String {
+pub fn parse_source(src: &str, stages: DumpStages, verify: bool) -> String {
     // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
     // code has to be told to link it. vstd's own prelude transitively
     // re-exports `verus_builtin` items and the `verus_builtin_macros`
@@ -610,7 +647,7 @@ pub fn parse_source(src: &str) -> String {
     let dump_clone = dump.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler);
+            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
         });
     }));
     let partial = dump.lock().unwrap().clone();

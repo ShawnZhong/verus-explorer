@@ -26,6 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use object::{Object, ObjectSection};
+
 const CRATES_TO_BUNDLE: &[&str] = &[
     "libcore",
     "libcompiler_builtins",
@@ -109,16 +111,13 @@ fn main() {
     compile_verus_builtin(&rustc, &out_dir);
     src.push_str(&format!("    ({VERUS_BUILTIN_RMETA:?}, include_bytes!({VERUS_BUILTIN_RMETA:?})),\n"));
 
-    // Pull each host proc-macro crate's rmeta straight out of the host Cargo
-    // target dir — its SVH must match the host dylib that rust_verify uses
-    // as `--extern <name>=...` when compiling vstd. A shim built from
-    // different source has a different SVH and trips E0460/E0786 when
-    // user-code rustc-in-wasm later loads vstd.rmeta. The matching
-    // standalone .rmeta is produced by `make verus-host`'s
-    // `cargo rustc -- --emit=link,metadata` invocation.
+    // Pull each host proc-macro crate's rmeta out of the dylib's embedded
+    // `.rustc` section. Its SVH must match the host dylib that rust_verify
+    // uses as `--extern <name>=...` when compiling vstd — by reading the
+    // bytes from the same dylib, SVH match is guaranteed.
     for name in HOST_PROC_MACRO_CRATES {
         let staged_name = format!("lib{name}-explorer.rmeta");
-        copy_host_macros_rmeta(&out_dir, name, &staged_name);
+        extract_host_macros_rmeta(&out_dir, name, &staged_name);
         src.push_str(&format!(
             "    ({staged_name:?}, include_bytes!({staged_name:?})),\n"
         ));
@@ -159,77 +158,38 @@ fn compile_verus_builtin(rustc: &str, out_dir: &Path) {
     );
 }
 
-fn copy_host_macros_rmeta(out_dir: &Path, crate_name: &str, staged_name: &str) {
-    let deps_dir = PathBuf::from(VERUS_HOST_DIR).join("deps");
-    let dylib = PathBuf::from(VERUS_HOST_DIR).join(if cfg!(target_os = "macos") {
-        format!("lib{crate_name}.dylib")
+// Pull the rmeta bytes out of a host proc-macro dylib's embedded `.rustc`
+// section. rustc always stores crate metadata there so cargo can load
+// proc-macros via `extern crate`. The section layout is a 16-byte header
+// (`rust\0\0\0\x0a` magic + u64 LE length) followed by the rmeta bytes —
+// which are byte-identical to what `rustc --emit=metadata` would produce.
+fn extract_host_macros_rmeta(out_dir: &Path, crate_name: &str, staged_name: &str) {
+    let dylib_ext = if cfg!(target_os = "macos") {
+        "dylib"
     } else if cfg!(target_os = "windows") {
-        format!("{crate_name}.dll")
+        "dll"
     } else {
-        format!("lib{crate_name}.so")
-    });
-    // The canonical $VERUS_HOST_DIR/lib<crate>.dylib symlinks (or
-    // otool-references) to one specific `deps/lib<crate>-<hash>.dylib`.
-    // Pair it with the matching `.rmeta` of the same hash — that's the
-    // standalone metadata file produced by `cargo rustc --emit=link,metadata`.
-    let canonical_dep = read_dylib_install_name(&dylib, crate_name).unwrap_or_else(|| {
-        panic!(
-            "couldn't determine which deps/ dylib backs {:?} — did `make verus-host` run?",
-            dylib
-        )
-    });
-    let dep_filename = canonical_dep
-        .file_name()
-        .and_then(|n| n.to_str())
-        .expect("install name has filename");
-    let rmeta_name = dep_filename
-        .strip_suffix(".dylib")
-        .or_else(|| dep_filename.strip_suffix(".so"))
-        .or_else(|| dep_filename.strip_suffix(".dll"))
-        .map(|stem| format!("{stem}.rmeta"))
-        .expect("dylib filename has expected suffix");
-    let rmeta_path = deps_dir.join(&rmeta_name);
+        "so"
+    };
+    let dylib = PathBuf::from(VERUS_HOST_DIR).join(format!("lib{crate_name}.{dylib_ext}"));
     assert!(
-        rmeta_path.exists(),
-        "expected matching {rmeta_name} alongside dylib — \
-         re-run `make verus-host` to emit it via --emit=link,metadata"
+        dylib.exists(),
+        "missing host proc-macro dylib {:?} — run `make verus-host`",
+        dylib
+    );
+    let bytes = fs::read(&dylib).expect("read host proc-macro dylib");
+    let obj = object::File::parse(&*bytes).expect("parse host proc-macro dylib");
+    let section = obj
+        .section_by_name(".rustc")
+        .expect(".rustc section in host proc-macro dylib");
+    let data = section.data().expect(".rustc section data");
+    assert!(
+        data.len() >= 16 && &data[0..8] == b"rust\x00\x00\x00\x0a",
+        "unexpected .rustc section header in {:?}",
+        dylib
     );
     let staged = out_dir.join(staged_name);
-    fs::copy(&rmeta_path, &staged).expect("copy host proc-macro rmeta");
-}
-
-// Read the `LC_LOAD_DYLIB` install name out of a Mach-O dylib. On macOS
-// `cargo build` writes a tiny "wrapper" dylib at $target/release/<name>.dylib
-// that points at the hashed deps/<name>-<hash>.dylib via this load command.
-// On Linux/Windows there's no wrapper — the canonical path *is* the hashed
-// file; in that case we fall back to using the path we were given.
-fn read_dylib_install_name(dylib: &Path, crate_name: &str) -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return Some(dylib.to_path_buf());
-    }
-    let out = Command::new("otool").arg("-L").arg(dylib).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(out.stdout).ok()?;
-    // `otool -L` output: header line, then `\t<path> (compat ..., current ...)`
-    // for each LC_LOAD_DYLIB. The first such entry on a wrapper is the
-    // hashed deps/ dylib.
-    for line in stdout.lines().skip(1) {
-        let trimmed = line.trim_start();
-        if let Some(end) = trimmed.find(" (") {
-            let path = PathBuf::from(&trimmed[..end]);
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains(crate_name) && n.contains('-'))
-                .unwrap_or(false)
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
+    fs::write(&staged, &data[16..]).expect("write extracted rmeta");
 }
 
 // Drives the host `rust_verify` (built by `make verus-host`) on Verus's vstd

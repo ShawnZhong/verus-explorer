@@ -124,6 +124,12 @@ fn main() {
 } // verus!
 </textarea>
     <button id="parse-run" disabled>Parse</button>
+    <span style="margin-left: .6em; display: inline-flex; gap: .8em;">
+      <label><input type="checkbox" id="parse-dump-air-initial" /> air initial</label>
+      <label><input type="checkbox" id="parse-dump-air-middle" /> air middle</label>
+      <label><input type="checkbox" id="parse-dump-air-final" /> air final</label>
+      <label><input type="checkbox" id="parse-dump-smt" /> smt</label>
+    </span>
     <div id="parse-out" class="query"></div>
   </section>
 
@@ -153,6 +159,10 @@ fn main() {
     const parseInput = document.getElementById('parse-input');
     const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
+    const dumpAirInitial = document.getElementById('parse-dump-air-initial');
+    const dumpAirMiddle = document.getElementById('parse-dump-air-middle');
+    const dumpAirFinal = document.getElementById('parse-dump-air-final');
+    const dumpSmt = document.getElementById('parse-dump-smt');
     const addParseBlock = (title, body) => {
       if (!body) return;
       const label = document.createElement('div');
@@ -196,7 +206,14 @@ fn main() {
     const runParse = () => {
       parseOut.textContent = '';
       try {
-        const text = parse_source(parseInput.value);
+        const text = parse_source(
+          parseInput.value,
+          dumpAirInitial.checked,
+          dumpAirMiddle.checked,
+          dumpAirFinal.checked,
+          dumpSmt.checked,
+          true, // verify
+        );
         // Split on "=== NAME ===" markers; the preamble (before any marker)
         // is panic/stderr fallback. Render order is verdict-first (the answer
         // the user came for) → pipeline stages (AST/HIR/VIR/AIR toggle).

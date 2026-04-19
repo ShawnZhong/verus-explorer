@@ -40,6 +40,12 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+# Used by build.rs to extract the embedded `.rustc` section from the host
+# proc-macro dylibs that vargo builds — gives us the rmeta bytes without
+# having to re-run rustc with --emit=metadata.
+object = "0.36"
+
 [dependencies]
 vir = { path = "third_party/verus/source/vir" }
 air = { path = "third_party/verus/source/air" }
@@ -68,6 +74,9 @@ wasm-bindgen = "0.2"
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
 rustc-rlibs = { path = "rustc-rlibs" }
+
+[target.wasm32-unknown-unknown.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [profile.release]
 opt-level = "s"

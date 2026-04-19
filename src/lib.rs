@@ -48,6 +48,22 @@ fn init() {
 /// string of AST/HIR/VIR/AIR + verdicts so the existing UI can split and
 /// display each section.
 #[wasm_bindgen]
-pub fn parse_source(src: &str) -> String {
-    pipeline::parse_source(src)
+pub fn parse_source(
+    src: &str,
+    dump_air_initial: bool,
+    dump_air_middle: bool,
+    dump_air_final: bool,
+    dump_smt: bool,
+    verify: bool,
+) -> String {
+    pipeline::parse_source(
+        src,
+        pipeline::DumpStages {
+            air_initial: dump_air_initial,
+            air_middle: dump_air_middle,
+            air_final: dump_air_final,
+            smt: dump_smt,
+        },
+        verify,
+    )
 }
