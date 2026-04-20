@@ -22,7 +22,8 @@ fn count_up_to(n: u32) -> (r: u32)
 
 fn main() {
     assert(count_up_to(0) == 0);
-    assert(count_up_to(42) == 42);
+    let x = count_up_to(10);
+    assert(x == 10);
 }
 
 } // verus!

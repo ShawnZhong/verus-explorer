@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="utf-8" />
-  <title>verus-explorer</title>
+  <title>Verus Explorer — every stage of Verus, from source to solver</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 
@@ -88,23 +88,16 @@
     // are independent; fire them all off at once. Critical cold-load time
     // = max(them), not sum. Emscripten resolves z3.wasm relative to z3.js
     // by default, so no locateFile callback is needed.
-    const ms = (t) => `${(performance.now() - t).toFixed(0)}ms`;
-    const coldStart = performance.now();
-    const timed = (label, p) => {
-      const t = performance.now();
-      return p.then(v => { console.log(`[cold] ${label}: ${ms(t)}`); return v; });
-    };
     const [Z3, verusModule, wasmLibs] = await Promise.all([
-      timed('initZ3', globalThis.initZ3()),
-      timed('compile verus', WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm'))),
-      timed('fetch+decompress wasm-libs', Promise.all(WASM_LIBS.map(async name => {
+      globalThis.initZ3(),
+      WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm')),
+      Promise.all(WASM_LIBS.map(async name => {
         const res = await fetch(`./wasm-libs/${name}.gz`);
         const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
         const buf = await new Response(stream).arrayBuffer();
         return [name, new Uint8Array(buf)];
-      }))),
+      })),
     ]);
-    console.log(`[cold] total: ${ms(coldStart)} (wasm-libs uncompressed = ${(wasmLibs.reduce((s, [,b]) => s + b.byteLength, 0) / 1e6).toFixed(1)} MB)`);
 
     // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
     // wasm-bindgen externs, so each must be a plain JS function on globalThis.
@@ -129,22 +122,10 @@
     // `run_compiler` builds its own Session+CStore; nothing leaks across
     // calls (confirmed by `tests/smoke.rs`). V8 JIT + rustc LazyLock entries
     // survive across calls and amortize, so #2/#3 run at ~2× #1 speed.
-    const t0 = performance.now();
     const verus = await import('./verus_explorer.js');
-    const t1 = performance.now();
     await verus.default({ module_or_path: verusModule });
-    const t2 = performance.now();
     for (const [name, bytes] of wasmLibs) verus.wasm_libs_add_file(name, bytes);
-    const t3 = performance.now();
     verus.wasm_libs_finalize();
-    const t4 = performance.now();
-    console.log(
-      `[init] import=${(t1 - t0).toFixed(0)}ms ` +
-      `instantiate=${(t2 - t1).toFixed(0)}ms ` +
-      `add_file×${wasmLibs.length}=${(t3 - t2).toFixed(0)}ms ` +
-      `finalize=${(t4 - t3).toFixed(0)}ms ` +
-      `total=${(t4 - t0).toFixed(0)}ms`
-    );
 
     // ------------------------------------------------------------------
     // DOM refs + tiny state
@@ -206,7 +187,7 @@
     // to the solver; `Z3-out` is its reply — both SMT-LIB2.
     const TAB_GROUPS = [
       { id: 'Verus',  variants: ['AST_PRE', 'AST'] },
-      { id: 'HIR',    variants: ['HIR'] },
+      { id: 'HIR',    variants: ['HIR', 'HIR_TYPED'] },
       { id: 'VIR',    variants: ['VIR', 'SST_AST', 'SST_POLY'] },
       { id: 'AIR',    variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
       { id: 'Z3-in',  variants: ['SMT'] },
@@ -214,7 +195,7 @@
     ];
     const VARIANT_LABEL = {
       AST_PRE: 'raw', AST: 'expanded',
-      HIR: 'HIR',
+      HIR: 'raw', HIR_TYPED: 'typed',
       VIR: 'ast', SST_AST: 'sst', SST_POLY: 'poly',
       AIR_INITIAL: 'raw', AIR_MIDDLE: 'SSA', AIR_FINAL: 'flat',
       SMT: 'Z3-in', Z3: 'Z3-out',
@@ -395,25 +376,19 @@
           if (!chosen) return;
           currentTab = chosen;
           lastVariantInGroup.set(g.id, chosen);
-          renderTabs();
-          renderSubtabs();
-          renderOutputView();
+          rerender();
         });
         parseTabsEl.appendChild(button);
       }
     };
 
-    // Subtab row under the output CM6 view: picks the variant within the
-    // active group (e.g., raw / SSA / flat for AIR). Hidden entirely when
-    // the current group has only one variant (Verus, HIR) so the row
-    // doesn't eat vertical space without offering a choice.
     // Subtab row: sits right under the top tab bar, above the CM6 view.
     // Holds two kinds of children, separated visually by `margin-left:
     // auto` on the control block so pills hug the left edge and controls
     // hug the right:
     //   1. Variant pills — one per sibling section in the active group
     //      (e.g., `ast` / `sst` / `poly` under VIR). Skipped when the
-    //      group has a single variant.
+    //      group has a single variant (Verus, HIR).
     //   2. Group-level controls — currently only VIR's `Show vstd`
     //      toggle, which swaps `sectionFor()` between pruned and full
     //      twins (both cached per run, no re-verify).
@@ -434,9 +409,7 @@
           button.addEventListener('click', () => {
             currentTab = v;
             lastVariantInGroup.set(currentGroup, v);
-            renderTabs();
-            renderSubtabs();
-            renderOutputView();
+            rerender();
           });
           parseSubtabsEl.appendChild(button);
         }
@@ -450,9 +423,7 @@
         cb.checked = showVstd;
         cb.addEventListener('change', () => {
           showVstd = cb.checked;
-          renderTabs();
-          renderSubtabs();
-          renderOutputView();
+          rerender();
         });
         label.appendChild(cb);
         label.appendChild(document.createTextNode(' Show vstd'));
@@ -610,7 +581,7 @@
     // pseudo-Rust pretty-prints; s-expressions for everything downstream
     // (VIR/SST also pretty-print as parenthesized trees, close enough).
     const LANGUAGE_FOR_SECTION = {
-      AST_PRE: rust(), AST: rust(), HIR: rust(),
+      AST_PRE: rust(), AST: rust(), HIR: rust(), HIR_TYPED: rust(),
       VIR: virLanguage, SST_AST: virLanguage, SST_POLY: virLanguage,
       AIR_INITIAL: sexpLanguage, AIR_MIDDLE: sexpLanguage, AIR_FINAL: sexpLanguage,
       SMT: sexpLanguage, Z3: sexpLanguage,
@@ -681,6 +652,12 @@
       }
       outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
     };
+
+    // Full re-render after a state change that can affect tabs, subtabs,
+    // and the shown section (tab click, subtab click, Show-vstd toggle,
+    // new parse result). All three are cheap (pure DOM rebuild + doc
+    // swap), so we always run the set rather than tracking dirty bits.
+    const rerender = () => { renderTabs(); renderSubtabs(); renderOutputView(); };
 
     // Build CM6 `Diagnostic` objects (the @codemirror/lint shape) from the
     // structured JsonEmitter payloads — one per primary span, with
@@ -778,9 +755,11 @@
       if (section === 'VERDICT') verdictCache = body;
       else sectionCache.set(section, body);
     };
-    globalThis.verus_bench = (label, ms) => {
-      console.log(`[stage] ${label}=${ms.toFixed(0)}ms`);
-    };
+    // Rust side calls `verus_bench(label, ms)` for each timed pipeline
+    // stage; leave it as a no-op in the browser (the signal is useful
+    // under `wasm-pack test --node`, where the test runner installs its
+    // own stub that writes to stderr).
+    globalThis.verus_bench = () => {};
 
     let runId = 0;
     const runParse = () => {
@@ -793,9 +772,7 @@
       diagnosticJsonCache.length = 0;
       z3ResponseBuffer = [];
       try {
-        const tParse = performance.now();
         verus.parse_source(view.state.doc.toString(), expandErrorsCheckbox.checked);
-        console.log(`[parse] parse_source=${(performance.now() - tParse).toFixed(0)}ms`);
       } catch (e) {
         if (myRun !== runId) return;
         if (diagnosticCache.length === 0 && sectionCache.size === 0 && verdictCache === null) {
@@ -823,9 +800,7 @@
       }
       if (currentTab) lastVariantInGroup.set(GROUP_OF.get(currentTab), currentTab);
       renderMeta();
-      renderTabs();
-      renderSubtabs();
-      renderOutputView();
+      rerender();
       updateErrorDecorations();
       buildInlineDiagnostics();
     };

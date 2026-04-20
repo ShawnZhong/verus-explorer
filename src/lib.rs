@@ -31,6 +31,7 @@
 #![feature(rustc_private)]
 
 extern crate rustc_ast;
+extern crate rustc_hir;
 extern crate rustc_ast_pretty;
 extern crate rustc_driver;
 extern crate rustc_errors;
@@ -41,6 +42,7 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io;
@@ -673,15 +675,23 @@ fn dump_ast(out: &mut String, tcx: TyCtxt<'_>) {
 }
 
 fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
+    // Forces macro expansion + name resolution + HIR lowering. Shared setup
+    // between the plain dump and the typed variant below; `typeck_body`
+    // downstream implicitly depends on it.
+    let _ = tcx.resolver_for_lowering();
+
     time("dump.hir", || {
-        // Forces macro expansion + name resolution + HIR lowering.
-        let _ = tcx.resolver_for_lowering();
         // Can't use `print_crate` on wasm: its `Comments::new` path
         // constructs a fresh `SourceMap` with the default `RealFileLoader`,
         // whose `current_directory()` traps on wasm. `item_to_string` goes
         // through the low-level `to_string` (`comments: None`) and skips
         // that path — trade-off: no pretty-printing of source comments,
         // which we don't want in the HIR dump anyway.
+        //
+        // `hir_free_items` only yields top-level items, but `print_item`
+        // recurses through `Nested::{ImplItem,TraitItem,ForeignItem}` via
+        // the `PpAnn::nested` dispatch, so impl methods, trait items, and
+        // extern blocks are all reached from here.
         let mut body = String::new();
         for item_id in tcx.hir_free_items() {
             let item = tcx.hir_item(item_id);
@@ -690,6 +700,73 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
         }
         emit_section(out, "HIR", &body);
     });
+
+    // Typed variant: mirror rustc's `-Zunpretty=hir-typed`
+    // (rustc_driver_impl::pretty::HirTypedAnn at pretty.rs:142). Each
+    // expression gets wrapped in `(expr as T)` using the inferred type from
+    // `typeck_body(body)`. Wrapped in `dep_graph.with_ignore` because
+    // typeck is a query and pretty-printing isn't a legal dep-graph node.
+    time("dump.hir_typed", || {
+        let ann = HirTypedAnn { tcx, typeck_results: Cell::new(None) };
+        let mut body = String::new();
+        tcx.dep_graph.with_ignore(|| {
+            for item_id in tcx.hir_free_items() {
+                let item = tcx.hir_item(item_id);
+                body.push_str(&rustc_hir_pretty::item_to_string(&ann, item));
+                body.push('\n');
+            }
+        });
+        emit_section(out, "HIR_TYPED", &body);
+    });
+}
+
+// Annotator for the `HIR_TYPED` dump. `maybe_typeck_results` tracks the
+// currently-active body so nested exprs pick up the right `TypeckResults`
+// (bodies can contain inner bodies via closures / async). The fallback in
+// `post` via `hir_maybe_body_owned_by` handles the rare case where an expr
+// is reached outside a Body nesting (e.g. const evaluation paths).
+struct HirTypedAnn<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typeck_results: Cell<Option<&'tcx rustc_middle::ty::TypeckResults<'tcx>>>,
+}
+
+impl<'tcx> rustc_hir_pretty::PpAnn for HirTypedAnn<'tcx> {
+    fn nested(&self, state: &mut rustc_hir_pretty::State<'_>, nested: rustc_hir_pretty::Nested) {
+        let prev = self.typeck_results.get();
+        if let rustc_hir_pretty::Nested::Body(id) = nested {
+            self.typeck_results.set(Some(self.tcx.typeck_body(id)));
+        }
+        // Delegate the actual nested-node printing to the TyCtxt PpAnn impl
+        // (which routes Nested::ImplItem / TraitItem / ForeignItem / Body
+        // to the right printer). Casting through `&dyn HirTyCtxt` picks up
+        // the `impl PpAnn for &dyn HirTyCtxt<'_>` in rustc_hir_pretty:58.
+        let tcx_ann: &dyn rustc_hir::intravisit::HirTyCtxt<'_> = &self.tcx;
+        tcx_ann.nested(state, nested);
+        self.typeck_results.set(prev);
+    }
+
+    fn pre(&self, s: &mut rustc_hir_pretty::State<'_>, node: rustc_hir_pretty::AnnNode<'_>) {
+        if matches!(node, rustc_hir_pretty::AnnNode::Expr(_)) {
+            s.popen();
+        }
+    }
+
+    fn post(&self, s: &mut rustc_hir_pretty::State<'_>, node: rustc_hir_pretty::AnnNode<'_>) {
+        if let rustc_hir_pretty::AnnNode::Expr(expr) = node {
+            let tr = self.typeck_results.get().or_else(|| {
+                self.tcx
+                    .hir_maybe_body_owned_by(expr.hir_id.owner.def_id)
+                    .map(|body| self.tcx.typeck_body(body.id()))
+            });
+            if let Some(tr) = tr {
+                s.space();
+                s.word("as");
+                s.space();
+                s.word(tr.expr_ty(expr).to_string());
+            }
+            s.pclose();
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -742,14 +819,16 @@ fn dump_vir_and_verify(
     // `build_vir` forces HIR lowering + name resolution + ty-check via Verus'
     // `build_vir_crate`, so this stage absorbs most of the rustc front-end
     // work. Split from `verify` below to separate rustc cost from Verus cost.
-    let (krate, global_ctx, crate_name, spans) = match time("build_vir", || build_vir(compiler, tcx)) {
-        Ok(v) => v,
-        Err(errs) => {
-            for e in errs {
-                writeln!(out, "  vir error: {}", e.note).unwrap();
-            }
-            return;
-        }
+    //
+    // Any `VirErr` that escapes `build_vir` has already been routed through
+    // the vendored `build_vir_crate`'s reporter (verifier.rs ~L2142),
+    // matching upstream's `after_expansion` handler. The DIAGNOSTICS section
+    // will render it with full span context; the rest of the pipeline (SST,
+    // AIR, SMT) has nothing to dump from a failed build, so we just return.
+    let Ok((krate, global_ctx, crate_name, spans)) =
+        time("build_vir", || build_vir(compiler, tcx))
+    else {
+        return;
     };
     time("dump.vir", || {
         let mut buf: Vec<u8> = Vec::new();

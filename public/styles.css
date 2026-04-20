@@ -164,9 +164,6 @@ pre {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
-#parse-input .cm-scroller {
-  font-family: ui-monospace, Menlo, Consolas, monospace;
-}
 #parse-output-view {
   flex: 1;
   min-height: 0;
@@ -185,7 +182,10 @@ pre {
   border-radius: 0 6px 6px 6px;
   font-size: 13px;
 }
-#parse-output-view .cm-scroller {
+/* Both CM6 instances live inside the workbench; CM6 sets its own default
+   font on `.cm-scroller`, so override it back to the body's monospace
+   stack in one place instead of per-instance. */
+.cm-scroller {
   font-family: ui-monospace, Menlo, Consolas, monospace;
 }
 /* Source-editor decorations for diagnostics flagged by the loc
