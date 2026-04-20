@@ -178,12 +178,25 @@
     #parse-input .cm-scroller {
       font-family: ui-monospace, Menlo, Consolas, monospace;
     }
-    #parse-out {
+    #parse-output-view {
       flex: 1;
       min-height: 0;
-      overflow: auto;
-      padding-right: .3em;
+      display: flex;
     }
+    #parse-output-view .cm-editor {
+      flex: 1;
+      min-height: 0;
+      border: 1px solid var(--border);
+      border-radius: 0 6px 6px 6px;
+      font-size: 13px;
+    }
+    #parse-output-view .cm-scroller {
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+    }
+    /* Source-editor decoration: any line flagged by the diagnostic loc
+       extractor gets a red wash so the user sees where the error lives
+       without having to click into it. */
+    .cm-error-line { background-color: var(--bad-bg); }
     @media (max-width: 900px) {
       #workbench {
         grid-template-columns: minmax(0, 1fr);
@@ -192,7 +205,7 @@
       }
       .pane { overflow: visible; }
       #parse-input .cm-editor { min-height: 14em; }
-      #parse-out { overflow: visible; min-height: 0; }
+      #parse-output-view { min-height: 20em; }
     }
 
     .controls {
@@ -214,43 +227,51 @@
       padding: 0 .3em;
     }
 
-    .toggles {
-      display: inline-flex;
-      flex-wrap: wrap;
-      gap: .3em .8em;
-      align-items: center;
-      font-size: .85em;
-    }
-    .toggles label {
-      display: inline-flex;
-      align-items: center;
-      gap: .25em;
-      color: var(--muted);
-    }
-
-    .progress-pills {
+    /* Tab strip selecting which IR stage shows in the output CM6 view
+       below. Tabs are disabled until the matching section lands in
+       `sectionCache`; the active tab sits flush with its CM6 body so the
+       border reads as one continuous surface. */
+    .output-tabs {
       display: flex;
       flex-wrap: wrap;
-      gap: .3em;
-      margin-bottom: .6em;
+      gap: .2em;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 0;
     }
-    .pill {
-      font-size: .75em;
-      padding: .15em .55em;
-      background: var(--pill-bg);
-      color: var(--pill-pending);
-      border-radius: 99px;
-      transition: background-color .15s, color .15s;
+    .tab {
+      background: none;
+      border: 1px solid transparent;
+      border-bottom: none;
+      color: var(--muted);
+      font: inherit;
+      font-size: .8em;
+      padding: .3em .7em;
+      cursor: pointer;
+      border-radius: 4px 4px 0 0;
     }
-    .pill.done {
-      background: var(--pill-done-bg);
-      color: var(--pill-done-fg);
+    .tab:hover:not(:disabled) { color: var(--fg); }
+    .tab.active {
+      background: var(--pre-bg);
+      color: var(--fg);
+      border-color: var(--border);
+      margin-bottom: -1px;
     }
+    .tab:disabled { opacity: .4; cursor: not-allowed; }
+
+    /* Verdict + diagnostics live under the source editor in the left
+       pane. Capped height with internal scroll so a long rustc dump
+       doesn't squeeze the editor; collapses to zero when no run has
+       produced a verdict yet (so the source fills the whole pane). */
+    #parse-meta {
+      max-height: 10em;
+      overflow-y: auto;
+    }
+    #parse-meta:not(:empty) { margin-top: .6em; }
 
     .verdict {
       padding: .5em .8em;
       border-radius: 6px;
-      margin-bottom: .6em;
+      margin-bottom: .4em;
     }
     .verdict.ok {
       background: var(--ok-bg);
@@ -269,32 +290,6 @@
       color: var(--muted);
       white-space: pre-wrap;
     }
-
-    /* Collapsible IR sections. `<details>` handles open/close natively;
-       we just restyle the default triangle+summary to match the muted
-       section-title look from the prior flat layout. */
-    details.section {
-      border-top: 1px solid var(--border-soft);
-      margin-top: .6em;
-      padding-top: .4em;
-    }
-    details.section > summary {
-      cursor: pointer;
-      color: var(--subtle);
-      font-size: .8em;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      user-select: none;
-      list-style: none;
-    }
-    details.section > summary::before {
-      content: '▸';
-      display: inline-block;
-      width: 1em;
-      color: var(--subtle);
-    }
-    details.section[open] > summary::before { content: '▾'; }
-    details.section[open] > summary { margin-bottom: .3em; }
   </style>
 </head>
 
@@ -302,9 +297,7 @@
 
   <header>
     <h1><a href="https://github.com/ShawnZhong/verus-explorer" target="_blank" rel="noopener">verus-explorer</a></h1>
-    <p class="muted">Verus's full pipeline — rustc front-end, HIR → VIR
-      lowering, AIR generation, Z3 — running entirely in the browser as
-      wasm. Edit the source and press Verify (or <kbd>⌘</kbd>+<kbd>Enter</kbd>).</p>
+    <p class="muted">Verus → HIR → VIR → AIR → Z3 pipeline, running as wasm in your browser.</p>
   </header>
 
   <main id="workbench">
@@ -322,27 +315,19 @@
         </label>
       </div>
       <div id="parse-input"></div>
+      <div id="parse-meta"></div>
       <div class="controls">
         <button id="parse-run" disabled>Loading verifier…</button>
+        <label class="hint muted" title="Re-verify 800ms after each edit">
+          <input type="checkbox" id="auto-verify" /> Auto-verify
+        </label>
         <span class="muted hint"><kbd>⌘</kbd>+<kbd>Enter</kbd> to verify</span>
       </div>
     </section>
 
     <section class="pane" id="right-pane">
-      <div class="pane-header">
-        <span class="pane-label">Output</span>
-        <span class="toggles" id="parse-toggles">
-          <label><input type="checkbox" data-section="AST" /> AST</label>
-          <label><input type="checkbox" data-section="HIR" /> HIR</label>
-          <label><input type="checkbox" data-section="VIR" /> VIR</label>
-          <label><input type="checkbox" data-section="AIR_INITIAL" /> AIR₁</label>
-          <label><input type="checkbox" data-section="AIR_MIDDLE" /> AIR₂</label>
-          <label><input type="checkbox" data-section="AIR_FINAL" /> AIR₃</label>
-          <label><input type="checkbox" data-section="SMT" /> SMT</label>
-        </span>
-      </div>
-      <div id="progress" class="progress-pills" aria-live="polite"></div>
-      <div id="parse-out"></div>
+      <div class="output-tabs" id="parse-tabs" role="tablist"></div>
+      <div id="parse-output-view"></div>
     </section>
   </main>
 
@@ -413,11 +398,12 @@ fn main() {
   <script src="./z3/z3.js"></script>
 
   <script type="module">
-    // CodeMirror 6 bundle, built by `make dev` (see the `public/editor.js`
+    // CodeMirror 6 bundle, built by `make dev` (see the `$(DIST)/editor.js`
     // Makefile target). All CM6 imports flow through this one file; the
-    // export list lives in the Makefile recipe.
+    // export list lives in `public/editor-src.js`.
     import {
       EditorView, basicSetup, keymap, indentWithTab, rust, oneDark,
+      Decoration, StateField, StateEffect, EditorState,
     } from './editor.js';
 
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
@@ -493,85 +479,65 @@ fn main() {
     // ------------------------------------------------------------------
     // DOM refs + tiny state
     // ------------------------------------------------------------------
-    const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
-    const progressEl = document.getElementById('progress');
+    const parseMeta = document.getElementById('parse-meta');
+    const parseTabsEl = document.getElementById('parse-tabs');
+    const parseOutputViewEl = document.getElementById('parse-output-view');
     const exampleSelect = document.getElementById('example-select');
+    const autoVerifyCheckbox = document.getElementById('auto-verify');
     const SECTION_ORDER = ['AST', 'HIR', 'VIR', 'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
+    // AIR has three pipeline-stage variants; subscripts keep the tab strip
+    // tight and reflect pipeline order (initial → middle → final).
     const SECTION_LABEL = {
-      AST: 'AST', HIR: 'HIR', VIR: 'VIR',
-      AIR_INITIAL: 'AIR initial', AIR_MIDDLE: 'AIR middle',
-      AIR_FINAL: 'AIR final', SMT: 'SMT',
-    };
-    const PILL_LABEL = {
       AST: 'AST', HIR: 'HIR', VIR: 'VIR',
       AIR_INITIAL: 'AIR₁', AIR_MIDDLE: 'AIR₂', AIR_FINAL: 'AIR₃',
       SMT: 'SMT',
     };
-    const toggles = Object.fromEntries(
-      [...document.querySelectorAll('#parse-toggles input[type=checkbox]')]
-        .map(cb => [cb.dataset.section, cb])
-    );
 
     // `parse_source` always produces every IR; bodies are cached here so
-    // flipping a toggle just re-renders from cache instead of re-parsing.
+    // flipping a tab just swaps the output-view's doc instead of re-parsing.
     const sectionCache = new Map();
     let verdictCache = null;
     const diagnosticCache = [];
+    // Which IR the output view currently shows; preserved across runParse
+    // calls so the user doesn't lose their tab selection on every edit.
+    // Null until the first successful parse; `renderTabs` picks a default.
+    let currentTab = null;
+    // Per-tab scroll position for the output viewer, so flipping between
+    // tabs (or re-running verification on the same tab) returns to where
+    // the user was reading. Kept live by a `scroll` listener on the
+    // viewer's scrollDOM, below; restored in `renderOutputView`.
+    const tabScrolls = new Map();
+
+    // ------------------------------------------------------------------
+    // Error-line decoration in the source editor. A StateField holds a
+    // RangeSet of `Decoration.line({ class: 'cm-error-line' })` positions;
+    // `setErrorLines` rebuilds it on every parse so stale marks from a
+    // prior run clear before new ones land. `decoration.map(tr.changes)`
+    // keeps existing marks following edits until the next parse refreshes.
+    // ------------------------------------------------------------------
+    const setErrorLines = StateEffect.define();
+    const errorLineField = StateField.define({
+      create: () => Decoration.none,
+      update(deco, tr) {
+        deco = deco.map(tr.changes);
+        for (const e of tr.effects) {
+          if (e.is(setErrorLines)) deco = Decoration.set(e.value, true);
+        }
+        return deco;
+      },
+      provide: f => EditorView.decorations.from(f),
+    });
+    const errorLineDeco = Decoration.line({ attributes: { class: 'cm-error-line' } });
 
     // ------------------------------------------------------------------
     // Renderers
     // ------------------------------------------------------------------
-    const renderProgress = () => {
-      progressEl.textContent = '';
-      for (const name of SECTION_ORDER) {
-        const pill = document.createElement('span');
-        const done = sectionCache.has(name);
-        pill.className = 'pill' + (done ? ' done' : '');
-        pill.textContent = PILL_LABEL[name] + (done ? ' ✓' : ' …');
-        progressEl.appendChild(pill);
-      }
-    };
-
-    const renderVerdict = (body) => {
-      // First line is the headline ("Valid" / "N/M queries failed" / "no queries"),
-      // rest is per-query detail. Pinned to the top of parseOut via `prepend`.
-      const [headline, ...rest] = body.split('\n');
-      const isOk = headline === 'Valid';
-      const div = document.createElement('div');
-      div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
-      const status = document.createElement('div');
-      status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
-      status.textContent = isOk ? '✓ Valid' : `✗ ${headline}`;
-      div.appendChild(status);
-      const detail = rest.join('\n').trim();
-      if (detail) {
-        const d = document.createElement('div');
-        d.className = 'verdict-detail';
-        d.textContent = detail;
-        div.appendChild(d);
-      }
-      parseOut.prepend(div);
-    };
-
-    const renderSection = (name, body) => {
-      if (!body) return;
-      const details = document.createElement('details');
-      details.className = 'section';
-      details.open = true;
-      const summary = document.createElement('summary');
-      summary.textContent = SECTION_LABEL[name] ?? name;
-      details.appendChild(summary);
-      const pre = document.createElement('pre');
-      pre.textContent = body;
-      details.appendChild(pre);
-      parseOut.appendChild(details);
-    };
-
-    // Pull a `line:col` out of a rustc diagnostic so we can make it clickable.
-    // The `--> file:N:M` form is rustc's canonical span marker; fallback to
-    // any `N:M` occurrence covers formats that don't carry an arrow (e.g.,
-    // Verus-side errors). Only the first match is used.
+    // Pull a `line:col` out of a rustc diagnostic so we can make it clickable
+    // *and* surface it as a source-editor line mark. The `--> file:N:M` form
+    // is rustc's canonical span marker; fallback to any `N:M` occurrence
+    // covers formats that don't carry an arrow (e.g., Verus-side errors).
+    // Only the first match is used.
     const extractLoc = (msg) => {
       const m = msg.match(/-->\s*\S*?:(\d+):(\d+)/) ?? msg.match(/:(\d+):(\d+)/);
       return m ? { line: parseInt(m[1], 10), col: parseInt(m[2], 10) } : null;
@@ -586,40 +552,94 @@ fn main() {
       view.focus();
     };
 
-    const renderDiagnostic = (msg) => {
-      const pre = document.createElement('pre');
-      pre.className = 'diagnostic';
-      pre.textContent = msg;
-      const loc = extractLoc(msg);
-      if (loc) {
-        pre.classList.add('clickable');
-        pre.title = `Jump to ${loc.line}:${loc.col}`;
-        pre.addEventListener('click', () => jumpTo(loc.line, loc.col));
+    const renderMeta = () => {
+      parseMeta.textContent = '';
+      if (verdictCache !== null) {
+        // First line is the headline ("Valid" / "N/M queries failed" /
+        // "no queries"); rest is per-query detail.
+        const [headline, ...rest] = verdictCache.split('\n');
+        const isOk = headline === 'Valid';
+        const div = document.createElement('div');
+        div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
+        const status = document.createElement('div');
+        status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
+        status.textContent = isOk ? '✓ Valid' : `✗ ${headline}`;
+        div.appendChild(status);
+        const detail = rest.join('\n').trim();
+        if (detail) {
+          const d = document.createElement('div');
+          d.className = 'verdict-detail';
+          d.textContent = detail;
+          div.appendChild(d);
+        }
+        parseMeta.appendChild(div);
       }
-      parseOut.appendChild(pre);
+      for (const msg of diagnosticCache) {
+        const pre = document.createElement('pre');
+        pre.className = 'diagnostic';
+        pre.textContent = msg;
+        const loc = extractLoc(msg);
+        if (loc) {
+          pre.classList.add('clickable');
+          pre.title = `Jump to ${loc.line}:${loc.col}`;
+          pre.addEventListener('click', () => jumpTo(loc.line, loc.col));
+        }
+        parseMeta.appendChild(pre);
+      }
     };
 
-    // Wipe parseOut and replay from cache. Order: verdict (prepended to top
-    // regardless of arrival order), then diagnostics, then toggled IR
-    // sections in pipeline order.
-    const rerender = () => {
-      parseOut.textContent = '';
-      for (const msg of diagnosticCache) renderDiagnostic(msg);
+    // Tab strip. Sections not yet cached render as disabled buttons so the
+    // full pipeline shape stays visible during cold load / between runs.
+    const renderTabs = () => {
+      parseTabsEl.textContent = '';
       for (const name of SECTION_ORDER) {
-        if (toggles[name].checked && sectionCache.has(name)) {
-          renderSection(name, sectionCache.get(name));
-        }
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'tab' + (name === currentTab ? ' active' : '');
+        button.textContent = SECTION_LABEL[name];
+        button.disabled = !sectionCache.has(name);
+        button.addEventListener('click', () => {
+          currentTab = name;
+          renderTabs();
+          renderOutputView();
+        });
+        parseTabsEl.appendChild(button);
       }
-      if (verdictCache !== null) renderVerdict(verdictCache);
-      renderProgress();
+    };
+
+    // Replace the read-only CM6 viewer's doc with the selected section body,
+    // then restore the user's last scroll position for that tab (0 on first
+    // visit). One long-lived view is cheaper than N-per-tab; the scroll map
+    // is what buys back the "pick up where I left off" feel.
+    const renderOutputView = () => {
+      const body = currentTab && sectionCache.has(currentTab)
+        ? sectionCache.get(currentTab) : '';
+      outputView.dispatch({
+        changes: { from: 0, to: outputView.state.doc.length, insert: body },
+      });
+      outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
+    };
+
+    // Convert diagnostic locations into line decorations on the source
+    // editor. Called post-parse so marks reflect the latest run; an edit
+    // afterwards leaves them in place (mapped through the change) until
+    // the next parse refreshes them.
+    const updateErrorDecorations = () => {
+      const decos = [];
+      const doc = view.state.doc;
+      for (const msg of diagnosticCache) {
+        const loc = extractLoc(msg);
+        if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
+        decos.push(errorLineDeco.range(doc.line(loc.line).from));
+      }
+      view.dispatch({ effects: setErrorLines.of(decos) });
     };
 
     // ------------------------------------------------------------------
     // Rust → JS bridge. Synchronous during `parse_source`; JS is
     // single-threaded, so the DOM won't actually repaint between these
-    // calls. The pills reflect which stages completed post-hoc; on a
-    // mid-pipeline trap the buffered caches survive the unwind and the
-    // `finally`-time `rerender()` flushes them.
+    // calls. On a mid-pipeline trap the buffered caches survive the
+    // unwind and `finally`-time renderers flush what's there.
     // ------------------------------------------------------------------
     globalThis.verus_diagnostic = (msg) => { diagnosticCache.push(msg); };
     globalThis.verus_dump = (section, body) => {
@@ -638,7 +658,6 @@ fn main() {
       sectionCache.clear();
       verdictCache = null;
       diagnosticCache.length = 0;
-      renderProgress();
       try {
         const tParse = performance.now();
         verus.parse_source(view.state.doc.toString());
@@ -655,7 +674,17 @@ fn main() {
           parseButton.textContent = 'Verify';
         }
       }
-      rerender();
+      // Preserve user's tab selection when it survives the new run;
+      // otherwise default to VIR (first "interesting" IR) or whichever
+      // stage made it the furthest.
+      if (!currentTab || !sectionCache.has(currentTab)) {
+        currentTab = sectionCache.has('VIR') ? 'VIR'
+          : (SECTION_ORDER.find(n => sectionCache.has(n)) ?? null);
+      }
+      renderMeta();
+      renderTabs();
+      renderOutputView();
+      updateErrorDecorations();
     };
 
     // ------------------------------------------------------------------
@@ -708,9 +737,29 @@ fn main() {
     })();
 
     // ------------------------------------------------------------------
-    // CM6 editor. Mounted after runParse is defined so the Mod-Enter
-    // keymap's closure resolves cleanly. `oneDark` only applied when the
-    // user's system is in dark mode; everything else keys off CSS vars.
+    // Auto-verify: debounced re-run on edits when the checkbox is on.
+    // Setting is persisted in localStorage so the preference survives a
+    // reload. 800ms feels long enough that fast typing doesn't burn
+    // verifier cycles but short enough that a brief pause fires a check.
+    // ------------------------------------------------------------------
+    const AUTO_VERIFY_KEY = 've-auto-verify';
+    // Default on — unchecked only if the user has explicitly turned it off.
+    autoVerifyCheckbox.checked = localStorage.getItem(AUTO_VERIFY_KEY) !== 'false';
+    autoVerifyCheckbox.addEventListener('change', () => {
+      localStorage.setItem(AUTO_VERIFY_KEY, autoVerifyCheckbox.checked);
+    });
+    let autoVerifyTimer;
+    const scheduleAutoVerify = () => {
+      clearTimeout(autoVerifyTimer);
+      if (!autoVerifyCheckbox.checked) return;
+      autoVerifyTimer = setTimeout(runParse, 800);
+    };
+
+    // ------------------------------------------------------------------
+    // CM6 source editor. Mounted after runParse is defined so the
+    // Mod-Enter keymap's closure resolves cleanly. `oneDark` only applied
+    // when the user's system is in dark mode; everything else keys off
+    // CSS vars.
     // ------------------------------------------------------------------
     const dark = matchMedia('(prefers-color-scheme: dark)').matches;
     const view = new EditorView({
@@ -720,7 +769,10 @@ fn main() {
         basicSetup,
         rust(),
         ...(dark ? [oneDark] : []),
-        EditorView.updateListener.of(u => { if (u.docChanged) scheduleHashSave(); }),
+        errorLineField,
+        EditorView.updateListener.of(u => {
+          if (u.docChanged) { scheduleHashSave(); scheduleAutoVerify(); }
+        }),
         keymap.of([
           indentWithTab,
           { key: 'Mod-Enter', run: () => { runParse(); return true; } },
@@ -728,8 +780,30 @@ fn main() {
       ],
     });
 
+    // Second CM6 instance, read-only, hosts the selected IR stage's
+    // output. `basicSetup` gets us line numbers + folding + search for
+    // free, which matters when the SMT stage dump runs to thousands of
+    // lines. No language extension: the IR formats don't map cleanly to
+    // any built-in highlighter, so we treat them as plain monospace text.
+    const outputView = new EditorView({
+      parent: parseOutputViewEl,
+      doc: '',
+      extensions: [
+        basicSetup,
+        EditorState.readOnly.of(true),
+        EditorView.editable.of(false),
+        ...(dark ? [oneDark] : []),
+      ],
+    });
+    // Keep `tabScrolls` in sync with live user scrolling. Fires on our
+    // own programmatic `scrollTop = …` too, which just re-saves the value
+    // we just wrote — idempotent, so no guard flag needed.
+    outputView.scrollDOM.addEventListener('scroll', () => {
+      if (currentTab) tabScrolls.set(currentTab, outputView.scrollDOM.scrollTop);
+    });
+
     // ------------------------------------------------------------------
-    // Wiring: example dropdown, Verify button, toggle checkboxes.
+    // Wiring: example dropdown + Verify button.
     // ------------------------------------------------------------------
     exampleSelect.addEventListener('change', () => {
       const val = exampleSelect.value;
@@ -740,15 +814,12 @@ fn main() {
       runParse();
     });
     parseButton.addEventListener('click', runParse);
-    for (const cb of Object.values(toggles)) {
-      cb.addEventListener('change', rerender);
-    }
 
     // Cold-load done — flip the Verify button live.
     parseButton.textContent = 'Verify';
     parseButton.disabled = false;
 
-    renderProgress();
+    renderTabs();
     runParse();
   </script>
 

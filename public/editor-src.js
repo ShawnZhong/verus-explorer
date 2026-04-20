@@ -5,7 +5,8 @@
 // with all of CM6's transitive deps inlined. Add a line here when
 // `index.html` wants a new CM6 feature (e.g. `lineNumbers`).
 export { EditorView, basicSetup } from "codemirror";
-export { keymap } from "@codemirror/view";
+export { keymap, Decoration } from "@codemirror/view";
+export { StateField, StateEffect, EditorState } from "@codemirror/state";
 export { indentWithTab } from "@codemirror/commands";
 export { rust } from "@codemirror/lang-rust";
 export { oneDark } from "@codemirror/theme-one-dark";

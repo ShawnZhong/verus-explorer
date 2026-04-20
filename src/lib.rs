@@ -11,6 +11,22 @@
 // `rustc_*` crates are not Cargo deps — they're built as wasm32 rlibs by the
 // `rustc-rlibs` workspace member and resolved at link time via the
 // `-L dependency=...` rustflag in `.cargo/config.toml`.
+//
+// ── File layout (top-down, follows the pipeline) ─────────────────────────
+//   1. JS externs                    — what the browser host provides.
+//   2. Public entry points           — the `#[wasm_bindgen]` surface.
+//   3. Wasm-libs implementation      — in-memory filesystem for rustc's
+//                                      crate locator; backs the wasm_libs_*
+//                                      entry points directly above.
+//   4. Small utilities               — `time`, `emit_section`,
+//                                      `unwrap_dump_or_panic`.
+//   5. Pipeline driver               — `parse_and_verify` → `run_pipeline`
+//                                      orchestrates the four stages below.
+//   6. Stage 1: rustc invocation     — config + `VirtualFileLoader` +
+//                                      `DomWriter` diagnostic plumbing.
+//   7. Stage 2: HIR dump
+//   8. Stage 3: HIR → VIR            — `build_vir` + vstd deserialize cache.
+//   9. Stage 4: VIR → AIR → Z3       — the bulk of the file.
 
 #![feature(rustc_private)]
 
@@ -56,7 +72,9 @@ use vir::prelude::PreludeConfig;
 use vir::sst::KrateSst;
 use wasm_bindgen::prelude::*;
 
-// ---------- JS externs ----------
+// ═══════════════════════════════════════════════════════════════════════
+// 1. JS externs
+// ═══════════════════════════════════════════════════════════════════════
 
 #[wasm_bindgen]
 extern "C" {
@@ -90,7 +108,9 @@ extern "C" {
     fn verus_bench(label: &str, ms: f64);
 }
 
-// ---------- entry points ----------
+// ═══════════════════════════════════════════════════════════════════════
+// 2. Public entry points (#[wasm_bindgen])
+// ═══════════════════════════════════════════════════════════════════════
 
 // `#[wasm_bindgen(start)]` fires when this crate is the final cdylib (the
 // browser build via `wasm-pack build`). Integration tests link us as an
@@ -157,7 +177,9 @@ pub fn parse_source(src: &str) -> String {
     parse_and_verify(src, /* verify */ true)
 }
 
-// ---------- wasm-libs: in-memory filesystem for rustc's crate locator ----------
+// ═══════════════════════════════════════════════════════════════════════
+// 3. Wasm-libs: in-memory filesystem for rustc's crate locator
+// ═══════════════════════════════════════════════════════════════════════
 //
 // Supplies `libcore.rmeta`, `libvstd.rmeta`, and friends to rustc's crate
 // locator so name resolution can resolve `extern crate core/alloc/vstd`
@@ -232,7 +254,9 @@ fn wasm_libs_vstd_vir() -> &'static [u8] {
     wasm_libs().files.iter().find(|(n, _)| *n == VSTD_VIR).map(|(_, d)| *d).unwrap_or_default()
 }
 
-// ---------- pipeline utilities ----------
+// ═══════════════════════════════════════════════════════════════════════
+// 4. Small utilities
+// ═══════════════════════════════════════════════════════════════════════
 
 // Wrap a pipeline stage with a wall-clock timer. Result: one `verus_bench`
 // call per stage, forwarded to console (browser) or stderr (smoke test).
@@ -261,7 +285,180 @@ fn emit_section(out: &mut String, name: &str, body: &str) {
     out.push('\n');
 }
 
-// ---------- rustc plumbing ----------
+// Always return whatever the closure managed to dump. `run_compiler`
+// post-processing can panic via `abort_if_errors` after our closure writes the
+// dump, which would otherwise shadow a valid dump with "panicked: …".
+fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> String {
+    match result {
+        Ok(()) => partial,
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| e.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<opaque>");
+            if partial.is_empty() {
+                format!("panicked: {msg}")
+            } else {
+                format!("{partial}\n(post-dump panic: {msg})")
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 5. Pipeline driver
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
+/// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
+/// the UI splits on.
+///
+/// `verify` gates the AIR→Z3 stage. The wasm-bindgen `parse_source` always
+/// passes `true`; integration tests in `tests/` can pass `false` so the
+/// pipeline stops after VIR and doesn't call into the `Z3_*` shims (which
+/// only `public/index.html` installs — not the wasm-bindgen-test harness).
+pub fn parse_and_verify(src: &str, verify: bool) -> String {
+    // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
+    // code has to be told to link it. vstd's own prelude transitively
+    // re-exports `verus_builtin` items and the `verus_builtin_macros`
+    // proc-macros, so users who do `use vstd::prelude::*;` get everything.
+    let src = format!("extern crate vstd;\n{src}");
+    let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let dump_clone = dump.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
+            *dump_clone.lock().unwrap() = run_pipeline(compiler, verify);
+        });
+    }));
+    let partial = dump.lock().unwrap().clone();
+    unwrap_dump_or_panic(result, partial)
+}
+
+fn run_pipeline(compiler: &Compiler, verify: bool) -> String {
+    let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
+    let mut out = String::new();
+    time("dump.ast", || {
+        let mut body = String::new();
+        writeln!(body, "crate items: {}", krate.items.len()).unwrap();
+        for item in &krate.items {
+            writeln!(
+                body,
+                "  {:?} {}",
+                item.kind.descr(),
+                item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
+            )
+            .unwrap();
+        }
+        emit_section(&mut out, "AST", &body);
+    });
+    // `create_and_enter_global_ctxt` itself is cheap — the expensive work
+    // (name resolution, HIR lowering, type-check) happens lazily inside the
+    // closure via `tcx` queries fired by `build_vir`. We time the enter call
+    // anyway in case global_ctxt setup becomes a hot spot later.
+    time("global_ctxt", || {
+        rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+            dump_hir(&mut out, tcx);
+            dump_vir_and_verify(&mut out, compiler, tcx, verify);
+        })
+    });
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 6. Stage 1: rustc invocation + diagnostic plumbing
+// ═══════════════════════════════════════════════════════════════════════
+
+// `--sysroot=/virtual` pairs with the filesearch callbacks installed by
+// `wasm_libs_finalize` — rustc's crate locator finds `libcore.rmeta` (and
+// friends), plus our prebuilt `libverus_builtin.rmeta`, in the wasm-libs
+// bundle instead of on disk. `#![no_std]` keeps std out (only `core` is
+// needed), and the caller prepends `extern crate verus_builtin;` so that
+// crate is linked and its `#[rustc_diagnostic_item]` registrations fire —
+// Verus keys its builtin lookups off those.
+fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
+    let argv: Vec<String> = [
+        "--edition=2021",
+        "--crate-type=lib",
+        "--crate-name=v",
+        "--sysroot=/virtual",
+        "-Zcrate-attr=no_std",
+        "-Zcrate-attr=feature(register_tool)",
+        // `verus!` expansion emits `#[...]` attributes on expressions
+        // (e.g. `#[verus::internal(...)] foo`) — unstable without this.
+        "-Zcrate-attr=feature(stmt_expr_attributes)",
+        "-Zcrate-attr=feature(proc_macro_hygiene)",
+        "-Zcrate-attr=register_tool(verus)",
+        "-Zcrate-attr=register_tool(verifier)",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
+    let matches = rustc_driver::handle_options(&early_dcx, &argv).expect("handle_options");
+    let opts = config::build_session_options(&mut early_dcx, &matches);
+
+    rustc_interface::interface::Config {
+        opts,
+        // `crate_cfg` is intentionally empty — `parse_cfg` constructs a fresh
+        // `ParseSess` per entry, which builds a `SourceMap` with the default
+        // `RealFileLoader`, and `current_directory()` traps on wasm32. Inject
+        // the cfgs from `psess_created` instead, where the SourceMap is already
+        // wired to our `VirtualFileLoader`.
+        crate_cfg: vec![],
+        crate_check_cfg: vec![],
+        input: Input::Str { name: FileName::Custom("input.rs".into()), input: src },
+        output_file: None,
+        output_dir: None,
+        ice_file: None,
+        file_loader: Some(Box::new(VirtualFileLoader)),
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
+        lint_caps: Default::default(),
+        psess_created: Some(Box::new(move |psess| {
+            let writer: Box<dyn io::Write + Send> = Box::new(DomWriter::new());
+            let dst = AutoStream::new(writer, ColorChoice::Never);
+            let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
+                .sm(Some(psess.clone_source_map()));
+            psess.dcx().set_emitter(Box::new(emitter));
+            // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck)
+            // but the `verus!` proc-macro's `cfg_erase()` strips ghost bodies
+            // unless `verus_keep_ghost_body` is also on — see
+            // builtin_macros/src/lib.rs. `cfg_erase` evaluates these via
+            // `expand_expr`, which reads `psess.config`.
+            psess.config.insert((Symbol::intern("verus_keep_ghost"), None));
+            psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
+        })),
+        hash_untracked_state: None,
+        register_lints: None,
+        override_queries: None,
+        extra_symbols: vec![],
+        make_codegen_backend: None,
+        registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
+        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
+    }
+}
+
+// rustc's `SourceMap::with_inputs` eagerly calls `current_directory()` during
+// session setup, but wasm32 `std::env::current_dir()` returns Unsupported.
+// Supplying our own FileLoader with a dummy cwd avoids the panic. We feed
+// source via `Input::Str`, so read_* is never invoked.
+struct VirtualFileLoader;
+
+impl FileLoader for VirtualFileLoader {
+    fn file_exists(&self, _: &Path) -> bool {
+        false
+    }
+    fn read_file(&self, _: &Path) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no fs on wasm"))
+    }
+    fn read_binary_file(&self, _: &Path) -> io::Result<Arc<[u8]>> {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no fs on wasm"))
+    }
+    fn current_directory(&self) -> io::Result<PathBuf> {
+        Ok(PathBuf::from("/"))
+    }
+}
 
 // wasm32 has panic=abort, so `catch_unwind` can't recover from rustc's
 // `abort_if_errors` (which fires on return from `run_compiler` whenever a
@@ -324,46 +521,63 @@ impl Drop for DomWriter {
     }
 }
 
-// rustc's `SourceMap::with_inputs` eagerly calls `current_directory()` during
-// session setup, but wasm32 `std::env::current_dir()` returns Unsupported.
-// Supplying our own FileLoader with a dummy cwd avoids the panic. We feed
-// source via `Input::Str`, so read_* is never invoked.
-struct VirtualFileLoader;
+// ═══════════════════════════════════════════════════════════════════════
+// 7. Stage 2: HIR dump
+// ═══════════════════════════════════════════════════════════════════════
 
-impl FileLoader for VirtualFileLoader {
-    fn file_exists(&self, _: &Path) -> bool {
-        false
-    }
-    fn read_file(&self, _: &Path) -> io::Result<String> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "no fs on wasm"))
-    }
-    fn read_binary_file(&self, _: &Path) -> io::Result<Arc<[u8]>> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "no fs on wasm"))
-    }
-    fn current_directory(&self) -> io::Result<PathBuf> {
-        Ok(PathBuf::from("/"))
-    }
+fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
+    time("dump.hir", || {
+        // Forces macro expansion + name resolution + HIR lowering.
+        let _ = tcx.resolver_for_lowering();
+        let mut body = String::new();
+        for item_id in tcx.hir_free_items() {
+            let def_id = item_id.owner_id.def_id.to_def_id();
+            writeln!(
+                body,
+                "  {} {}",
+                tcx.def_kind(def_id).descr(def_id),
+                tcx.def_path_str(def_id)
+            )
+            .unwrap();
+        }
+        emit_section(out, "HIR", &body);
+    });
 }
 
-// ---------- HIR → VIR ----------
+// ═══════════════════════════════════════════════════════════════════════
+// 8. Stage 3: HIR → VIR
+// ═══════════════════════════════════════════════════════════════════════
 
-// Deserialize-once cache for the bundled vstd VIR. `bincode::deserialize` of
-// the ~20 MB `vstd.vir` is the single biggest substage inside `build_vir`
-// (~55% in debug builds, ~135ms of the 244ms steady-state in release).
-// `Krate` is `Arc<KrateX>`, so cloning from the cache is an O(1) refcount
-// bump. Wasm is single-threaded — no contention on the OnceLock.
-static VSTD_KRATE: OnceLock<vir::ast::Krate> = OnceLock::new();
-
-fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
-    if let Some(k) = VSTD_KRATE.get() {
-        return Ok(k.clone());
+fn dump_vir_and_verify(
+    out: &mut String,
+    compiler: &Compiler,
+    tcx: TyCtxt<'_>,
+    verify: bool,
+) {
+    // `build_vir` forces HIR lowering + name resolution + ty-check via Verus'
+    // `build_vir_crate`, so this stage absorbs most of the rustc front-end
+    // work. Split from `verify` below to separate rustc cost from Verus cost.
+    let (krate, global_ctx, crate_name, spans) = match time("build_vir", || build_vir(compiler, tcx)) {
+        Ok(v) => v,
+        Err(errs) => {
+            for e in errs {
+                writeln!(out, "  vir error: {}", e.note).unwrap();
+            }
+            return;
+        }
+    };
+    time("dump.vir", || {
+        let mut buf: Vec<u8> = Vec::new();
+        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
+        emit_section(out, "VIR", &String::from_utf8_lossy(&buf));
+    });
+    if !verify {
+        return;
     }
-    let CrateWithMetadata { krate, .. } = bincode::deserialize(wasm_libs_vstd_vir())
-        .map_err(|_| vec![vir::messages::error_bare(
-            "failed to deserialize embedded VIR crate — version mismatch?",
-        )])?;
-    let _ = VSTD_KRATE.set(krate.clone());
-    Ok(krate)
+    match time("verify", || verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans)) {
+        Ok(output) => write_verify_output(out, &output),
+        Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
+    }
 }
 
 // Drives Verus's HIR→VIR pipeline. `Verifier::build_vir_crate` (vendored
@@ -398,7 +612,28 @@ fn build_vir<'tcx>(
     Ok((krate, global_ctx, crate_name, spans))
 }
 
-// ---------- VIR → AIR → Z3 ----------
+// Deserialize-once cache for the bundled vstd VIR. `bincode::deserialize` of
+// the ~20 MB `vstd.vir` is the single biggest substage inside `build_vir`
+// (~55% in debug builds, ~135ms of the 244ms steady-state in release).
+// `Krate` is `Arc<KrateX>`, so cloning from the cache is an O(1) refcount
+// bump. Wasm is single-threaded — no contention on the OnceLock.
+static VSTD_KRATE: OnceLock<vir::ast::Krate> = OnceLock::new();
+
+fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
+    if let Some(k) = VSTD_KRATE.get() {
+        return Ok(k.clone());
+    }
+    let CrateWithMetadata { krate, .. } = bincode::deserialize(wasm_libs_vstd_vir())
+        .map_err(|_| vec![vir::messages::error_bare(
+            "failed to deserialize embedded VIR crate — version mismatch?",
+        )])?;
+    let _ = VSTD_KRATE.set(krate.clone());
+    Ok(krate)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 9. Stage 4: VIR → AIR → Z3
+// ═══════════════════════════════════════════════════════════════════════
 //
 // Drives a fully-simplified Verus VIR krate through prune → Ctx → ast_to_sst →
 // poly → AIR generation → Z3, returning the dumped AIR text and per-query
@@ -408,6 +643,8 @@ fn build_vir<'tcx>(
 //
 // The Z3 backend is `air::context::Context`, which on wasm32 routes through
 // the `Z3_*` shims declared in `air/src/smt_process.rs`.
+
+// -------- data types --------
 
 #[derive(Default)]
 struct VerifyOutput {
@@ -436,6 +673,33 @@ impl Verdict {
             ValidityResult::Valid(_) => Self { function, kind, verdict: "Valid".into(), proved: true },
             other => Self { function, kind, verdict: format!("{:?}", other), proved: false },
         }
+    }
+}
+
+// Box<dyn Write> needs 'static, but we want to drain the captured bytes back
+// in the caller. An Arc<Mutex<Vec<u8>>> shared between writer and caller
+// gives both: the writer owns its handle, and we drain the bytes at module
+// boundaries.
+#[derive(Clone)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBuf {
+    fn new() -> Self {
+        SharedBuf(Arc::new(Mutex::new(Vec::new())))
+    }
+    fn drain_string(&self) -> String {
+        let bytes = std::mem::take(&mut *self.0.lock().unwrap());
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+}
+
+impl io::Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -487,33 +751,6 @@ struct ModuleCtx<'a, 'tcx> {
     arch_word_bits: ArchWordBits,
 }
 
-// Box<dyn Write> needs 'static, but we want to drain the captured bytes back
-// in the caller. An Arc<Mutex<Vec<u8>>> shared between writer and caller
-// gives both: the writer owns its handle, and we drain the bytes at module
-// boundaries.
-#[derive(Clone)]
-struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-
-impl SharedBuf {
-    fn new() -> Self {
-        SharedBuf(Arc::new(Mutex::new(Vec::new())))
-    }
-    fn drain_string(&self) -> String {
-        let bytes = std::mem::take(&mut *self.0.lock().unwrap());
-        String::from_utf8(bytes).unwrap_or_default()
-    }
-}
-
-impl io::Write for SharedBuf {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 // Bundles the per-module driver state. `feed`/`feed_all` send each command to
 // Z3 via `air_ctx.command()`; AIR/SMT dumps are captured by the log writers
 // attached to `air_ctx`.
@@ -533,6 +770,8 @@ impl<'a, 'tcx> Feeder<'a, 'tcx> {
         }
     }
 }
+
+// -------- drivers --------
 
 fn verify_simplified_krate<'tcx>(
     krate: Krate,
@@ -780,203 +1019,4 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
         writeln!(verdict, "{}: {} → {}", v.function, v.kind, result).unwrap();
     }
     emit_section(out, "VERDICT", &verdict);
-}
-
-// ---------- top-level driver ----------
-
-// `--sysroot=/virtual` pairs with the filesearch callbacks installed by
-// `wasm_libs_finalize` — rustc's crate locator finds `libcore.rmeta` (and
-// friends), plus our prebuilt `libverus_builtin.rmeta`, in the wasm-libs
-// bundle instead of on disk. `#![no_std]` keeps std out (only `core` is
-// needed), and the caller prepends `extern crate verus_builtin;` so that
-// crate is linked and its `#[rustc_diagnostic_item]` registrations fire —
-// Verus keys its builtin lookups off those.
-fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
-    let argv: Vec<String> = [
-        "--edition=2021",
-        "--crate-type=lib",
-        "--crate-name=v",
-        "--sysroot=/virtual",
-        "-Zcrate-attr=no_std",
-        "-Zcrate-attr=feature(register_tool)",
-        // `verus!` expansion emits `#[...]` attributes on expressions
-        // (e.g. `#[verus::internal(...)] foo`) — unstable without this.
-        "-Zcrate-attr=feature(stmt_expr_attributes)",
-        "-Zcrate-attr=feature(proc_macro_hygiene)",
-        "-Zcrate-attr=register_tool(verus)",
-        "-Zcrate-attr=register_tool(verifier)",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-
-    let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
-    let matches = rustc_driver::handle_options(&early_dcx, &argv).expect("handle_options");
-    let opts = config::build_session_options(&mut early_dcx, &matches);
-
-    rustc_interface::interface::Config {
-        opts,
-        // `crate_cfg` is intentionally empty — `parse_cfg` constructs a fresh
-        // `ParseSess` per entry, which builds a `SourceMap` with the default
-        // `RealFileLoader`, and `current_directory()` traps on wasm32. Inject
-        // the cfgs from `psess_created` instead, where the SourceMap is already
-        // wired to our `VirtualFileLoader`.
-        crate_cfg: vec![],
-        crate_check_cfg: vec![],
-        input: Input::Str { name: FileName::Custom("input.rs".into()), input: src },
-        output_file: None,
-        output_dir: None,
-        ice_file: None,
-        file_loader: Some(Box::new(VirtualFileLoader)),
-        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
-        lint_caps: Default::default(),
-        psess_created: Some(Box::new(move |psess| {
-            let writer: Box<dyn io::Write + Send> = Box::new(DomWriter::new());
-            let dst = AutoStream::new(writer, ColorChoice::Never);
-            let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
-                .sm(Some(psess.clone_source_map()));
-            psess.dcx().set_emitter(Box::new(emitter));
-            // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck)
-            // but the `verus!` proc-macro's `cfg_erase()` strips ghost bodies
-            // unless `verus_keep_ghost_body` is also on — see
-            // builtin_macros/src/lib.rs. `cfg_erase` evaluates these via
-            // `expand_expr`, which reads `psess.config`.
-            psess.config.insert((Symbol::intern("verus_keep_ghost"), None));
-            psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
-        })),
-        hash_untracked_state: None,
-        register_lints: None,
-        override_queries: None,
-        extra_symbols: vec![],
-        make_codegen_backend: None,
-        registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
-        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
-    }
-}
-
-fn run_pipeline(compiler: &Compiler, verify: bool) -> String {
-    let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
-    let mut out = String::new();
-    time("dump.ast", || {
-        let mut body = String::new();
-        writeln!(body, "crate items: {}", krate.items.len()).unwrap();
-        for item in &krate.items {
-            writeln!(
-                body,
-                "  {:?} {}",
-                item.kind.descr(),
-                item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
-            )
-            .unwrap();
-        }
-        emit_section(&mut out, "AST", &body);
-    });
-    // `create_and_enter_global_ctxt` itself is cheap — the expensive work
-    // (name resolution, HIR lowering, type-check) happens lazily inside the
-    // closure via `tcx` queries fired by `build_vir`. We time the enter call
-    // anyway in case global_ctxt setup becomes a hot spot later.
-    time("global_ctxt", || {
-        rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            dump_hir(&mut out, tcx);
-            dump_vir_and_verify(&mut out, compiler, tcx, verify);
-        })
-    });
-    out
-}
-
-fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
-    time("dump.hir", || {
-        // Forces macro expansion + name resolution + HIR lowering.
-        let _ = tcx.resolver_for_lowering();
-        let mut body = String::new();
-        for item_id in tcx.hir_free_items() {
-            let def_id = item_id.owner_id.def_id.to_def_id();
-            writeln!(
-                body,
-                "  {} {}",
-                tcx.def_kind(def_id).descr(def_id),
-                tcx.def_path_str(def_id)
-            )
-            .unwrap();
-        }
-        emit_section(out, "HIR", &body);
-    });
-}
-
-fn dump_vir_and_verify(
-    out: &mut String,
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    verify: bool,
-) {
-    // `build_vir` forces HIR lowering + name resolution + ty-check via Verus'
-    // `build_vir_crate`, so this stage absorbs most of the rustc front-end
-    // work. Split from `verify` below to separate rustc cost from Verus cost.
-    let (krate, global_ctx, crate_name, spans) = match time("build_vir", || build_vir(compiler, tcx)) {
-        Ok(v) => v,
-        Err(errs) => {
-            for e in errs {
-                writeln!(out, "  vir error: {}", e.note).unwrap();
-            }
-            return;
-        }
-    };
-    time("dump.vir", || {
-        let mut buf: Vec<u8> = Vec::new();
-        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
-        emit_section(out, "VIR", &String::from_utf8_lossy(&buf));
-    });
-    if !verify {
-        return;
-    }
-    match time("verify", || verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans)) {
-        Ok(output) => write_verify_output(out, &output),
-        Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
-    }
-}
-
-// Always return whatever the closure managed to dump. `run_compiler`
-// post-processing can panic via `abort_if_errors` after our closure writes the
-// dump, which would otherwise shadow a valid dump with "panicked: …".
-fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> String {
-    match result {
-        Ok(()) => partial,
-        Err(e) => {
-            let msg = e
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| e.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<opaque>");
-            if partial.is_empty() {
-                format!("panicked: {msg}")
-            } else {
-                format!("{partial}\n(post-dump panic: {msg})")
-            }
-        }
-    }
-}
-
-/// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
-/// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
-/// the UI splits on.
-///
-/// `verify` gates the AIR→Z3 stage. The wasm-bindgen `parse_source` always
-/// passes `true`; integration tests in `tests/` can pass `false` so the
-/// pipeline stops after VIR and doesn't call into the `Z3_*` shims (which
-/// only `public/index.html` installs — not the wasm-bindgen-test harness).
-pub fn parse_and_verify(src: &str, verify: bool) -> String {
-    // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
-    // code has to be told to link it. vstd's own prelude transitively
-    // re-exports `verus_builtin` items and the `verus_builtin_macros`
-    // proc-macros, so users who do `use vstd::prelude::*;` get everything.
-    let src = format!("extern crate vstd;\n{src}");
-    let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let dump_clone = dump.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler, verify);
-        });
-    }));
-    let partial = dump.lock().unwrap().clone();
-    unwrap_dump_or_panic(result, partial)
 }
