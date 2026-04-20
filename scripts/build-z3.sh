@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# Build Z3 → build/z3.{js,wasm}.
+# Build Z3 → target/wasm-z3/z3.{js,wasm}.
 # Stage 1: CMake + build libz3.a (slow, ~5min; skipped if already built).
-# Stage 2: emcc links libz3.a into build/z3.{js,wasm} (fast, ~30s).
-# Idempotent. `rm -rf build` to force a full rebuild of stage 1.
+# Stage 2: emcc links libz3.a into target/wasm-z3/z3.{js,wasm} (fast, ~30s).
+# Idempotent. `rm -rf target/wasm-z3` to force a full rebuild of stage 1.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 source third_party/emsdk/emsdk_env.sh >/dev/null
 
+out=target/wasm-z3
+mkdir -p "$out"
+
 set -x
 
-emcmake cmake -S third_party/z3 -B build \
+emcmake cmake -S third_party/z3 -B "$out" \
   -DZ3_BUILD_LIBZ3_SHARED=OFF \
   -DZ3_SINGLE_THREADED=ON \
   -DZ3_POLLING_TIMER=ON \
@@ -23,9 +26,9 @@ emcmake cmake -S third_party/z3 -B build \
   -DCMAKE_C_FLAGS="-fwasm-exceptions" \
   -DCMAKE_CXX_FLAGS="-fwasm-exceptions" \
   -DCMAKE_BUILD_TYPE=MinSizeRel
-cmake --build build -j"$(nproc)"
+cmake --build "$out" -j"$(nproc)"
 
-emcc -x c /dev/null build/libz3.a \
+emcc -x c /dev/null "$out/libz3.a" \
     -fwasm-exceptions \
     -Oz \
     -s WASM_BIGINT \
@@ -38,4 +41,4 @@ emcc -x c /dev/null build/libz3.a \
     -s INITIAL_MEMORY=64MB \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s TOTAL_STACK=16MB \
-    -o build/z3.js
+    -o "$out/z3.js"

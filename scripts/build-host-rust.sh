@@ -1,26 +1,45 @@
 #!/usr/bin/env bash
-# Snapshot the patched stage1 rustc into a stable rustup-compatible toolchain
-# directory. Required because `./x.py build library` and `./x.py dist
-# rustc-dev` mutually wipe each other's outputs in build/host/stage1/lib —
-# library --target wasm32 erases rustc-dev libs, and dist rustc-dev erases
-# the wasm32 sysroot. Snapshot captures both into a side directory rustup
-# points at, so subsequent x.py invocations can churn freely.
+# Build the patched host rustc and stage it as a self-contained sysroot at
+# target/host-rust/. Required because rust_verify links against patched
+# `rustc_metadata::proc_macro_registry` symbols that don't exist in the
+# rustup-shipped stable toolchain. Other entry points (Makefile + scripts)
+# inject `RUSTC=target/host-rust/bin/rustc` so cargo uses this rustc — no
+# `rustup toolchain link` or `rustup override` involvement.
 #
-# Run after any combination of:
-#   ./x.py build --stage 1 library --target aarch64-apple-darwin,wasm32-unknown-unknown
-#   ./x.py dist rustc-dev --stage 1
-# (in either order — this script picks up wasm32 from the raw stage1-std
-# build dir, which neither wipes.)
+# Three steps in one shot:
+#   1. ./x.py build --stage 1 library --target <host>,wasm32-unknown-unknown
+#   2. ./x.py dist rustc-dev --stage 1
+#   3. stage build/host/stage1 + raw stage1-std into target/host-rust/.
+#      Required because steps 1 and 2 mutually wipe each other's outputs in
+#      build/host/stage1/lib (library --target wasm32 regenerates the sysroot
+#      fresh and drops rustc-dev libs; dist rustc-dev drops the wasm32 sysroot
+#      the other way). The wasm32 std survives in the raw build/<host>/
+#      stage1-std dir, which neither command touches.
 set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+repo="$PWD"
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+# Host triple from rustc; stable channel from rust-toolchain.toml. We borrow
+# cargo/rust-lld/llvm-strip/wasm-component-ld from the rustup-shipped stable
+# toolchain — stage1 doesn't build its own copies, and the protocol versions
+# need to match stage1 rustc's source version.
+HOST_TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
+STABLE_CHANNEL=$(awk -F'"' '/^channel/ {print $2}' rust-toolchain.toml)
+RUSTUP_STABLE="$HOME/.rustup/toolchains/$STABLE_CHANNEL-$HOST_TRIPLE"
+[ -d "$RUSTUP_STABLE" ] || {
+    echo "missing rustup toolchain $STABLE_CHANNEL — run \`rustup toolchain install $STABLE_CHANNEL\`." >&2
+    exit 1
+}
+
+set -x
+cd "$repo/third_party/rust"
+./x.py build --stage 1 library --target "$HOST_TRIPLE,wasm32-unknown-unknown"
+./x.py dist rustc-dev --stage 1
+{ set +x; } 2>/dev/null
+
 RUST_BUILD="$repo/third_party/rust/build/host/stage1"
-RAW_STD="$repo/third_party/rust/build/aarch64-apple-darwin/stage1-std"
-SNAP="$repo/third_party/rust/build/verus-stage1"
-RUSTUP_STABLE="$HOME/.rustup/toolchains/1.94.0-aarch64-apple-darwin"
-HOST_TRIPLE="aarch64-apple-darwin"
-
-[ -d "$RUST_BUILD" ] || { echo "missing $RUST_BUILD — run x.py first" >&2; exit 1; }
+RAW_STD="$repo/third_party/rust/build/$HOST_TRIPLE/stage1-std"
+SNAP="$repo/target/host-rust"
 
 rm -rf "$SNAP"
 mkdir -p "$SNAP/bin" \
@@ -40,8 +59,6 @@ for f in "$RUST_BUILD"/lib/*.dylib; do
 done
 
 # Host sysroot lib/: std + rustc-dev (rustc_driver, rustc_macros, etc.)
-# Whatever's there at snapshot time is what we get — caller is responsible
-# for running the right x.py invocations first.
 for f in "$RUST_BUILD/lib/rustlib/$HOST_TRIPLE/lib/"*; do
     base=$(basename "$f")
     if [ -d "$f" ]; then
@@ -87,9 +104,6 @@ done
 [ -d "$RUST_BUILD/lib/rustlib/src" ] && cp -R "$RUST_BUILD/lib/rustlib/src" "$SNAP/lib/rustlib/src"
 [ -d "$RUST_BUILD/lib/rustlib/rustc-src" ] && cp -R "$RUST_BUILD/lib/rustlib/rustc-src" "$SNAP/lib/rustlib/rustc-src"
 
-# Re-link rustup so `cargo`/`rustc` in this repo resolve to the snapshot.
-rustup toolchain link verus-stage1 "$SNAP" >/dev/null
-
-echo "snapshot built at $SNAP"
+echo "staged rustc at $SNAP"
 echo "host lib: $(ls "$SNAP/lib/rustlib/$HOST_TRIPLE/lib/" | wc -l | tr -d ' ') files"
 echo "wasm32 lib: $(ls "$SNAP/lib/rustlib/wasm32-unknown-unknown/lib/" | wc -l | tr -d ' ') files"

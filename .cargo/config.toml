@@ -41,6 +41,9 @@ CFG_COMPILER_HOST_TRIPLE = "wasm32-unknown-unknown"
 # `debug/deps` and `release/deps` triggers E0464 once both dirs exist.
 [build]
 rustc-wrapper = "./scripts/rustc-wrapper.sh"
+# Consolidate workspace artifacts under target/cargo/ so they sit alongside
+# target/host-rust/, target/host-verus/, and target/wasm-z3/ — see Makefile.
+target-dir = "target/cargo"
 
 [target.wasm32-unknown-unknown]
 rustflags = [

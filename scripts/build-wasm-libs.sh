@@ -7,6 +7,11 @@
 #     `-Z always-encode-mir=yes` we don't need since we never codegen).
 #   verus_builtin — registers the `#[rustc_diagnostic_item = ...]` names
 #     Verus looks up.
+#   verus_builtin_macros, verus_state_machines_macros — `--cfg=stub_only`
+#     rmetas exposing only the `pub macro NAME` decl_macro shims, enough
+#     for vstd's name resolution. Their full crates (with the `MACROS`
+#     descriptor slices) get built separately by cargo for the host
+#     (rust_verify) and the explorer's wasm binary.
 #   vstd.rmeta + vstd.vir — vstd compiled via the host rust_verify driver
 #     against our self-built sysroot (SVH chain matches user-code rustc-
 #     in-wasm's lookups).
@@ -26,7 +31,11 @@ out="${1:-target/wasm-libs}"
 lib="$out/lib/rustlib/wasm32-unknown-unknown/lib"
 mkdir -p "$lib"
 
-RUSTC="${RUSTC:-rustc}"
+RUSTC="${RUSTC:-$repo/target/host-rust/bin/rustc}"
+[ -x "$RUSTC" ] || {
+    echo "missing $RUSTC — run \`make host-rust\` first." >&2
+    exit 1
+}
 export RUSTC_BOOTSTRAP=1
 
 # Chain: core (no deps) → compiler_builtins (deps core) → alloc (deps core
@@ -76,32 +85,26 @@ set -x
     --out-dir "$lib" \
     "$repo/third_party/verus/source/builtin/src/lib.rs"
 
-# verus_builtin_macros + verus_state_machines_macros, stubs-only mode
-# (`--cfg=stub_only` cfg-gates out the proc_macro/syn/quote-using impl fns +
-# `MACROS` slice — see each crate's lib.rs header). Result is a wasm32 rmeta
-# exposing only the `pub macro NAME` decl_macro stubs, exactly what vstd's
-# build (`--extern=...` below) and the bundled sysroot need for name
-# resolution. The full crates (with `MACROS`) get built separately by cargo
-# for both the host (rust_verify) and the explorer's wasm binary (registered
-# at startup via `proc_macros::install`); these rmetas aren't used by either.
-"$RUSTC" --edition=2018 --crate-type=lib --crate-name=verus_builtin_macros \
-    --target=wasm32-unknown-unknown --emit=metadata \
-    -Cextra-filename=-explorer \
-    --cfg=stub_only \
-    --check-cfg='cfg(stub_only)' \
-    --check-cfg='cfg(verus_keep_ghost)' \
-    --sysroot="$out" \
-    --out-dir "$lib" \
+# Stubs-only macro rmetas (`--cfg=stub_only` cfg-gates out the proc_macro/
+# syn/quote-using impl fns + `MACROS` slice — see each crate's lib.rs
+# header). Each is a wasm32 rmeta exposing only the `pub macro NAME`
+# decl_macro stubs, exactly what vstd's build (`--extern=...` below) and the
+# bundled sysroot need for name resolution.
+build_stub_rmeta() {
+    local name=$1 src=$2
+    "$RUSTC" --edition=2018 --crate-type=lib --crate-name="$name" \
+        --target=wasm32-unknown-unknown --emit=metadata \
+        -Cextra-filename=-explorer \
+        --cfg=stub_only \
+        --check-cfg='cfg(stub_only)' \
+        --check-cfg='cfg(verus_keep_ghost)' \
+        --sysroot="$out" \
+        --out-dir "$lib" \
+        "$src"
+}
+build_stub_rmeta verus_builtin_macros \
     "$repo/third_party/verus/source/builtin_macros/src/lib.rs"
-
-"$RUSTC" --edition=2018 --crate-type=lib --crate-name=verus_state_machines_macros \
-    --target=wasm32-unknown-unknown --emit=metadata \
-    -Cextra-filename=-explorer \
-    --cfg=stub_only \
-    --check-cfg='cfg(stub_only)' \
-    --check-cfg='cfg(verus_keep_ghost)' \
-    --sysroot="$out" \
-    --out-dir "$lib" \
+build_stub_rmeta verus_state_machines_macros \
     "$repo/third_party/verus/source/state_machines_macros/src/lib.rs"
 
 # vstd via host rust_verify. --sysroot=$out resolves core/alloc/
@@ -113,14 +116,14 @@ set -x
 # `feature="alloc"` (not "std") because the embedded sysroot bundles
 # only core + alloc.
 { set +x; } 2>/dev/null
-host_dir="$repo/target/verus-host/release"
+host_dir="$repo/target/host-verus/release"
 rust_verify="$host_dir/rust_verify"
 # Both macro crates' wasm32 stub rmetas were built directly above (lives in
 # $lib next to verus_builtin); vstd's --externs point at those.
 macros="$lib/libverus_builtin_macros-explorer.rmeta"
 sm_macros="$lib/libverus_state_machines_macros-explorer.rmeta"
 [ -e "$rust_verify" ] || {
-    echo "missing host artifact: $rust_verify — run \`make verus-host\` first." >&2
+    echo "missing host artifact: $rust_verify — run \`make host-verus\` first." >&2
     exit 1
 }
 

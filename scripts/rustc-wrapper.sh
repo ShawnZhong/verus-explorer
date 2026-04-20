@@ -38,7 +38,7 @@ for a in "$@"; do
 done
 
 extra=()
-marker="/target/wasm32-unknown-unknown/"
+marker="/wasm32-unknown-unknown/"
 if [[ "$target" == "wasm32-unknown-unknown" && "$outdir" == *"$marker"* ]]; then
     prefix="${outdir%%${marker}*}"
     rest="${outdir#*$marker}"

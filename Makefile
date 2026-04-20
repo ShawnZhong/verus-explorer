@@ -1,42 +1,63 @@
 # verus-explorer convenience targets.
 #
 # Usage:
-#   make          # dev build into dist/ (fast, skips wasm-opt)
-#   make release  # optimized build into dist/
-#   make serve    # dev build + serve dist/ on :8000
-#   make deploy   # release build + push dist/ to origin/gh-pages
-#   make test     # run headless-browser wasm-bindgen tests (needs chrome/chromedriver)
-#   make verus-host  # build the host rust_verify driver (used by build.rs)
-#   make clean    # remove build artifacts (keeps third_party/)
+#   make           # dev build into dist/ (fast, skips wasm-opt)
+#   make release   # optimized build into dist/
+#   make serve     # dev build + serve dist/ on :8000
+#   make deploy    # release build + push dist/ to origin/gh-pages
+#   make test      # run headless-browser wasm-bindgen tests (needs chrome/chromedriver)
+#   make host-rust # build patched stage1 rustc → target/host-rust/ (slow, ~10min; rare)
+#   make host-verus# build host rust_verify driver → target/host-verus/release/
+#   make clean     # remove cargo + wasm-z3 + host-verus artifacts (keeps host-rust)
+#   make distclean # also remove host-rust (full nuke; forces stage1 rebuild)
+#
+# Build artifact layout (all under target/):
+#   target/cargo/      cargo workspace (debug, release, wasm32-unknown-unknown)
+#   target/host-rust/  patched rustc staged sysroot (RUSTC env points here)
+#   target/host-verus/ rust_verify + verus macro crates (host build)
+#   target/wasm-z3/    z3.{js,wasm} for the in-browser SMT runtime
 
-.PHONY: dev release serve deploy test verus-host clean
+.PHONY: dev release serve deploy test host-rust host-verus clean distclean
 
 DIST  := dist
-BUILD := build
+WASM_Z3 := target/wasm-z3
 # wasm-pack's staging directory, kept separate from $(DIST) so its post-build
 # wasm-opt pass only sees our own bundle — otherwise it chokes on
 # $(DIST)/z3.wasm, which uses the WebAssembly exception-handling proposal.
 PKG   := $(DIST)/pkg
 
+# Patched rustc staged at target/host-rust/ by build-host-rust.sh. Injected
+# into every cargo/wasm-pack invocation here (and the build scripts do the
+# same) so cargo uses our rustc without needing rustup-toolchain-link or
+# rustup-override. Cargo itself still comes from the rustup-shipped channel
+# in rust-toolchain.toml.
+export RUSTC := $(CURDIR)/target/host-rust/bin/rustc
+
 # `rustc-rlibs` is a wasm32-only path dep of this crate (see Cargo.toml), so
 # wasm-pack's single cargo invocation resolves features across both trees
 # in one pass and builds every rustc_* wasm32 rlib into
-# `target/wasm32-unknown-unknown/<profile>/deps` — where the explorer's
+# `target/cargo/wasm32-unknown-unknown/<profile>/deps` — where the explorer's
 # `extern crate rustc_*;` lookups resolve them via the `-L dependency=...`
 # rustflag in `.cargo/config.toml`.
-dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm verus-host
+dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm host-verus
 	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
 	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
 	rm -rf $(PKG)
+
+# Build the patched stage1 rustc. Slow (~10 min) and rarely needed (only
+# when third_party/rust source changes). Phony so each invocation re-runs
+# x.py — cargo-style incremental skipping is x.py's job.
+host-rust:
+	./scripts/build-host-rust.sh
 
 # Build the host rust_verify driver. build.rs's wasm-libs script invokes
 # rust_verify to compile vstd → wasm32 rmeta + .vir, both of which get
 # bundled into the virtual sysroot. Phony so each invocation re-checks via
 # cargo (cargo itself skips work when nothing changed).
-verus-host:
+host-verus:
 	./scripts/build-host-verus.sh
 
-$(DIST)/z3.%: $(BUILD)/z3.% | $(DIST)
+$(DIST)/z3.%: $(WASM_Z3)/z3.% | $(DIST)
 	cp $< $@
 $(DIST)/index.html: public/index.html | $(DIST)
 	cp $< $@
@@ -44,7 +65,7 @@ $(DIST)/index.html: public/index.html | $(DIST)
 $(DIST):
 	git worktree add --orphan -b gh-pages $(DIST)
 
-$(BUILD)/z3.js $(BUILD)/z3.wasm &: scripts/build-z3.sh
+$(WASM_Z3)/z3.js $(WASM_Z3)/z3.wasm &: scripts/build-z3.sh
 	./scripts/build-z3.sh
 
 serve:
@@ -52,7 +73,7 @@ serve:
 
 # Headless-browser run of `tests/smoke.rs`. Tests call `parse_source` with
 # `verify = false` so the AIR → Z3 stage is skipped — no Z3 shims needed.
-test: verus-host
+test: host-verus
 	wasm-pack test --chrome --headless
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
@@ -65,5 +86,10 @@ deploy: release
 	git branch -M gh-pages && \
 	git push --force origin gh-pages
 
+# Spare target/host-rust/ — it's the expensive stage1 rustc (~1 GB,
+# ~10 min to rebuild from x.py). Use `make distclean` for a full nuke.
 clean:
-	rm -rf target
+	rm -rf target/cargo target/host-verus $(WASM_Z3)
+
+distclean: clean
+	rm -rf target/host-rust
