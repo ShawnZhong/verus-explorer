@@ -133,7 +133,7 @@ fn pipeline_preserves_ghost_proof_block() {
                verus! { fn main() { proof { assert(false); } } }";
 
     let t1 = perf_now();
-    let out1 = verus_explorer::parse_and_verify(src, /* verify */ true);
+    let out1 = verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
     let t2 = perf_now();
 
     // Second and third parse_source in the *same* wasm instance. The JS
@@ -144,9 +144,9 @@ fn pipeline_preserves_ghost_proof_block() {
     // `verus_explorer::init`) surfaces via wasm-pack's output — telling
     // us exactly which global-state invariant trips. #3 confirms whether
     // #2 was a one-shot warmup or whether subsequent calls are steady-state.
-    let out2 = verus_explorer::parse_and_verify(src, /* verify */ true);
+    let out2 = verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
     let t3 = perf_now();
-    let out3 = verus_explorer::parse_and_verify(src, /* verify */ true);
+    let out3 = verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
     let t4 = perf_now();
 
     bench_log(&format!(

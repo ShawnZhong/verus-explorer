@@ -10,3 +10,4 @@ export { StateField, StateEffect, EditorState } from "@codemirror/state";
 export { indentWithTab } from "@codemirror/commands";
 export { rust } from "@codemirror/lang-rust";
 export { oneDark } from "@codemirror/theme-one-dark";
+export { linter, setDiagnostics } from "@codemirror/lint";

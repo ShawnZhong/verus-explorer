@@ -25,6 +25,8 @@
       --bad-border: #f5c2c0;
       --diag-bg: #fdf2f2;
       --diag-border: #b42318;
+      --warn-bg: #fffaf0;
+      --warn-border: #d4a017;
       --focus-ring: #4a9eff;
       --pill-bg: #f0f0f0;
       --pill-pending: #999;
@@ -48,6 +50,8 @@
         --bad-border: #5a2f2d;
         --diag-bg: #2a1010;
         --diag-border: #e07b75;
+        --warn-bg: #2a2310;
+        --warn-border: #d4a017;
         --focus-ring: #6fb2ff;
         --pill-bg: #2a2a2a;
         --pill-pending: #666;
@@ -117,17 +121,6 @@
       font-size: .85em;
     }
 
-    pre.diagnostic {
-      background: var(--diag-bg);
-      border-left: 3px solid var(--diag-border);
-    }
-    pre.diagnostic.clickable {
-      cursor: pointer;
-    }
-    pre.diagnostic.clickable:hover {
-      outline: 1px solid var(--diag-border);
-    }
-
     /* Split-pane workbench: editor on the left, output on the right.
        Each pane is a flex column that owns its own scroll; `min-height: 0`
        on the grid children is what lets the inner `overflow: auto` track
@@ -147,17 +140,10 @@
     }
     .pane-header {
       display: flex;
-      justify-content: space-between;
       align-items: center;
       gap: .5em;
       margin-bottom: .4em;
       flex-wrap: wrap;
-    }
-    .pane-label {
-      font-size: .8em;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      color: var(--subtle);
     }
     #parse-input {
       flex: 1;
@@ -193,10 +179,11 @@
     #parse-output-view .cm-scroller {
       font-family: ui-monospace, Menlo, Consolas, monospace;
     }
-    /* Source-editor decoration: any line flagged by the diagnostic loc
-       extractor gets a red wash so the user sees where the error lives
-       without having to click into it. */
+    /* Source-editor decorations for diagnostics flagged by the loc
+       extractor. Errors get a red wash, warnings a softer yellow — same
+       severity palette as the diagnostic panes below the editor. */
     .cm-error-line { background-color: var(--bad-bg); }
+    .cm-warning-line { background-color: var(--warn-bg); }
     @media (max-width: 900px) {
       #workbench {
         grid-template-columns: minmax(0, 1fr);
@@ -225,6 +212,18 @@
       border: 1px solid var(--border);
       border-radius: 3px;
       padding: 0 .3em;
+    }
+    /* In-button shortcut hint. Inherits the button's disabled opacity so it
+       dims along with the label while cold-loading / mid-run. */
+    #parse-run {
+      display: inline-flex;
+      align-items: center;
+      gap: .5em;
+    }
+    .shortcut {
+      font-size: .75em;
+      opacity: .7;
+      padding: 0 .25em;
     }
 
     /* Tab strip selecting which IR stage shows in the output CM6 view
@@ -303,7 +302,6 @@
   <main id="workbench">
     <section class="pane" id="left-pane">
       <div class="pane-header">
-        <span class="pane-label">Source</span>
         <label class="hint muted">
           Example:
           <select id="example-select">
@@ -317,11 +315,16 @@
       <div id="parse-input"></div>
       <div id="parse-meta"></div>
       <div class="controls">
-        <button id="parse-run" disabled>Loading verifier…</button>
+        <button id="parse-run" disabled>
+          <span id="parse-run-label">Loading verifier…</span>
+          <kbd class="shortcut">⌘↵</kbd>
+        </button>
         <label class="hint muted" title="Re-verify 800ms after each edit">
           <input type="checkbox" id="auto-verify" /> Auto-verify
         </label>
-        <span class="muted hint"><kbd>⌘</kbd>+<kbd>Enter</kbd> to verify</span>
+        <label class="hint muted" title="Run expand-errors after a failed query to pinpoint which sub-conjunct breaks (slower)">
+          <input type="checkbox" id="expand-errors" /> Expand errors
+        </label>
       </div>
     </section>
 
@@ -404,6 +407,7 @@ fn main() {
     import {
       EditorView, basicSetup, keymap, indentWithTab, rust, oneDark,
       Decoration, StateField, StateEffect, EditorState,
+      linter, setDiagnostics,
     } from './editor.js';
 
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
@@ -452,8 +456,19 @@ fn main() {
     globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
     globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
     globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
-    globalThis.Z3_eval_smtlib2_string = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
     globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
+    // `Z3_eval_smtlib2_string` returns the solver's textual reply (`sat` /
+    // `unsat` / errors / model output) for each batch of SMT commands sent
+    // from the AIR driver. The AIR log writers capture *input* SMT-LIB2 but
+    // the replies are otherwise opaque; tee them into `z3ResponseBuffer`
+    // here so `runParse` can stash the transcript as a 'Z3' section.
+    const z3Eval = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
+    let z3ResponseBuffer = [];
+    globalThis.Z3_eval_smtlib2_string = (ctx, query) => {
+      const reply = z3Eval(ctx, query);
+      z3ResponseBuffer.push(reply);
+      return reply;
+    };
 
     // One wasm instance, reused for every `parse_source` call. Each
     // `run_compiler` builds its own Session+CStore; nothing leaks across
@@ -480,18 +495,27 @@ fn main() {
     // DOM refs + tiny state
     // ------------------------------------------------------------------
     const parseButton = document.getElementById('parse-run');
+    const parseButtonLabel = document.getElementById('parse-run-label');
     const parseMeta = document.getElementById('parse-meta');
     const parseTabsEl = document.getElementById('parse-tabs');
     const parseOutputViewEl = document.getElementById('parse-output-view');
     const exampleSelect = document.getElementById('example-select');
     const autoVerifyCheckbox = document.getElementById('auto-verify');
-    const SECTION_ORDER = ['AST', 'HIR', 'VIR', 'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
-    // AIR has three pipeline-stage variants; subscripts keep the tab strip
-    // tight and reflect pipeline order (initial → middle → final).
+    const expandErrorsCheckbox = document.getElementById('expand-errors');
+    const SECTION_ORDER = [
+      'AST', 'HIR', 'VIR', 'SST_AST', 'SST_POLY',
+      'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT', 'Z3',
+    ];
+    // Tab labels name what the stage actually *produced* rather than pipeline
+    // positions — SST has two dumps (post-ast_to_sst, post-poly), AIR has
+    // three (initial block tree, SSA-versioned, flattened to one assertion).
+    // SMT-in is what we send to Z3; SMT-out is Z3's reply. Both sides are
+    // SMT-LIB2, so the direction suffix carries the information.
     const SECTION_LABEL = {
       AST: 'AST', HIR: 'HIR', VIR: 'VIR',
-      AIR_INITIAL: 'AIR₁', AIR_MIDDLE: 'AIR₂', AIR_FINAL: 'AIR₃',
-      SMT: 'SMT',
+      SST_AST: 'SST', SST_POLY: 'SST-poly',
+      AIR_INITIAL: 'AIR-raw', AIR_MIDDLE: 'AIR-SSA', AIR_FINAL: 'AIR-flat',
+      SMT: 'SMT-in', Z3: 'SMT-out',
     };
 
     // `parse_source` always produces every IR; bodies are cached here so
@@ -529,6 +553,19 @@ fn main() {
       provide: f => EditorView.decorations.from(f),
     });
     const errorLineDeco = Decoration.line({ attributes: { class: 'cm-error-line' } });
+    const warningLineDeco = Decoration.line({ attributes: { class: 'cm-warning-line' } });
+
+    // Rustc's `HumanEmitter` prefixes each top-level diagnostic with the
+    // level name: `error[E0432]:`, `error:`, `warning:`, `note:`, `help:`.
+    // We key off that first token to pick severity. Anything we don't
+    // recognize (rare — e.g., a Verus-side message without the prefix)
+    // falls through as an error so it stays visible in red.
+    const severity = (msg) => {
+      const m = msg.trimStart().match(/^(error|warning|note|help)\b/);
+      if (!m) return 'error';
+      if (m[1] === 'note' || m[1] === 'help') return 'note';
+      return m[1];
+    };
 
     // ------------------------------------------------------------------
     // Renderers
@@ -543,49 +580,30 @@ fn main() {
       return m ? { line: parseInt(m[1], 10), col: parseInt(m[2], 10) } : null;
     };
 
-    const jumpTo = (line, col) => {
-      const doc = view.state.doc;
-      if (line < 1 || line > doc.lines) return;
-      const lineInfo = doc.line(line);
-      const anchor = Math.min(lineInfo.from + Math.max(0, col - 1), lineInfo.to);
-      view.dispatch({ selection: { anchor }, scrollIntoView: true });
-      view.focus();
-    };
-
+    // Diagnostic text is surfaced inline via the CM6 lint extension
+    // (squiggles + hover tooltips) — see `buildInlineDiagnostics`. This
+    // panel only hosts the high-level verdict (verified / N queries failed).
     const renderMeta = () => {
       parseMeta.textContent = '';
-      if (verdictCache !== null) {
-        // First line is the headline ("Valid" / "N/M queries failed" /
-        // "no queries"); rest is per-query detail.
-        const [headline, ...rest] = verdictCache.split('\n');
-        const isOk = headline === 'Valid';
-        const div = document.createElement('div');
-        div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
-        const status = document.createElement('div');
-        status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
-        status.textContent = isOk ? '✓ Valid' : `✗ ${headline}`;
-        div.appendChild(status);
-        const detail = rest.join('\n').trim();
-        if (detail) {
-          const d = document.createElement('div');
-          d.className = 'verdict-detail';
-          d.textContent = detail;
-          div.appendChild(d);
-        }
-        parseMeta.appendChild(div);
+      if (verdictCache === null) return;
+      // First line is the headline ("verified" / "N/M queries failed" /
+      // "no queries"); rest is per-query detail.
+      const [headline, ...rest] = verdictCache.split('\n');
+      const isOk = headline === 'verified';
+      const div = document.createElement('div');
+      div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
+      const status = document.createElement('div');
+      status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
+      status.textContent = isOk ? '✓ verified' : `✗ ${headline}`;
+      div.appendChild(status);
+      const detail = rest.join('\n').trim();
+      if (detail) {
+        const d = document.createElement('div');
+        d.className = 'verdict-detail';
+        d.textContent = detail;
+        div.appendChild(d);
       }
-      for (const msg of diagnosticCache) {
-        const pre = document.createElement('pre');
-        pre.className = 'diagnostic';
-        pre.textContent = msg;
-        const loc = extractLoc(msg);
-        if (loc) {
-          pre.classList.add('clickable');
-          pre.title = `Jump to ${loc.line}:${loc.col}`;
-          pre.addEventListener('click', () => jumpTo(loc.line, loc.col));
-        }
-        parseMeta.appendChild(pre);
-      }
+      parseMeta.appendChild(div);
     };
 
     // Tab strip. Sections not yet cached render as disabled buttons so the
@@ -620,18 +638,55 @@ fn main() {
       outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
     };
 
+    // Build CM6 `Diagnostic` objects (the @codemirror/lint shape) from the
+    // rustc diagnostic strings — one per message with a known line:col.
+    // Yields the hover tooltip + squiggle underline in the editor, in sync
+    // with the line-bg wash `updateErrorDecorations` applies.
+    const buildInlineDiagnostics = () => {
+      const doc = view.state.doc;
+      const diags = [];
+      for (const msg of diagnosticCache) {
+        const loc = extractLoc(msg);
+        if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
+        const lineInfo = doc.line(loc.line);
+        // rustc's `--> file:L:C` already emits a 1-based char column, and
+        // CM6's lint renderer places the squiggle starting one char after
+        // `from` — so we add `loc.col` directly (no -1) to land the
+        // underline exactly under the character rustc's ^^^^^ points at.
+        const from = Math.min(lineInfo.from + Math.max(0, loc.col), lineInfo.to);
+        diags.push({ from, to: lineInfo.to, severity: severity(msg), message: msg });
+      }
+      // CM6 requires diagnostics sorted by `from`.
+      diags.sort((a, b) => a.from - b.from);
+      view.dispatch(setDiagnostics(view.state, diags));
+    };
+
     // Convert diagnostic locations into line decorations on the source
     // editor. Called post-parse so marks reflect the latest run; an edit
     // afterwards leaves them in place (mapped through the change) until
     // the next parse refreshes them.
     const updateErrorDecorations = () => {
-      const decos = [];
       const doc = view.state.doc;
+      // CM6 requires decorations fed into a set to be sorted by `from`.
+      // Collect with the line `from` first, sort, then materialize the
+      // correct decoration per severity. Error wins when the same line has
+      // both an error and a warning — two line-bg decorations on one line
+      // both render and the warning would visually layer over the error.
+      const byLine = new Map();
       for (const msg of diagnosticCache) {
         const loc = extractLoc(msg);
         if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
-        decos.push(errorLineDeco.range(doc.line(loc.line).from));
+        const sev = severity(msg);
+        if (sev === 'note') continue;
+        const from = doc.line(loc.line).from;
+        const prev = byLine.get(from);
+        if (!prev || (prev === 'warning' && sev === 'error')) {
+          byLine.set(from, sev);
+        }
       }
+      const decos = [...byLine.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([from, sev]) => (sev === 'error' ? errorLineDeco : warningLineDeco).range(from));
       view.dispatch({ effects: setErrorLines.of(decos) });
     };
 
@@ -654,13 +709,14 @@ fn main() {
     const runParse = () => {
       const myRun = ++runId;
       parseButton.disabled = true;
-      parseButton.textContent = 'Verifying…';
+      parseButtonLabel.textContent = 'Verifying…';
       sectionCache.clear();
       verdictCache = null;
       diagnosticCache.length = 0;
+      z3ResponseBuffer = [];
       try {
         const tParse = performance.now();
-        verus.parse_source(view.state.doc.toString());
+        verus.parse_source(view.state.doc.toString(), expandErrorsCheckbox.checked);
         console.log(`[parse] parse_source=${(performance.now() - tParse).toFixed(0)}ms`);
       } catch (e) {
         if (myRun !== runId) return;
@@ -671,8 +727,13 @@ fn main() {
       } finally {
         if (myRun === runId) {
           parseButton.disabled = false;
-          parseButton.textContent = 'Verify';
+          parseButtonLabel.textContent = 'Verify';
         }
+      }
+      // Z3 transcript lives on the JS side (wrapped cwrap), so it's installed
+      // after `parse_source` returns rather than via `verus_dump`.
+      if (z3ResponseBuffer.length) {
+        sectionCache.set('Z3', z3ResponseBuffer.join('\n'));
       }
       // Preserve user's tab selection when it survives the new run;
       // otherwise default to VIR (first "interesting" IR) or whichever
@@ -685,6 +746,7 @@ fn main() {
       renderTabs();
       renderOutputView();
       updateErrorDecorations();
+      buildInlineDiagnostics();
     };
 
     // ------------------------------------------------------------------
@@ -748,6 +810,14 @@ fn main() {
     autoVerifyCheckbox.addEventListener('change', () => {
       localStorage.setItem(AUTO_VERIFY_KEY, autoVerifyCheckbox.checked);
     });
+    // Expand-errors: default off — runs per-conjunct sub-queries on a failed
+    // body, which doubles-to-triples verify time but pinpoints which sub-
+    // assertion broke. Persisted so the pref survives reloads.
+    const EXPAND_ERRORS_KEY = 've-expand-errors';
+    expandErrorsCheckbox.checked = localStorage.getItem(EXPAND_ERRORS_KEY) === 'true';
+    expandErrorsCheckbox.addEventListener('change', () => {
+      localStorage.setItem(EXPAND_ERRORS_KEY, expandErrorsCheckbox.checked);
+    });
     let autoVerifyTimer;
     const scheduleAutoVerify = () => {
       clearTimeout(autoVerifyTimer);
@@ -770,6 +840,10 @@ fn main() {
         rust(),
         ...(dark ? [oneDark] : []),
         errorLineField,
+        // No-op source — we push diagnostics directly via `setDiagnostics`
+        // after each parse. The extension itself is what enables CM6's
+        // hover-tooltip rendering of those diagnostics.
+        linter(() => []),
         EditorView.updateListener.of(u => {
           if (u.docChanged) { scheduleHashSave(); scheduleAutoVerify(); }
         }),
@@ -810,13 +884,12 @@ fn main() {
       if (!val) return;
       const src = document.getElementById(`example-${val}`).textContent;
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
-      exampleSelect.value = '';
       runParse();
     });
     parseButton.addEventListener('click', runParse);
 
     // Cold-load done — flip the Verify button live.
-    parseButton.textContent = 'Verify';
+    parseButtonLabel.textContent = 'Verify';
     parseButton.disabled = false;
 
     renderTabs();

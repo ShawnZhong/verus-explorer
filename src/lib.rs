@@ -30,8 +30,10 @@
 
 #![feature(rustc_private)]
 
+extern crate rustc_ast_pretty;
 extern crate rustc_driver;
 extern crate rustc_errors;
+extern crate rustc_hir_pretty;
 extern crate rustc_interface;
 extern crate rustc_metadata;
 extern crate rustc_middle;
@@ -51,6 +53,7 @@ use rust_verify::buckets::Bucket;
 use rust_verify::cargo_verus_dep_tracker::DepTracker;
 use rust_verify::commands::{OpGenerator, OpKind, QueryOp, Style};
 use rust_verify::config::ArgsX;
+use rust_verify::expand_errors_driver::ExpandErrorsResult;
 use rust_verify::import_export::CrateWithMetadata;
 use rust_verify::spans::SpanContext;
 use rust_verify::verifier::{Reporter, Verifier};
@@ -64,12 +67,13 @@ use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::FileLoader;
 use rustc_span::{FileName, Symbol};
-use vir::ast::{ArchWordBits, Datatype, Fun, Krate, VirErr};
+use vir::ast::{ArchWordBits, Datatype, Dt, Fun, Krate, KrateX, Path as VirPath, VirErr};
 use vir::ast_util::{fun_as_friendly_rust_name, is_visible_to};
 use vir::context::{Ctx, GlobalCtx};
-use vir::messages::VirMessageInterface;
+use vir::messages::{ToAny, VirMessageInterface};
 use vir::prelude::PreludeConfig;
-use vir::sst::KrateSst;
+use vir::def::ProverChoice;
+use vir::sst::{AssertId, KrateSst, KrateSstX};
 use wasm_bindgen::prelude::*;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -173,8 +177,8 @@ pub fn wasm_libs_finalize() {
 /// and toggles rendering without re-parsing. Returned String mirrors the
 /// dumps for non-browser callers (smoke test).
 #[wasm_bindgen]
-pub fn parse_source(src: &str) -> String {
-    parse_and_verify(src, /* verify */ true)
+pub fn parse_source(src: &str, expand_errors: bool) -> String {
+    parse_and_verify(src, /* verify */ true, expand_errors)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -318,48 +322,35 @@ fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> Str
 /// passes `true`; integration tests in `tests/` can pass `false` so the
 /// pipeline stops after VIR and doesn't call into the `Z3_*` shims (which
 /// only `public/index.html` installs — not the wasm-bindgen-test harness).
-pub fn parse_and_verify(src: &str, verify: bool) -> String {
-    // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
-    // code has to be told to link it. vstd's own prelude transitively
-    // re-exports `verus_builtin` items and the `verus_builtin_macros`
-    // proc-macros, so users who do `use vstd::prelude::*;` get everything.
-    let src = format!("extern crate vstd;\n{src}");
+pub fn parse_and_verify(src: &str, verify: bool, expand_errors: bool) -> String {
+    // vstd is wired into the extern prelude via `--extern=vstd` in
+    // `build_rustc_config`, so the user's source is passed through unmodified.
+    // Keeping the source 1:1 with what the editor shows is what lets
+    // diagnostic line numbers land on the right editor line.
+    let src = src.to_string();
     let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let dump_clone = dump.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler, verify);
+            *dump_clone.lock().unwrap() = run_pipeline(compiler, verify, expand_errors);
         });
     }));
     let partial = dump.lock().unwrap().clone();
     unwrap_dump_or_panic(result, partial)
 }
 
-fn run_pipeline(compiler: &Compiler, verify: bool) -> String {
+fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) -> String {
     let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
     let mut out = String::new();
-    time("dump.ast", || {
-        let mut body = String::new();
-        writeln!(body, "crate items: {}", krate.items.len()).unwrap();
-        for item in &krate.items {
-            writeln!(
-                body,
-                "  {:?} {}",
-                item.kind.descr(),
-                item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
-            )
-            .unwrap();
-        }
-        emit_section(&mut out, "AST", &body);
-    });
     // `create_and_enter_global_ctxt` itself is cheap — the expensive work
     // (name resolution, HIR lowering, type-check) happens lazily inside the
     // closure via `tcx` queries fired by `build_vir`. We time the enter call
     // anyway in case global_ctxt setup becomes a hot spot later.
     time("global_ctxt", || {
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+            dump_ast(&mut out, tcx);
             dump_hir(&mut out, tcx);
-            dump_vir_and_verify(&mut out, compiler, tcx, verify);
+            dump_vir_and_verify(&mut out, compiler, tcx, verify, expand_errors);
         })
     });
     out
@@ -382,6 +373,13 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         "--crate-type=lib",
         "--crate-name=v",
         "--sysroot=/virtual",
+        // `--extern=vstd` puts vstd in the edition-2018+ extern prelude so
+        // user code can `use vstd::prelude::*;` directly. We used to prepend
+        // `extern crate vstd;\n` to the source instead, but that shifted
+        // every diagnostic's line number by one — breaking the in-editor
+        // error-line highlight. No `=PATH` needed: rustc's crate locator
+        // finds `libvstd.rmeta` via the wasm-libs sysroot bundle.
+        "--extern=vstd",
         "-Zcrate-attr=no_std",
         "-Zcrate-attr=feature(register_tool)",
         // `verus!` expansion emits `#[...]` attributes on expressions
@@ -525,20 +523,36 @@ impl Drop for DomWriter {
 // 7. Stage 2: HIR dump
 // ═══════════════════════════════════════════════════════════════════════
 
+// Post-expansion AST: the `ast::Crate` held by `resolver_for_lowering` *after*
+// macro expansion (`configure_and_expand` in `passes::resolver_for_lowering_raw`).
+// Must run before `dump_hir` because `hir_free_items` / HIR lowering consumes
+// the AST via `Steal`. We only dump the expanded form — the pre-expansion AST
+// is just `verus! { <token tree> }` wrapping source the user can already see
+// in the editor, so it wouldn't add anything for the reader.
+fn dump_ast(out: &mut String, tcx: TyCtxt<'_>) {
+    time("dump.ast", || {
+        let borrow = tcx.resolver_for_lowering().borrow();
+        let (_, krate) = &*borrow;
+        let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
+        emit_section(out, "AST", &body);
+    });
+}
+
 fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
     time("dump.hir", || {
         // Forces macro expansion + name resolution + HIR lowering.
         let _ = tcx.resolver_for_lowering();
+        // Can't use `print_crate` on wasm: its `Comments::new` path
+        // constructs a fresh `SourceMap` with the default `RealFileLoader`,
+        // whose `current_directory()` traps on wasm. `item_to_string` goes
+        // through the low-level `to_string` (`comments: None`) and skips
+        // that path — trade-off: no pretty-printing of source comments,
+        // which we don't want in the HIR dump anyway.
         let mut body = String::new();
         for item_id in tcx.hir_free_items() {
-            let def_id = item_id.owner_id.def_id.to_def_id();
-            writeln!(
-                body,
-                "  {} {}",
-                tcx.def_kind(def_id).descr(def_id),
-                tcx.def_path_str(def_id)
-            )
-            .unwrap();
+            let item = tcx.hir_item(item_id);
+            body.push_str(&rustc_hir_pretty::item_to_string(&tcx, item));
+            body.push('\n');
         }
         emit_section(out, "HIR", &body);
     });
@@ -548,11 +562,48 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
 // 8. Stage 3: HIR → VIR
 // ═══════════════════════════════════════════════════════════════════════
 
+// Dump-only filter: the full krate (which still contains every vstd item
+// that was pulled in through `extern crate vstd`) is passed to `verify`,
+// but for the VIR section we strip everything not owned by the local crate
+// so the dump shows only what the user wrote. The structural marker is
+// `PathX::krate` — `None` for the local crate, `Some(ident)` for every
+// external crate (vstd, core, alloc, …). That's rustc/Verus' own
+// distinction, so it's stable against remappings, repo renames, or the
+// source path layout on any given machine.
+fn prune_krate_to_user(krate: &Krate) -> Krate {
+    Arc::new(KrateX {
+        functions: krate.functions.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
+        reveal_groups: krate.reveal_groups.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
+        datatypes: krate.datatypes.iter().filter(|x| is_local_dt(&x.x.name)).cloned().collect(),
+        traits: krate.traits.iter().filter(|x| is_local_path(&x.x.name)).cloned().collect(),
+        trait_impls: krate.trait_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
+        assoc_type_impls: krate.assoc_type_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
+        modules: krate.modules.iter().filter(|x| is_local_path(&x.x.path)).cloned().collect(),
+        external_fns: vec![],
+        external_types: vec![],
+        path_as_rust_names: vec![],
+        arch: krate.arch.clone(),
+        opaque_types: krate.opaque_types.clone(),
+    })
+}
+
+fn is_local_path(p: &VirPath) -> bool {
+    p.krate.is_none()
+}
+
+fn is_local_dt(dt: &Dt) -> bool {
+    match dt {
+        Dt::Path(p) => is_local_path(p),
+        Dt::Tuple(_) => false,
+    }
+}
+
 fn dump_vir_and_verify(
     out: &mut String,
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     verify: bool,
+    expand_errors: bool,
 ) {
     // `build_vir` forces HIR lowering + name resolution + ty-check via Verus'
     // `build_vir_crate`, so this stage absorbs most of the rustc front-end
@@ -568,13 +619,14 @@ fn dump_vir_and_verify(
     };
     time("dump.vir", || {
         let mut buf: Vec<u8> = Vec::new();
-        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
+        let pruned = prune_krate_to_user(&krate);
+        vir::printer::write_krate(&mut buf, &pruned, &vir::printer::COMPACT_TONODEOPTS);
         emit_section(out, "VIR", &String::from_utf8_lossy(&buf));
     });
     if !verify {
         return;
     }
-    match time("verify", || verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans)) {
+    match time("verify", || verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans, expand_errors)) {
         Ok(output) => write_verify_output(out, &output),
         Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
     }
@@ -648,6 +700,12 @@ fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
 
 #[derive(Default)]
 struct VerifyOutput {
+    /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
+    /// (still polymorphic; function bodies as SST expressions/statements).
+    sst_ast: String,
+    /// After `poly::poly_krate_for_module` — monomorphized SST
+    /// (polymorphism erased; the form the AIR lowerer consumes).
+    sst_poly: String,
     /// Raw AIR (Block/Switch/Assert tree, AIR syntax).
     air_initial: String,
     /// After `var_to_const::lower_query` (SSA-style versioning of mutable vars).
@@ -663,16 +721,32 @@ struct VerifyOutput {
 struct Verdict {
     function: String,
     kind: String,
-    verdict: String,
+    outcome: String,
     proved: bool,
 }
 
 impl Verdict {
-    fn from_result(result: &ValidityResult, function: String, kind: String) -> Self {
-        match result {
-            ValidityResult::Valid(_) => Self { function, kind, verdict: "Valid".into(), proved: true },
-            other => Self { function, kind, verdict: format!("{:?}", other), proved: false },
-        }
+    fn from_result(result: &ValidityResult, function: String, op: QueryOp) -> Self {
+        let kind = match op {
+            QueryOp::SpecTermination => "spec termination".to_string(),
+            QueryOp::Body(Style::Normal) => "body".to_string(),
+            QueryOp::Body(Style::RecommendsFollowupFromError) => "recommends".to_string(),
+            QueryOp::Body(Style::RecommendsChecked) => "recommends check".to_string(),
+            QueryOp::Body(Style::Expanded) => "expanded".to_string(),
+            QueryOp::Body(Style::CheckApiSafety) => "api safety".to_string(),
+        };
+        let (outcome, proved) = match result {
+            ValidityResult::Valid(_) => ("valid".to_string(), true),
+            ValidityResult::Invalid(_, _, Some(id)) => {
+                let id_str = id.iter().map(u64::to_string).collect::<Vec<_>>().join(".");
+                (format!("invalid (assert {id_str})"), false)
+            }
+            ValidityResult::Invalid(_, _, None) => ("invalid".to_string(), false),
+            ValidityResult::Canceled => ("timeout".to_string(), false),
+            ValidityResult::TypeError(_) => ("type error".to_string(), false),
+            ValidityResult::UnexpectedOutput(s) => (format!("solver error: {s}"), false),
+        };
+        Self { function, kind, outcome, proved }
     }
 }
 
@@ -749,6 +823,7 @@ struct ModuleCtx<'a, 'tcx> {
     reporter: &'a Reporter<'tcx>,
     solver: SmtSolver,
     arch_word_bits: ArchWordBits,
+    expand_errors: bool,
 }
 
 // Bundles the per-module driver state. `feed`/`feed_all` send each command to
@@ -779,6 +854,7 @@ fn verify_simplified_krate<'tcx>(
     crate_name: Arc<String>,
     compiler: &'tcx Compiler,
     spans: &SpanContext,
+    expand_errors: bool,
 ) -> Result<VerifyOutput, VirErr> {
     let msg = Arc::new(VirMessageInterface {});
     // Routes VIR/AIR messages through rustc's `DiagCtxt` — the emitter
@@ -793,6 +869,7 @@ fn verify_simplified_krate<'tcx>(
         reporter: &reporter,
         solver: SmtSolver::Z3,
         arch_word_bits: krate.arch.word_bits,
+        expand_errors,
     };
     let mut output = VerifyOutput::default();
     // After `build_vir_crate` merges vstd into the local krate, `krate.modules`
@@ -857,7 +934,9 @@ fn verify_module(
         &bucket_funs,
         &pruned,
     ))?;
+    time("dump.sst_ast", || append_sst_dump(&mut output.sst_ast, &krate_sst));
     let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
+    time("dump.sst_poly", || append_sst_dump(&mut output.sst_poly, &krate_sst));
 
     let visible_dts: Vec<Datatype> = krate_sst
         .datatypes
@@ -872,6 +951,14 @@ fn verify_module(
     let mut air_ctx = time("verify.air_ctx_new", || {
         let mut c = Context::new(mctx.msg.clone(), mctx.solver);
         c.set_z3_param("air_recommended_options", "true");
+        // Cap each Z3 query at ~10 seconds of solver work. Matches upstream
+        // Verus' documented `--rlimit=10` CLI default (`RLIMIT_PER_SECOND`
+        // = 3_000_000 in `verifier.rs:50`). Upstream's `ArgsX::new` default
+        // is `f32::INFINITY`, but that's only appropriate when a human can
+        // Ctrl-C; a pathological assert in the browser would otherwise hang
+        // the tab with no abort path. 10s is generous for the small snippets
+        // the explorer serves.
+        c.set_rlimit(10 * 3_000_000);
         c
     });
     let bufs = AirBufs::attach(&mut air_ctx);
@@ -881,7 +968,7 @@ fn verify_module(
         feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)
     })?;
     time("verify.queries", || {
-        run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts)
+        run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts, mctx.expand_errors)
     })?;
 
     bufs.drain_into(output);
@@ -920,53 +1007,161 @@ fn feed_module_decls(
 
 // OpGenerator drives the SCC-ordered req/ens decls + axioms + body queries.
 // Each `CheckValid` command produces a `Verdict` appended to `verdicts`.
+//
+// Also runs expand-errors: after a failed Normal-style body op,
+// `start_expand_errors_if_possible` arms the driver, and subsequent iterations
+// fetch `expand_errors_next` before the regular queue so the driver can feed
+// per-conjunct sub-queries back in. When it finishes, it yields the final
+// `note: diagnostics via expansion` message which we route through the
+// rustc reporter. Mirrors the loop at verifier.rs:1492-1859 but trimmed to
+// the pieces the explorer needs (no spinoff, profiler, or progress bars).
 fn run_queries(
     feeder: &mut Feeder,
     ctx: &mut Ctx,
     krate_sst: &KrateSst,
     bucket_funs: HashSet<Fun>,
     verdicts: &mut Vec<Verdict>,
+    expand_errors: bool,
 ) -> Result<(), VirErr> {
     let bucket = Bucket { funs: bucket_funs };
     let mut opgen = OpGenerator::new(ctx, krate_sst, bucket);
     while let Some(mut function_opgen) = opgen.next()? {
-        while let Some(op) = function_opgen.next() {
+        loop {
+            // The expand-errors driver produces either the next expansion op to
+            // run or, once it's exhausted all sub-queries, the final diagnostic
+            // to print. Only yields when armed by a prior failure.
+            let mut next_op = None;
+            let mut expand_diag = None;
+            if let Some(r) = function_opgen.expand_errors_next(None) {
+                match r {
+                    Ok(op) => next_op = Some(op),
+                    Err(diag) => expand_diag = Some(diag),
+                }
+            }
+            if next_op.is_none() {
+                next_op = function_opgen.next();
+            }
+            if let Some(diag) = expand_diag {
+                feeder.reporter.report(&diag);
+            }
+            let Some(op) = next_op else { break };
+
+            // The explorer always compiles an anonymous crate, so every user
+            // function's friendly name starts with `crate::`. Strip it so the
+            // verdict detail reads `main: body → valid` instead of the
+            // redundant `crate::main: body → valid`.
             let func_name = op
                 .function
                 .as_ref()
                 .map(|f| fun_as_friendly_rust_name(&f.x.name))
+                .map(|n| n.strip_prefix("crate::").map(str::to_string).unwrap_or(n))
                 .unwrap_or_default();
-            // Tracked across the (possibly multiple) `CheckValid` commands in
-            // this one op so that on a failed proof/spec body we can enqueue
-            // the recommends-retry ops. Matches Verus' verifier.rs:1829-1879.
             let mut any_invalid = false;
+            let mut any_timed_out = false;
+            let mut default_prover_failed_assert_ids: Vec<AssertId> = vec![];
             let mut retry_kind: Option<QueryOp> = None;
             match &op.kind {
                 OpKind::Context(_, commands) => feeder.feed_all(commands),
                 OpKind::Query { commands_with_context_list, query_op, .. } => {
-                    let kind = format!("{:?}", query_op);
                     retry_kind = Some(*query_op);
                     for cmds in commands_with_context_list.iter() {
+                        // Contextual advice that Verus attaches to certain
+                        // proof obligations (e.g. loop-invariant hints). Upstream
+                        // emits it once per `CheckValid` command, as a `note:`
+                        // preceding the first failing probe (`verifier.rs:910`).
+                        // Single-threaded wasm, so the Mutex `.lock()` is free;
+                        // we clone out so we don't hold the guard across probes.
+                        let hint = cmds
+                            .hint_upon_failure
+                            .lock()
+                            .expect("hint_upon_failure mutex poisoned")
+                            .clone();
                         for cmd in cmds.commands.iter() {
-                            let result = feeder.feed(cmd);
+                            let mut result = feeder.feed(cmd);
                             if matches!(&**cmd, CommandX::CheckValid(_)) {
-                                // Route the Verus-supplied `Message` (with source
-                                // spans + labels) through the rustc Reporter so
-                                // the emitter renders it as a normal spanned
-                                // error. Without this the caller only sees our
-                                // coarse "Valid / N queries failed" summary.
-                                if let ValidityResult::Invalid(_, Some(err), _) = &result {
-                                    feeder.reporter.report_as(err, MessageLevel::Error);
+                                // Probe for more failing asserts in the same
+                                // body via `check_valid_again`. Mirrors the
+                                // two-phase loop in Verus'
+                                // `verifier.rs:834-982`:
+                                //   1. Up to `checks_remaining` "any more
+                                //      errors" probes (upstream default:
+                                //      `--multiple-errors=2`; bumped here
+                                //      because explorer snippets are small
+                                //      and users want to see everything).
+                                //   2. When the budget runs out, flip
+                                //      `only_check_earlier=true`. That pass
+                                //      is guaranteed to terminate — AIR
+                                //      strictly shrinks the enabled-label
+                                //      set each call
+                                //      (`smt_verify.rs:149-168`) and returns
+                                //      Valid once none remain.
+                                let mut checks_remaining: u32 = 8;
+                                let mut only_check_earlier = false;
+                                let mut is_first_check = true;
+                                loop {
+                                    if let ValidityResult::Invalid(_, Some(err), _) = &result {
+                                        feeder.reporter.report_as(err, MessageLevel::Error);
+                                        // Emit the hint right after the first
+                                        // failure's error so the user sees
+                                        // them grouped. Matches upstream's
+                                        // first-check-only gate.
+                                        if is_first_check {
+                                            if let Some(h) = &hint {
+                                                feeder
+                                                    .reporter
+                                                    .report_as(&h.clone().to_any(), MessageLevel::Note);
+                                            }
+                                        }
+                                    }
+                                    // Only DefaultProver failures get
+                                    // expand-errors; Nonlinear / BitVector
+                                    // use solver paths the expansion
+                                    // machinery doesn't cover.
+                                    if let ValidityResult::Invalid(_, _, Some(id)) = &result {
+                                        if cmds.prover_choice == ProverChoice::DefaultProver {
+                                            default_prover_failed_assert_ids.push(id.clone());
+                                        }
+                                    }
+                                    if matches!(result, ValidityResult::Canceled) {
+                                        any_timed_out = true;
+                                    }
+                                    let proved = matches!(result, ValidityResult::Valid(_));
+                                    if !proved {
+                                        any_invalid = true;
+                                    }
+                                    verdicts.push(Verdict::from_result(
+                                        &result,
+                                        func_name.clone(),
+                                        *query_op,
+                                    ));
+
+                                    // `check_valid_again` panics unless the
+                                    // previous result was Invalid with both
+                                    // a model and a message — that's how AIR
+                                    // stores its continuation state. Any
+                                    // other variant (Valid, Canceled,
+                                    // Invalid without a model) terminates
+                                    // the loop naturally.
+                                    let can_probe = matches!(
+                                        &result,
+                                        ValidityResult::Invalid(Some(_), Some(_), _),
+                                    );
+                                    if !can_probe {
+                                        break;
+                                    }
+                                    if !only_check_earlier {
+                                        checks_remaining -= 1;
+                                        if checks_remaining == 0 {
+                                            only_check_earlier = true;
+                                        }
+                                    }
+                                    is_first_check = false;
+                                    result = feeder.air_ctx.check_valid_again(
+                                        feeder.reporter,
+                                        only_check_earlier,
+                                        Default::default(),
+                                    );
                                 }
-                                let proved = matches!(result, ValidityResult::Valid(_));
-                                if !proved {
-                                    any_invalid = true;
-                                }
-                                verdicts.push(Verdict::from_result(
-                                    &result,
-                                    func_name.clone(),
-                                    kind.clone(),
-                                ));
                                 feeder.air_ctx.finish_query();
                             }
                         }
@@ -975,25 +1170,99 @@ fn run_queries(
             }
             // Auto-recommends: on a failed Normal body or spec-termination
             // query, enqueue recommends-retry ops. Mirrors the trigger in
-            // Verus' `verifier.rs:1829-1879`. `check_recommends` attribute on
-            // the function is another trigger in Verus, but reading it
-            // requires digging into the function's attrs — auto-on-error
-            // covers the common case. Only fires on failure, so no cost for
-            // passing proofs.
-            if any_invalid {
-                if matches!(
+            // Verus' `verifier.rs:1829-1879`.
+            if any_invalid
+                && matches!(
                     retry_kind,
                     Some(QueryOp::Body(Style::Normal)) | Some(QueryOp::SpecTermination)
-                ) {
-                    function_opgen.retry_with_recommends(&op, /* from_error */ true)?;
-                }
+                )
+            {
+                function_opgen.retry_with_recommends(&op, /* from_error */ true)?;
+            }
+            // Arm expand-errors on a failed Normal body. Driver starts here;
+            // subsequent loop iterations feed its sub-queries in via
+            // `expand_errors_next` at the top. Gated by the user-facing
+            // "Expand errors" toggle — skipping the sub-queries shaves a
+            // couple hundred ms per failed query in the browser.
+            if expand_errors
+                && matches!(retry_kind, Some(QueryOp::Body(Style::Normal)))
+                && any_invalid
+                && !default_prover_failed_assert_ids.is_empty()
+            {
+                function_opgen.start_expand_errors_if_possible(
+                    &op,
+                    default_prover_failed_assert_ids[0].clone(),
+                );
+            }
+            // Report the outcome of each Expanded sub-query so the driver
+            // advances through the conjunct tree. Pass/Fail/Timeout controls
+            // which branch the next sub-query descends into.
+            if matches!(retry_kind, Some(QueryOp::Body(Style::Expanded))) {
+                let res = if any_timed_out {
+                    ExpandErrorsResult::Timeout
+                } else if any_invalid {
+                    ExpandErrorsResult::Fail
+                } else {
+                    ExpandErrorsResult::Pass
+                };
+                function_opgen.report_expand_error_result(res);
             }
         }
     }
     Ok(())
 }
 
+// `krate_sst` is per-module (SST lowering happens inside `verify_module`).
+// Each call appends a module's SST dump to the running buffer so the final
+// section contains every module's SSTs in order. Same local-crate filter as
+// VIR — vstd items don't drown out the user's functions. Verify still runs
+// on the full krate; this pruned copy is display-only.
+fn append_sst_dump(buf: &mut String, krate_sst: &KrateSst) {
+    let pruned = prune_krate_sst_to_user(krate_sst);
+    let mut bytes: Vec<u8> = Vec::new();
+    vir::printer::write_krate_sst(&mut bytes, &pruned, &vir::printer::COMPACT_TONODEOPTS);
+    buf.push_str(&String::from_utf8_lossy(&bytes));
+}
+
+fn prune_krate_sst_to_user(krate: &KrateSst) -> KrateSst {
+    Arc::new(KrateSstX {
+        functions: krate.functions.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
+        datatypes: krate.datatypes.iter().filter(|x| is_local_dt(&x.x.name)).cloned().collect(),
+        opaque_types: krate.opaque_types.clone(),
+        traits: krate.traits.iter().filter(|x| is_local_path(&x.x.name)).cloned().collect(),
+        trait_impls: krate.trait_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
+        assoc_type_impls: krate.assoc_type_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
+        reveal_groups: krate.reveal_groups.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
+    })
+}
+
+// Each AIR/SMT dump begins with the global axiom/datatype preamble and then
+// transitions to query blocks at the first `(push)` (logged by `check_valid`
+// before each query — see air/context.rs:429). Insert `-- setup --` /
+// `-- queries --` banners so the browser can fold the preamble by default
+// without mangling the content.
+fn split_setup_queries(body: &str) -> String {
+    let needle = "\n(push";
+    match body.find(needle) {
+        Some(idx) => {
+            let (setup, queries) = body.split_at(idx);
+            format!(
+                ";; -- setup --\n{}\n;; -- queries --{}",
+                setup.trim_end(),
+                queries,
+            )
+        }
+        None => body.to_string(),
+    }
+}
+
 fn write_verify_output(out: &mut String, output: &VerifyOutput) {
+    for (name, body) in [("SST_AST", &output.sst_ast), ("SST_POLY", &output.sst_poly)] {
+        if body.is_empty() {
+            continue;
+        }
+        emit_section(out, name, body);
+    }
     for (name, body) in [
         ("AIR_INITIAL", &output.air_initial),
         ("AIR_MIDDLE", &output.air_middle),
@@ -1003,20 +1272,19 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
         if body.is_empty() {
             continue;
         }
-        emit_section(out, name, body);
+        emit_section(out, name, &split_setup_queries(body));
     }
     let mut verdict = String::new();
     if output.verdicts.is_empty() {
         writeln!(verdict, "no queries").unwrap();
     } else if output.verdicts.iter().all(|v| v.proved) {
-        writeln!(verdict, "Valid").unwrap();
+        writeln!(verdict, "verified").unwrap();
     } else {
         let n_failed = output.verdicts.iter().filter(|v| !v.proved).count();
         writeln!(verdict, "{}/{} queries failed", n_failed, output.verdicts.len()).unwrap();
     }
     for v in &output.verdicts {
-        let result = if v.proved { "proved" } else { v.verdict.as_str() };
-        writeln!(verdict, "{}: {} → {}", v.function, v.kind, result).unwrap();
+        writeln!(verdict, "{}: {} → {}", v.function, v.kind, v.outcome).unwrap();
     }
     emit_section(out, "VERDICT", &verdict);
 }

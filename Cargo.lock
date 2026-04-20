@@ -1915,6 +1915,7 @@ dependencies = [
  "rustc_abi",
  "rustc_arena",
  "rustc_ast",
+ "rustc_ast_pretty",
  "rustc_data_structures",
  "rustc_driver",
  "rustc_error_messages",

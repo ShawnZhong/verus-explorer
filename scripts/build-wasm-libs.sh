@@ -47,6 +47,13 @@ RUSTC="$repo/target/host-rust/bin/rustc"
 }
 export RUSTC_BOOTSTRAP=1
 
+# Rewrite `$repo/` → `` in every rustc/rust_verify invocation so the spans
+# baked into rmetas and `vstd.vir` are repo-relative instead of leaking the
+# developer's absolute path. rustc applies this to all `RemapPathScopeComponents`
+# by default, which includes DIAGNOSTICS — the scope `span_to_diagnostic_string`
+# reads when producing the `span.as_string` field Verus serializes into the VIR.
+remap="--remap-path-prefix=$repo/="
+
 # Chain: core (no deps) → compiler_builtins (deps core) → alloc (deps core
 # + compiler_builtins) → verus_builtin (deps core). compiler_builtins'
 # `compiler-builtins` feature flips on its `#[compiler_builtins]` attr.
@@ -63,6 +70,7 @@ rust_src="$("$RUSTC" --print sysroot)/lib/rustlib/src/rust/library"
 set -x
 "$RUSTC" --edition=2024 --crate-type=lib --crate-name=core \
     --target=wasm32-unknown-unknown --emit=metadata \
+    "$remap" \
     --out-dir "$lib" \
     "$rust_src/core/src/lib.rs"
 
@@ -72,12 +80,14 @@ set -x
     --check-cfg='cfg(feature, values("compiler-builtins"))' \
     --cap-lints=allow \
     --sysroot="$out" \
+    "$remap" \
     --out-dir "$lib" \
     "$rust_src/compiler-builtins/compiler-builtins/src/lib.rs"
 
 "$RUSTC" --edition=2024 --crate-type=lib --crate-name=alloc \
     --target=wasm32-unknown-unknown --emit=metadata \
     --sysroot="$out" \
+    "$remap" \
     --out-dir "$lib" \
     "$rust_src/alloc/src/lib.rs"
 
@@ -87,6 +97,7 @@ set -x
     --target=wasm32-unknown-unknown --emit=metadata \
     --cfg=verus_keep_ghost \
     --sysroot="$out" \
+    "$remap" \
     --out-dir "$lib" \
     "$repo/third_party/verus/source/builtin/src/lib.rs"
 
@@ -103,6 +114,7 @@ build_stub_rmeta() {
         --check-cfg='cfg(stub_only)' \
         --check-cfg='cfg(verus_keep_ghost)' \
         --sysroot="$out" \
+        "$remap" \
         --out-dir "$lib" \
         "$src"
 }
@@ -162,4 +174,5 @@ VSTD_KIND=IsVstd \
     --no-verify \
     --no-lifetime \
     --cfg 'feature="alloc"' \
+    "$remap" \
     "$repo/third_party/verus/source/vstd/vstd.rs"
