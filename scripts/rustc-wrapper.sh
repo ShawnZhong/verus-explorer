@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
 # RUSTC_WRAPPER invoked by cargo for every rustc call in the build graph.
 #
-# Two injections, both scoped by crate attributes that cargo passes on every
-# invocation:
+# Three injections; the first is unconditional, the other two scoped by
+# crate attributes cargo passes on every invocation:
+#
+# 0. Always: `--allow=unexpected_cfgs`. The vendored rustc tree carries
+#    `#[cfg(bootstrap)]` attributes (normally declared as a check-cfg by
+#    x.py); without this flag, `rustc_macros` and `rustc_fluent_macro`
+#    flood the build log with `unexpected_cfgs` warnings.
+#    `.cargo/config.toml` already sets the same flag in `[build].rustflags`
+#    + `[target.wasm32-unknown-unknown].rustflags`, but cargo silently
+#    drops `[build].rustflags` whenever the CLI carries `--target`, and the
+#    wasm32 table never matches the host triple — so the proc-macro/host
+#    artifacts compile with NO rustflags. Injecting from the wrapper covers
+#    host + target uniformly (extra duplication on the target side is
+#    benign — rustc accepts the flag twice).
 #
 # 1. For wasm32 compiles: a profile-aware
 #    `-L <repo>/target/wasm32-unknown-unknown/<profile>/deps`
@@ -53,7 +65,7 @@ for a in "$@"; do
     prev="$a"
 done
 
-extra=()
+extra=(--allow=unexpected_cfgs)
 marker="/wasm32-unknown-unknown/"
 if [[ "$target" == "wasm32-unknown-unknown" && "$outdir" == *"$marker"* ]]; then
     prefix="${outdir%%${marker}*}"

@@ -43,6 +43,26 @@ extern "C" {
     // `unreachable` trap (see the comment on `ConsoleWriter`).
     #[wasm_bindgen(js_name = verus_diagnostic)]
     pub(crate) fn verus_diagnostic(msg: &str);
+
+    // Streams each completed pipeline section (AST / HIR / VIR /
+    // AIR_INITIAL / AIR_MIDDLE / AIR_FINAL / SMT / VERDICT) out to the
+    // browser as soon as it's formatted. Same survivability reasoning as
+    // `verus_diagnostic`: a later stage that traps the wasm instance
+    // (rustc's `abort_if_errors` → `unreachable`) would otherwise discard
+    // the whole returned String, hiding every section we'd already built.
+    #[wasm_bindgen(js_name = verus_dump)]
+    pub(crate) fn verus_dump(section: &str, body: &str);
+
+    // Stage-level timing. `pipeline::time` emits one call per stage with
+    // the elapsed ms. `public/index.html` and `tests/smoke.rs` both install
+    // a stub on globalThis (the former logs to console, the latter to
+    // stderr). Kept out-of-band from `verus_dump` so timings don't clutter
+    // the UI output sections.
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    pub fn perf_now() -> f64;
+
+    #[wasm_bindgen(js_name = verus_bench)]
+    pub(crate) fn verus_bench(label: &str, ms: f64);
 }
 
 // `#[wasm_bindgen(start)]` fires when this crate is the final cdylib (the

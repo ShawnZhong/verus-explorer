@@ -181,7 +181,7 @@ verus! {
 fn main() {
     proof {
         let s: Seq<int> = Seq::empty().push(1).push(2).push(3);
-        assert(s.len() == 2);
+        assert(s.len() == 3);
         assert(s[0] == 1);
         assert(s[1] == 2);
         assert(s[2] == 3);
@@ -213,34 +213,6 @@ fn main() {
   <script src="./z3.js"></script>
 
   <script type="module">
-    // Async-load the Z3 wasm module and stash it on globalThis. Emscripten
-    // resolves z3.wasm relative to the loading script URL by default, so no
-    // locateFile callback is needed.
-    const Z3 = await globalThis.initZ3();
-
-    // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
-    // wasm-bindgen externs, so each must be a plain JS function on globalThis.
-    // cwrap returns a pre-bound callable that handles the emscripten ABI
-    // marshalling (malloc+UTF-8 for strings).
-    globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
-    globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
-    globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
-    globalThis.Z3_eval_smtlib2_string = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
-    globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
-
-    // rustc isn't designed for in-process re-entry — `SESSION_GLOBALS`,
-    // symbol/span interners, and various `OnceLock`s accumulate state across
-    // calls. We side-step the whole class of "what state leaks across calls"
-    // bugs by giving every parse_source a fresh wasm instance: compile the
-    // module once (~580ms), then for each call dynamic-import the
-    // wasm-bindgen JS shim with a nonce (fresh module scope → fresh `wasm`
-    // singleton) and re-instantiate against the cached `WebAssembly.Module`
-    // (~100ms). Old instances become GC-eligible once the prior import drops
-    // out of scope.
-    const verusModule = await WebAssembly.compileStreaming(
-      fetch('./verus_explorer_bg.wasm')
-    );
-
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
     // against rmetas laid out at `/virtual/lib/rustlib/wasm32-unknown-unknown/lib`.
     // `build.rs` stages each file gzipped as `${name}.gz` under `./wasm-libs/`;
@@ -262,42 +234,70 @@ fn main() {
       'libvstd.rmeta',
       'vstd.vir',
     ];
-    const wasmLibs = await Promise.all(WASM_LIBS.map(async name => {
-      const res = await fetch(`./wasm-libs/${name}.gz`);
-      const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
-      const buf = await new Response(stream).arrayBuffer();
-      return [name, new Uint8Array(buf)];
-    }));
 
-    // Monotonic nonce — `Date.now()` collides at sub-ms granularity, and
-    // dynamic import is keyed by URL: a collision returns the cached module
-    // instance, defeating the fresh-state guarantee. Two `parse_source`
-    // calls sharing one module trip rustc's CStore freeze invariant
-    // (creader.rs panics with "data should not be frozen…").
-    let freshNonce = 0;
-    const freshVerus = async () => {
-      const mod = await import(`./verus_explorer.js?nonce=${++freshNonce}`);
-      await mod.default({ module_or_path: verusModule });
-      // Each fresh instance gets a fresh (empty) wasm-libs bundle;
-      // re-install before `parse_source` touches rustc's crate locator.
-      for (const [name, bytes] of wasmLibs) mod.wasm_libs_add_file(name, bytes);
-      mod.wasm_libs_finalize();
-      return mod;
+    // Z3 init, the verus wasm compile, and the wasm-libs fetch+decompress
+    // are independent (nothing below them needs to wait on the other two),
+    // so fire them all off at once. Critical cold-load time = max(them),
+    // not sum. Emscripten resolves z3.wasm relative to z3.js by default, so
+    // no locateFile callback is needed.
+    const ms = (t) => `${(performance.now() - t).toFixed(0)}ms`;
+    const coldStart = performance.now();
+    const timed = (label, p) => {
+      const t = performance.now();
+      return p.then(v => { console.log(`[cold] ${label}: ${ms(t)}`); return v; });
     };
+    const [Z3, verusModule, wasmLibs] = await Promise.all([
+      timed('initZ3', globalThis.initZ3()),
+      timed('compile verus', WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm'))),
+      timed('fetch+decompress wasm-libs', Promise.all(WASM_LIBS.map(async name => {
+        const res = await fetch(`./wasm-libs/${name}.gz`);
+        const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
+        const buf = await new Response(stream).arrayBuffer();
+        return [name, new Uint8Array(buf)];
+      }))),
+    ]);
+    console.log(`[cold] total: ${ms(coldStart)} (wasm-libs uncompressed = ${(wasmLibs.reduce((s, [,b]) => s + b.byteLength, 0) / 1e6).toFixed(1)} MB)`);
+
+    // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
+    // wasm-bindgen externs, so each must be a plain JS function on globalThis.
+    // cwrap returns a pre-bound callable that handles the emscripten ABI
+    // marshalling (malloc+UTF-8 for strings).
+    globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
+    globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
+    globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
+    globalThis.Z3_eval_smtlib2_string = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
+    globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
+
+    // One wasm instance, reused for every `parse_source` call. Earlier
+    // versions dynamic-imported with a cache-busting nonce per click to
+    // force a fresh instance, under the assumption that rustc's
+    // `SESSION_GLOBALS` + CStore state would leak between calls. In
+    // practice each `run_compiler` builds its own Session+CStore, so
+    // nothing leaks — confirmed by `tests/smoke.rs`, which runs three
+    // `parse_source` calls back-to-back in a single instance and sees
+    // calls #2/#3 run at ~2× the speed of #1 (V8 JIT + rustc
+    // `LazyLock`/`OnceLock` entries survive across calls and amortize).
+    // The fresh-per-call pattern was throwing that warmup away.
+    const t0 = performance.now();
+    const verus = await import('./verus_explorer.js');
+    const t1 = performance.now();
+    await verus.default({ module_or_path: verusModule });
+    const t2 = performance.now();
+    for (const [name, bytes] of wasmLibs) verus.wasm_libs_add_file(name, bytes);
+    const t3 = performance.now();
+    verus.wasm_libs_finalize();
+    const t4 = performance.now();
+    console.log(
+      `[init] import=${(t1 - t0).toFixed(0)}ms ` +
+      `instantiate=${(t2 - t1).toFixed(0)}ms ` +
+      `add_file×${wasmLibs.length}=${(t3 - t2).toFixed(0)}ms ` +
+      `finalize=${(t4 - t3).toFixed(0)}ms ` +
+      `total=${(t4 - t0).toFixed(0)}ms`
+    );
 
     const parseInput = document.getElementById('parse-input');
     const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
-    // Synchronously invoked by Rust (`src/pipeline.rs::DomWriter`) for each
-    // rustc diagnostic while `parse_source` is still running. Landing text in
-    // the DOM here means it survives the `unreachable` trap that rustc's
-    // `abort_if_errors` produces on wasm32 (panic=abort).
-    globalThis.verus_diagnostic = (msg) => {
-      const pre = document.createElement('pre');
-      pre.className = 'diagnostic';
-      pre.textContent = msg;
-      parseOut.appendChild(pre);
-    };
     // Order matches `parse_source`'s positional bool arguments — keep in sync
     // with `src/lib.rs::parse_source`.
     const SECTION_ORDER = ['AST', 'HIR', 'VIR', 'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
@@ -344,37 +344,54 @@ fn main() {
       parseOut.appendChild(pre);
     };
 
+    // Synchronously invoked by Rust (`src/pipeline.rs::DomWriter`) for each
+    // rustc diagnostic, and by `emit_section` for each completed pipeline
+    // section, while `parse_source` is still running. Landing text in the
+    // DOM here means it survives the `unreachable` trap that rustc's
+    // `abort_if_errors` produces on wasm32 (panic=abort) — if we instead
+    // waited for `parse_source` to return and parsed its String output, a
+    // mid-pipeline trap would discard every section produced so far.
+    globalThis.verus_diagnostic = (msg) => {
+      const pre = document.createElement('pre');
+      pre.className = 'diagnostic';
+      pre.textContent = msg;
+      parseOut.appendChild(pre);
+    };
+    globalThis.verus_dump = (section, body) => {
+      if (section === 'VERDICT') renderVerdict(body);
+      else renderSection(section, body);
+    };
+    // Stage-level timings from `pipeline::time`. Keep out-of-DOM (console
+    // only) so the main output stays focused on IR/verdict rendering.
+    globalThis.verus_bench = (label, ms) => {
+      console.log(`[stage] ${label}=${ms.toFixed(0)}ms`);
+    };
+
     let runId = 0;
-    const runParse = async () => {
+    const runParse = () => {
       const myRun = ++runId;
-      parseOut.textContent = '';
       parseButton.disabled = true;
       const flags = SECTION_ORDER.map(k => toggles[k].checked);
       try {
-        const { parse_source } = await freshVerus();
-        const text = parse_source(parseInput.value, ...flags);
-        if (myRun !== runId) return; // a newer toggle change superseded us.
-        // Split on "=== NAME ===" markers; the preamble (before any marker)
-        // is panic/stderr fallback.
-        const chunks = text.split(/^=== (\w+) ===$/m);
-        const sections = {};
-        if (chunks[0].trim()) sections.output = chunks[0].trimEnd();
-        for (let i = 1; i < chunks.length; i += 2) {
-          sections[chunks[i]] = chunks[i + 1].trim();
-        }
-        if (sections.output) renderSection('output', sections.output);
-        if (sections.VERDICT !== undefined) renderVerdict(sections.VERDICT);
-        for (const name of SECTION_ORDER) {
-          if (sections[name] !== undefined) renderSection(name, sections[name]);
-        }
+        // `parse_source` is synchronous wasm — no interleaving possible
+        // once we start it. Each `verus_dump` / `verus_diagnostic` call
+        // lands before the next run can clear `parseOut`. `runId` is
+        // redundant here (nothing can preempt us mid-call), but keep the
+        // check for symmetry with any future async work.
+        parseOut.textContent = '';
+        const tParse = performance.now();
+        verus.parse_source(parseInput.value, ...flags);
+        console.log(`[parse] parse_source=${(performance.now() - tParse).toFixed(0)}ms`);
+        // Each section was already rendered via `verus_dump` as it was
+        // produced; the returned String is ignored on the browser side.
       } catch (e) {
         if (myRun !== runId) return;
         // When rustc emits diagnostics, `abort_if_errors` degrades to a wasm
-        // `unreachable` trap that propagates here as `RuntimeError`. The
-        // diagnostic text was already appended to `parse-out` live via
-        // `verus_diagnostic`, so treat the trap as informational rather than
-        // an opaque crash.
-        if (!parseOut.querySelector('pre.diagnostic')) {
+        // `unreachable` trap that propagates here as `RuntimeError`. Any
+        // diagnostics and completed sections were already streamed to the
+        // DOM via `verus_diagnostic` / `verus_dump`, so treat the trap as
+        // informational rather than an opaque crash.
+        if (!parseOut.querySelector('pre.diagnostic, .section-title')) {
           renderSection('error', 'Parse crashed: ' + (e?.message ?? e));
           console.error(e);
         }

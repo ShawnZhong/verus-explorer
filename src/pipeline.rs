@@ -36,7 +36,34 @@ use vir::messages::VirMessageInterface;
 use vir::prelude::PreludeConfig;
 use vir::sst::KrateSst;
 
-use crate::verus_diagnostic;
+use crate::{perf_now, verus_bench, verus_diagnostic, verus_dump};
+
+// Wrap a pipeline stage with a wall-clock timer. Result: one `verus_bench`
+// call per stage, forwarded to console (browser) or stderr (smoke test).
+// Kept synchronous + infallible so it composes cleanly around both closures
+// and plain expressions; `perf_now` is a raw JS import so the overhead is
+// two foreign calls per stage — negligible next to the stages themselves.
+fn time<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+    let t0 = perf_now();
+    let result = f();
+    verus_bench(label, perf_now() - t0);
+    result
+}
+
+// Streams a completed section to the browser and appends it to `out` in the
+// same `=== NAME ===\n<body>\n` shape the String-side consumers expect.
+// Emitting via `verus_dump` synchronously at each stage boundary means the
+// section lands in the DOM before a later stage could trap the wasm instance
+// and discard everything we'd built up in `out`. `out` is still populated in
+// parallel so the returned String stays usable for `tests/smoke.rs` and for
+// the `unwrap_dump_or_panic` fallback.
+fn emit_section(out: &mut String, name: &str, body: &str) {
+    let body = body.trim_end();
+    verus_dump(name, body);
+    writeln!(out, "=== {} ===", name).unwrap();
+    out.push_str(body);
+    out.push('\n');
+}
 
 // ---------- rustc plumbing ----------
 
@@ -322,7 +349,7 @@ fn verify_simplified_krate<'tcx>(
     // attached in `psess_created` (a `HumanEmitter` over a shared string
     // buffer) formats them with `error: … --> file:line | source` layout
     // the UI surfaces in its DIAGNOSTICS section.
-    let reporter = Reporter::new(spans, compiler);
+    let reporter = time("verify.reporter_new", || Reporter::new(spans, compiler));
     let mctx = ModuleCtx {
         krate: &krate,
         crate_name: &crate_name,
@@ -332,9 +359,11 @@ fn verify_simplified_krate<'tcx>(
         arch_word_bits: krate.arch.word_bits,
     };
     let mut output = VerifyOutput::default();
+    verus_bench("verify.module_count", krate.modules.len() as f64);
     for module in &krate.modules {
-        global_ctx =
-            verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output, stages)?;
+        global_ctx = time("verify.module", || {
+            verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output, stages)
+        })?;
     }
     Ok(output)
 }
@@ -346,7 +375,7 @@ fn verify_module(
     output: &mut VerifyOutput,
     stages: DumpStages,
 ) -> Result<GlobalCtx, VirErr> {
-    let (pruned, prune_info) = vir::prune::prune_krate_for_module_or_krate(
+    let (pruned, prune_info) = time("verify.prune", || vir::prune::prune_krate_for_module_or_krate(
         mctx.krate,
         mctx.crate_name,
         None,
@@ -354,7 +383,7 @@ fn verify_module(
         None,
         true,
         true,
-    );
+    ));
     let module = pruned
         .modules
         .iter()
@@ -362,7 +391,7 @@ fn verify_module(
         .cloned()
         .expect("module in pruned krate");
 
-    let mut ctx = Ctx::new(
+    let mut ctx = time("verify.ctx_new", || Ctx::new(
         &pruned,
         global_ctx,
         module,
@@ -373,7 +402,7 @@ fn verify_module(
         prune_info.fndef_types,
         prune_info.resolved_typs.unwrap(),
         /* debug */ false,
-    )?;
+    ))?;
 
     let bucket_funs: HashSet<Fun> = pruned
         .functions
@@ -382,13 +411,13 @@ fn verify_module(
         .map(|f| f.x.name.clone())
         .collect();
 
-    let krate_sst = vir::ast_to_sst_crate::ast_to_sst_krate(
+    let krate_sst = time("verify.ast_to_sst", || vir::ast_to_sst_crate::ast_to_sst_krate(
         &mut ctx,
         mctx.reporter,
         &bucket_funs,
         &pruned,
-    )?;
-    let krate_sst = vir::poly::poly_krate_for_module(&mut ctx, &krate_sst);
+    ))?;
+    let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
 
     let visible_dts: Vec<Datatype> = krate_sst
         .datatypes
@@ -397,16 +426,28 @@ fn verify_module(
         .cloned()
         .collect();
 
-    let mut air_ctx = Context::new(mctx.msg.clone(), mctx.solver);
-    air_ctx.set_z3_param("air_recommended_options", "true");
+    // `Context::new` calls `SmtProcess::launch` → `Z3_mk_config`+`Z3_mk_context`,
+    // which on wasm hops into the Emscripten Z3 runtime and spins up a fresh
+    // solver context. That's not free — each context is its own Z3 state.
+    let mut air_ctx = time("verify.air_ctx_new", || {
+        let mut c = Context::new(mctx.msg.clone(), mctx.solver);
+        c.set_z3_param("air_recommended_options", "true");
+        c
+    });
     let bufs = AirBufs::attach(&mut air_ctx, stages);
 
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
-    feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)?;
-    run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts)?;
+    time("verify.feed_decls", || {
+        feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)
+    })?;
+    time("verify.queries", || {
+        run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts)
+    })?;
 
     bufs.drain_into(output);
-    Ok(ctx.free())
+    // `ctx.free()` drops the AirBufs-attached Z3 context → `Z3_del_context`.
+    // Any deferred solver teardown shows up here.
+    Ok(time("verify.ctx_free", || ctx.free()))
 }
 
 // Prelude, fuel, trait/assoc/datatype/opaque decls, plus per-function symbol
@@ -497,24 +538,22 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
         if body.is_empty() {
             continue;
         }
-        writeln!(out, "=== {} ===", name).unwrap();
-        out.push_str(body.trim_end());
-        writeln!(out).unwrap();
-        writeln!(out).unwrap();
+        emit_section(out, name, body);
     }
-    writeln!(out, "=== VERDICT ===").unwrap();
+    let mut verdict = String::new();
     if output.verdicts.is_empty() {
-        writeln!(out, "no queries").unwrap();
+        writeln!(verdict, "no queries").unwrap();
     } else if output.verdicts.iter().all(|v| v.proved) {
-        writeln!(out, "Valid").unwrap();
+        writeln!(verdict, "Valid").unwrap();
     } else {
         let n_failed = output.verdicts.iter().filter(|v| !v.proved).count();
-        writeln!(out, "{}/{} queries failed", n_failed, output.verdicts.len()).unwrap();
+        writeln!(verdict, "{}/{} queries failed", n_failed, output.verdicts.len()).unwrap();
     }
     for v in &output.verdicts {
         let result = if v.proved { "proved" } else { v.verdict.as_str() };
-        writeln!(out, "{}: {} → {}", v.function, v.kind, result).unwrap();
+        writeln!(verdict, "{}: {} → {}", v.function, v.kind, result).unwrap();
     }
+    emit_section(out, "VERDICT", &verdict);
 }
 
 // ---------- top-level entry ----------
@@ -590,46 +629,52 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
 }
 
 fn run_pipeline(compiler: &Compiler, stages: DumpStages, verify: bool) -> String {
-    let krate = rustc_interface::passes::parse(&compiler.sess);
+    let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
     let mut out = String::new();
     if stages.ast {
-        writeln!(out, "=== AST ===").unwrap();
-        writeln!(out, "crate items: {}", krate.items.len()).unwrap();
+        let mut body = String::new();
+        writeln!(body, "crate items: {}", krate.items.len()).unwrap();
         for item in &krate.items {
             writeln!(
-                out,
+                body,
                 "  {:?} {}",
                 item.kind.descr(),
                 item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
             )
             .unwrap();
         }
-        writeln!(out).unwrap();
+        emit_section(&mut out, "AST", &body);
     }
-    rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-        if stages.hir {
-            dump_hir(&mut out, tcx);
-        }
-        dump_vir_and_verify(&mut out, compiler, tcx, stages, verify);
+    // `create_and_enter_global_ctxt` itself is cheap — the expensive work
+    // (name resolution, HIR lowering, type-check) happens lazily inside the
+    // closure via `tcx` queries fired by `build_vir`. We time the enter call
+    // anyway in case global_ctxt setup becomes a hot spot later.
+    time("global_ctxt", || {
+        rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+            if stages.hir {
+                dump_hir(&mut out, tcx);
+            }
+            dump_vir_and_verify(&mut out, compiler, tcx, stages, verify);
+        })
     });
     out
 }
 
 fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
-    writeln!(out, "=== HIR ===").unwrap();
     // Forces macro expansion + name resolution + HIR lowering.
     let _ = tcx.resolver_for_lowering();
+    let mut body = String::new();
     for item_id in tcx.hir_free_items() {
         let def_id = item_id.owner_id.def_id.to_def_id();
         writeln!(
-            out,
+            body,
             "  {} {}",
             tcx.def_kind(def_id).descr(def_id),
             tcx.def_path_str(def_id)
         )
         .unwrap();
     }
-    writeln!(out).unwrap();
+    emit_section(out, "HIR", &body);
 }
 
 fn dump_vir_and_verify(
@@ -639,7 +684,10 @@ fn dump_vir_and_verify(
     stages: DumpStages,
     verify: bool,
 ) {
-    let (krate, global_ctx, crate_name, spans) = match build_vir(compiler, tcx) {
+    // `build_vir` forces HIR lowering + name resolution + ty-check via Verus'
+    // `build_vir_crate`, so this stage absorbs most of the rustc front-end
+    // work. Split from `verify` below to separate rustc cost from Verus cost.
+    let (krate, global_ctx, crate_name, spans) = match time("build_vir", || build_vir(compiler, tcx)) {
         Ok(v) => v,
         Err(errs) => {
             for e in errs {
@@ -649,16 +697,14 @@ fn dump_vir_and_verify(
         }
     };
     if stages.vir {
-        writeln!(out, "=== VIR ===").unwrap();
         let mut buf: Vec<u8> = Vec::new();
         vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
-        out.push_str(&String::from_utf8_lossy(&buf));
-        writeln!(out).unwrap();
+        emit_section(out, "VIR", &String::from_utf8_lossy(&buf));
     }
     if !verify {
         return;
     }
-    match verify_simplified_krate(krate, global_ctx, crate_name, stages, compiler, &spans) {
+    match time("verify", || verify_simplified_krate(krate, global_ctx, crate_name, stages, compiler, &spans)) {
         Ok(output) => write_verify_output(out, &output),
         Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
     }
