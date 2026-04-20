@@ -45,17 +45,12 @@ crate-type = ["cdylib", "rlib"]
 # real doctests anyway.
 doctest = false
 
-[build-dependencies]
-# Used by build.rs to extract the embedded `.rustc` section from the host
-# proc-macro dylibs that vargo builds — gives us the rmeta bytes without
-# having to re-run rustc with --emit=metadata.
-object = "0.36"
-
 [dependencies]
 vir = { path = "third_party/verus/source/vir" }
 air = { path = "third_party/verus/source/air" }
 rust_verify = { path = "third_party/verus/source/rust_verify" }
 verus_builtin_macros = { path = "third_party/verus/source/builtin_macros" }
+verus_state_machines_macros = { path = "third_party/verus/source/state_machines_macros" }
 proc-macro2 = "1.0.39"
 wasm-bindgen = "0.2"
 # rustc_* crates that this crate uses directly are not declared here — they

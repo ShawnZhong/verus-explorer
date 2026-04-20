@@ -29,12 +29,10 @@ dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm verus-host
 	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
 	rm -rf $(PKG)
 
-# Build the host rust_verify driver + its proc-macro dylibs. build.rs
-# extracts the rmeta from each dylib's embedded `.rustc` section to bundle
-# into the virtual sysroot — that way vstd.rmeta's dep entries (stable
-# crate id + SVH) line up exactly with what user-code rustc-in-wasm later
-# finds. Phony so each invocation re-checks via cargo (cargo itself skips
-# work when nothing changed).
+# Build the host rust_verify driver. build.rs's wasm-libs script invokes
+# rust_verify to compile vstd → wasm32 rmeta + .vir, both of which get
+# bundled into the virtual sysroot. Phony so each invocation re-checks via
+# cargo (cargo itself skips work when nothing changed).
 verus-host:
 	./scripts/build-host-verus.sh
 

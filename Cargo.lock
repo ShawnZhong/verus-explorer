@@ -1881,6 +1881,7 @@ dependencies = [
  "sha2",
  "sise",
  "verus_builtin_macros",
+ "verus_state_machines_macros",
  "vir",
  "win32job",
 ]
@@ -4003,11 +4004,11 @@ version = "0.1.0"
 dependencies = [
  "air",
  "getrandom 0.3.4",
- "object 0.36.7",
  "proc-macro2",
  "rust_verify",
  "rustc-rlibs",
  "verus_builtin_macros",
+ "verus_state_machines_macros",
  "vir",
  "wasm-bindgen",
  "wasm-bindgen-test",
@@ -4030,6 +4031,16 @@ name = "verus_prettyplease"
 version = "0.0.0-2026-04-12-0118"
 dependencies = [
  "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-04-05-0114"
+dependencies = [
+ "indexmap 1.9.3",
+ "proc-macro2",
+ "quote",
  "verus_syn",
 ]
 

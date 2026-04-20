@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Build the host rust_verify driver + its proc-macro dylibs into
-# target/verus-host/release/. build.rs calls rust_verify to compile
-# vstd → wasm32 rmeta and extracts rmeta bytes from each dylib's
-# `.rustc` section for the bundled virtual sysroot.
+# Build the host rust_verify driver into target/verus-host/release/.
+# build.rs's wasm-libs script invokes rust_verify to compile vstd → wasm32
+# rmeta + .vir for the bundled virtual sysroot.
 #
 # `--target-dir target/verus-host` redirects cargo out of Verus's own
 # workspace (`third_party/verus/source/target/`) so `make clean`'s

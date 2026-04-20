@@ -76,14 +76,14 @@ set -x
     --out-dir "$lib" \
     "$repo/third_party/verus/source/builtin/src/lib.rs"
 
-# verus_builtin_macros, stubs-only mode (`--cfg=stub_only` cfg-gates out
-# the proc_macro/syn/quote-using impl fns + `MACROS` slice — see the file
-# header). Result is a wasm32 rmeta exposing only the `pub macro NAME`
-# decl_macro stubs, exactly what vstd's build (`--extern=verus_builtin_macros`
-# below) and the bundled sysroot need for name resolution. The full crate
-# (with `MACROS`) gets built separately by cargo for both the host
-# (rust_verify) and the explorer's wasm binary (registered at startup via
-# `proc_macros::install`); this rmeta isn't used by either.
+# verus_builtin_macros + verus_state_machines_macros, stubs-only mode
+# (`--cfg=stub_only` cfg-gates out the proc_macro/syn/quote-using impl fns +
+# `MACROS` slice — see each crate's lib.rs header). Result is a wasm32 rmeta
+# exposing only the `pub macro NAME` decl_macro stubs, exactly what vstd's
+# build (`--extern=...` below) and the bundled sysroot need for name
+# resolution. The full crates (with `MACROS`) get built separately by cargo
+# for both the host (rust_verify) and the explorer's wasm binary (registered
+# at startup via `proc_macros::install`); these rmetas aren't used by either.
 "$RUSTC" --edition=2018 --crate-type=lib --crate-name=verus_builtin_macros \
     --target=wasm32-unknown-unknown --emit=metadata \
     -Cextra-filename=-explorer \
@@ -93,6 +93,16 @@ set -x
     --sysroot="$out" \
     --out-dir "$lib" \
     "$repo/third_party/verus/source/builtin_macros/src/lib.rs"
+
+"$RUSTC" --edition=2018 --crate-type=lib --crate-name=verus_state_machines_macros \
+    --target=wasm32-unknown-unknown --emit=metadata \
+    -Cextra-filename=-explorer \
+    --cfg=stub_only \
+    --check-cfg='cfg(stub_only)' \
+    --check-cfg='cfg(verus_keep_ghost)' \
+    --sysroot="$out" \
+    --out-dir "$lib" \
+    "$repo/third_party/verus/source/state_machines_macros/src/lib.rs"
 
 # vstd via host rust_verify. --sysroot=$out resolves core/alloc/
 # compiler_builtins against our self-built rmetas (matching SVH with
@@ -104,26 +114,15 @@ set -x
 # only core + alloc.
 { set +x; } 2>/dev/null
 host_dir="$repo/target/verus-host/release"
-case "$(uname -s)" in
-    Darwin) dylib_ext=dylib ;;
-    Linux) dylib_ext=so ;;
-    *) dylib_ext=dll ;;
-esac
 rust_verify="$host_dir/rust_verify"
-# verus_builtin_macros's wasm32 stub rmeta was built directly above (lives in
-# $lib next to verus_builtin); vstd's --extern points at that.
-# verus_state_machines_macros is still a real proc-macro dylib — its host
-# build is what we --extern (rustc accepts host-triple proc-macro dylibs as
-# `--extern` targets even for cross-compilation, since proc-macros run in
-# the compiler).
+# Both macro crates' wasm32 stub rmetas were built directly above (lives in
+# $lib next to verus_builtin); vstd's --externs point at those.
 macros="$lib/libverus_builtin_macros-explorer.rmeta"
-sm_macros="$host_dir/libverus_state_machines_macros.$dylib_ext"
-for f in "$rust_verify" "$sm_macros"; do
-    [ -e "$f" ] || {
-        echo "missing host artifact: $f — run \`make verus-host\` first." >&2
-        exit 1
-    }
-done
+sm_macros="$lib/libverus_state_machines_macros-explorer.rmeta"
+[ -e "$rust_verify" ] || {
+    echo "missing host artifact: $rust_verify — run \`make verus-host\` first." >&2
+    exit 1
+}
 
 # rust_verify's host rustc loads librustc_driver.dylib at launch; DYLD
 # fallback exposes the toolchain's sysroot/lib without fighting SIP. The
