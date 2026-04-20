@@ -19,9 +19,7 @@
       <div class="pane-header">
         <label class="hint muted">
           Example:
-          <select id="example-select">
-            <option value="">— load —</option>
-          </select>
+          <select id="example-select"></select>
         </label>
       </div>
       <div id="parse-input"></div>
@@ -156,25 +154,37 @@
     const autoVerifyCheckbox = document.getElementById('auto-verify');
     const expandErrorsCheckbox = document.getElementById('expand-errors');
 
-    // Example manifest: each entry drives one `<option>` in the dropdown,
-    // and the `file` field names a source file under `public/examples/`
-    // (copied to `dist/examples/` by the Makefile). Add an entry here to
-    // add a new example — no other wiring needed. The first entry also
-    // doubles as the cold-load default when no URL hash is present.
-    const EXAMPLES = [
-      { file: 'sequence.rs', label: 'Sequence (passes)' },
-      { file: 'failure.rs', label: 'Assertion failure' },
-      { file: 'arith.rs', label: 'Arithmetic proof' },
-      { file: 'requires_ensures.rs', label: 'Requires / ensures' },
-      { file: 'loop.rs', label: 'Loop invariant' },
-      { file: 'recursion.rs', label: 'Recursive spec fn' },
-      { file: 'struct_invariant.rs', label: 'Struct + nonlinear hint' },
+    // Example manifest: grouped by topic so the dropdown reads as a mini
+    // table of contents. Each `items` entry drives one `<option>`; the
+    // `group` label renders as a native `<optgroup>` header. `file` names
+    // a source file under `public/examples/` (copied to `dist/examples/`
+    // by the Makefile). Add an entry here to add a new example — no other
+    // wiring needed. The first entry also doubles as the cold-load default
+    // when no URL hash is present.
+    const EXAMPLE_GROUPS = [
+      { group: 'Basics', items: [
+        { file: 'sequence.rs', label: 'Sequence (passes)' },
+        { file: 'failure.rs', label: 'Assertion failure' },
+        { file: 'arith.rs', label: 'Arithmetic proof' },
+      ]},
+      { group: 'Language features', items: [
+        { file: 'requires_ensures.rs', label: 'Requires / ensures' },
+        { file: 'loop.rs', label: 'Loop invariant' },
+        { file: 'recursion.rs', label: 'Recursive spec fn' },
+        { file: 'struct_invariant.rs', label: 'Struct + ghost binding' },
+      ]},
     ];
-    for (const { file, label } of EXAMPLES) {
-      const opt = document.createElement('option');
-      opt.value = file;
-      opt.textContent = label;
-      exampleSelect.appendChild(opt);
+    const EXAMPLES = EXAMPLE_GROUPS.flatMap(g => g.items);
+    for (const { group, items } of EXAMPLE_GROUPS) {
+      const og = document.createElement('optgroup');
+      og.label = group;
+      for (const { file, label } of items) {
+        const opt = document.createElement('option');
+        opt.value = file;
+        opt.textContent = label;
+        og.appendChild(opt);
+      }
+      exampleSelect.appendChild(og);
     }
     const fetchExample = (file) => fetch(`./examples/${file}`).then(r => r.text());
     const SECTION_ORDER = [
@@ -498,14 +508,24 @@
       }, 500);
     };
 
+    // The dropdown's selected option doubles as a "this example is loaded
+    // verbatim" indicator. On hash-load the editor holds whatever the user
+    // shared, which may or may not be one of our examples — clear the
+    // selection so the dropdown reads blank rather than lying about what's
+    // in the editor.
+    let loadedFromHash = false;
     const initialDoc = await (async () => {
       const hash = location.hash.slice(1);
       if (hash) {
-        try { return await decodeSrc(hash); }
-        catch (e) { console.warn('hash decode failed:', e); }
+        try {
+          const src = await decodeSrc(hash);
+          loadedFromHash = true;
+          return src;
+        } catch (e) { console.warn('hash decode failed:', e); }
       }
       return fetchExample(EXAMPLES[0].file);
     })();
+    if (loadedFromHash) exampleSelect.selectedIndex = -1;
 
     // ------------------------------------------------------------------
     // Auto-verify: debounced re-run on edits when the checkbox is on.
@@ -594,9 +614,7 @@
     // Wiring: example dropdown + Verify button.
     // ------------------------------------------------------------------
     exampleSelect.addEventListener('change', async () => {
-      const val = exampleSelect.value;
-      if (!val) return;
-      const src = await fetchExample(val);
+      const src = await fetchExample(exampleSelect.value);
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
       runParse();
     });

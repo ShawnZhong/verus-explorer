@@ -1,10 +1,15 @@
 use vstd::prelude::*;
 
-// Struct + spec-mode method: `spec fn len2` is available in `ensures`
-// clauses and `assert`s but emits no runtime code. The `rotate_90`
-// proof needs a nonlinear hint because SMT is incomplete on products
-// of symbolic terms — `by(nonlinear_arith)` flips the solver into its
-// dedicated nonlinear mode for that one fact.
+// `int` is Verus's unbounded mathematical integer — ghost-only, with
+// no runtime bits. Exec code that tries to handle an `int` directly
+// (even via `3 as int`) is rejected by Verus:
+//
+//   The Verus types 'nat' and 'int' can only be used in ghost code
+//   (e.g., in a 'spec' or 'proof' function, inside a 'proof' block,
+//    or when assigning to a 'ghost' or 'tracked' variable)
+//
+// `let ghost` binds the struct in ghost context, so the literals are
+// spec-mode and coerce to `int` freely.
 verus! {
 
 struct Point {
@@ -18,18 +23,9 @@ impl Point {
     }
 }
 
-fn rotate_90(p: Point) -> (o: Point)
-    ensures o.len2() == p.len2(),
-{
-    let o = Point { x: -p.y, y: p.x };
-    assert((-p.y) * (-p.y) == p.y * p.y) by(nonlinear_arith);
-    o
-}
-
 fn main() {
-    let p = Point { x: 3, y: 4 };
-    let q = rotate_90(p);
-    assert(q.len2() == 25);
+    let ghost p = Point { x: 3, y: 4 };
+    assert(p.len2() == 25);
 }
 
 } // verus!
