@@ -40,6 +40,7 @@
 
     <section class="pane" id="right-pane">
       <div class="output-tabs" id="parse-tabs" role="tablist"></div>
+      <div class="output-subtabs" id="parse-subtabs" role="tablist"></div>
       <div id="parse-output-view"></div>
     </section>
   </main>
@@ -59,7 +60,7 @@
       Decoration, StateField, StateEffect, EditorState,
       linter, setDiagnostics,
       search,
-      Compartment, StreamLanguage,
+      Compartment, StreamLanguage, foldService, foldEffect,
     } from './editor.js';
 
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
@@ -150,6 +151,7 @@
     const parseButtonLabel = document.getElementById('parse-run-label');
     const parseMeta = document.getElementById('parse-meta');
     const parseTabsEl = document.getElementById('parse-tabs');
+    const parseSubtabsEl = document.getElementById('parse-subtabs');
     const parseOutputViewEl = document.getElementById('parse-output-view');
     const exampleSelect = document.getElementById('example-select');
     const autoVerifyCheckbox = document.getElementById('auto-verify');
@@ -189,24 +191,58 @@
       exampleSelect.appendChild(og);
     }
     const fetchExample = (file) => fetch(`./examples/${file}`).then(r => r.text());
-    const SECTION_ORDER = [
-      'AST', 'HIR', 'VIR', 'SST_AST', 'SST_POLY',
-      'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT', 'Z3',
+    // Output panel has two levels of navigation: a top tab strip picks the
+    // pipeline stage (Verus / HIR / VIR / AIR / Z3), and a subtab row under
+    // the CM6 view picks the variant within that stage (raw / SSA / flat
+    // for AIR, in / out for Z3, …). Collapsing sub-variants into a second
+    // row keeps the top strip fitting on one line and groups related IRs
+    // head-to-head. Groups with a single variant render no subtab row.
+    //
+    // Stage blurbs: `Verus` is the source-level AST (post-macro-expansion).
+    // `HIR` is rustc's high-level IR. The `VIR-*` family all lives in the
+    // `vir` crate: `VIR` is the AST form, `VIR-sst` is after
+    // `ast_to_sst_krate` (statement / expression trees closer to SMT),
+    // `VIR-poly` is after the `poly` pass (generics monomorphized / type-
+    // erased — what AIR consumes). AIR has three: initial block tree,
+    // SSA-versioned, flattened to one assertion. `Z3-in` is what we send
+    // to the solver; `Z3-out` is its reply — both SMT-LIB2.
+    const TAB_GROUPS = [
+      { id: 'Verus',  variants: ['AST_PRE', 'AST'] },
+      { id: 'HIR',    variants: ['HIR'] },
+      { id: 'VIR',    variants: ['VIR', 'SST_AST', 'SST_POLY'] },
+      { id: 'AIR',    variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
+      { id: 'Z3-in',  variants: ['SMT'] },
+      { id: 'Z3-out', variants: ['Z3'] },
     ];
-    // Tab labels name what the stage actually *produced* rather than pipeline
-    // positions. The `VIR-*` family all lives in the `vir` crate: `VIR` is
-    // the AST form, `VIR-sst` is after `ast_to_sst_krate` (statement /
-    // expression trees closer to SMT), `VIR-sst-poly` is after the `poly`
-    // pass (generics monomorphized / type-erased — what AIR consumes). AIR
-    // has three: initial block tree, SSA-versioned, flattened to one
-    // assertion. SMT-in is what we send to Z3; SMT-out is Z3's reply —
-    // both SMT-LIB2, direction in the suffix.
-    const SECTION_LABEL = {
-      AST: 'AST', HIR: 'HIR', VIR: 'VIR',
-      SST_AST: 'VIR-sst', SST_POLY: 'VIR-poly',
-      AIR_INITIAL: 'AIR-raw', AIR_MIDDLE: 'AIR-SSA', AIR_FINAL: 'AIR-flat',
-      SMT: 'SMT-in', Z3: 'SMT-out',
+    const VARIANT_LABEL = {
+      AST_PRE: 'raw', AST: 'expanded',
+      HIR: 'HIR',
+      VIR: 'ast', SST_AST: 'sst', SST_POLY: 'poly',
+      AIR_INITIAL: 'raw', AIR_MIDDLE: 'SSA', AIR_FINAL: 'flat',
+      SMT: 'Z3-in', Z3: 'Z3-out',
     };
+    // Flat section order + section → group lookup, both derived from
+    // TAB_GROUPS so adding a new variant is a one-line change.
+    const SECTION_ORDER = TAB_GROUPS.flatMap(g => g.variants);
+    const GROUP_OF = new Map(TAB_GROUPS.flatMap(g => g.variants.map(v => [v, g.id])));
+    // Remembers the last subtab the user clicked in each group, so
+    // clicking back into (say) `VIR` returns to `VIR-sst` if that's where
+    // they left it rather than snapping back to the first variant.
+    const lastVariantInGroup = new Map();
+
+    // "Show vstd" toggle: by default the VIR tab's three variants show
+    // only user-owned items (Rust side runs `prune_krate_to_user` /
+    // `prune_krate_sst_to_user` at dump time — verification itself still
+    // sees everything). When the checkbox is on, we swap the section
+    // lookup to the `_FULL` twin that Rust emits alongside, which pretty-
+    // prints the whole krate including vstd. Pure dump filter — no
+    // re-verify needed. Map declares the variants that have a twin.
+    const VIR_FULL_SECTION = {
+      VIR: 'VIR_FULL', SST_AST: 'SST_AST_FULL', SST_POLY: 'SST_POLY_FULL',
+    };
+    let showVstd = false;
+    const sectionFor = (tab) =>
+      (showVstd && VIR_FULL_SECTION[tab]) ? VIR_FULL_SECTION[tab] : tab;
 
     // `parse_source` always produces every IR; bodies are cached here so
     // flipping a tab just swaps the output-view's doc instead of re-parsing.
@@ -331,22 +367,91 @@
       }
     };
 
-    // Tab strip. Sections not yet cached render as disabled buttons so the
-    // full pipeline shape stays visible during cold load / between runs.
+    // Top tab strip: one button per pipeline stage. A group is enabled as
+    // long as *any* of its variants has produced output. Clicking a group
+    // restores the last-visited variant within it (or falls back to the
+    // first cached one) so flipping away and back doesn't lose context.
+    // Stages not yet cached render as disabled buttons so the full pipeline
+    // shape stays visible during cold load / between runs.
     const renderTabs = () => {
       parseTabsEl.textContent = '';
-      for (const name of SECTION_ORDER) {
+      const currentGroup = currentTab ? GROUP_OF.get(currentTab) : null;
+      const cached = (v) => sectionCache.has(sectionFor(v));
+      for (const g of TAB_GROUPS) {
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'tab' + (name === currentTab ? ' active' : '');
-        button.textContent = SECTION_LABEL[name];
-        button.disabled = !sectionCache.has(name);
+        button.className = 'tab' + (g.id === currentGroup ? ' active' : '');
+        button.textContent = g.id;
+        button.disabled = !g.variants.some(cached);
         button.addEventListener('click', () => {
-          currentTab = name;
+          const chosen = (lastVariantInGroup.has(g.id) && cached(lastVariantInGroup.get(g.id)))
+            ? lastVariantInGroup.get(g.id)
+            : g.variants.find(cached);
+          if (!chosen) return;
+          currentTab = chosen;
+          lastVariantInGroup.set(g.id, chosen);
           renderTabs();
+          renderSubtabs();
           renderOutputView();
         });
         parseTabsEl.appendChild(button);
+      }
+    };
+
+    // Subtab row under the output CM6 view: picks the variant within the
+    // active group (e.g., raw / SSA / flat for AIR). Hidden entirely when
+    // the current group has only one variant (Verus, HIR) so the row
+    // doesn't eat vertical space without offering a choice.
+    // Subtab row: sits right under the top tab bar, above the CM6 view.
+    // Holds two kinds of children, separated visually by `margin-left:
+    // auto` on the control block so pills hug the left edge and controls
+    // hug the right:
+    //   1. Variant pills — one per sibling section in the active group
+    //      (e.g., `ast` / `sst` / `poly` under VIR). Skipped when the
+    //      group has a single variant.
+    //   2. Group-level controls — currently only VIR's `Show vstd`
+    //      toggle, which swaps `sectionFor()` between pruned and full
+    //      twins (both cached per run, no re-verify).
+    // Row is hidden entirely when empty (`.output-subtabs:empty`) so
+    // tabs with no variants and no controls don't leave a dead band.
+    const renderSubtabs = () => {
+      parseSubtabsEl.textContent = '';
+      const currentGroup = currentTab ? GROUP_OF.get(currentTab) : null;
+      if (!currentGroup) return;
+      const group = TAB_GROUPS.find(g => g.id === currentGroup);
+      if (group.variants.length > 1) {
+        for (const v of group.variants) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'subtab' + (v === currentTab ? ' active' : '');
+          button.textContent = VARIANT_LABEL[v];
+          button.disabled = !sectionCache.has(sectionFor(v));
+          button.addEventListener('click', () => {
+            currentTab = v;
+            lastVariantInGroup.set(currentGroup, v);
+            renderTabs();
+            renderSubtabs();
+            renderOutputView();
+          });
+          parseSubtabsEl.appendChild(button);
+        }
+      }
+      if (currentGroup === 'VIR') {
+        const label = document.createElement('label');
+        label.className = 'tab-control hint muted';
+        label.title = 'Include vstd items in the VIR / VIR-sst / VIR-poly dumps';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = showVstd;
+        cb.addEventListener('change', () => {
+          showVstd = cb.checked;
+          renderTabs();
+          renderSubtabs();
+          renderOutputView();
+        });
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(' Show vstd'));
+        parseSubtabsEl.appendChild(label);
       }
     };
 
@@ -394,8 +499,13 @@
       'str.len', 'str.++', 'str.at', 'str.substr', 'str.indexof', 'str.contains',
       'str.prefixof', 'str.suffixof', 'str.replace', 'str.to_int', 'str.from_int',
     ]);
-    const sexpParser = {
-      name: 'sexp',
+    // Token-classifier factory: same whitespace / comment / string /
+    // number / paren / `|quoted|` / `:attr` handling for every sexp-ish
+    // dialect, but the keyword/sort/operator sets differ between SMT
+    // (lowercase commands like `declare-fun`) and VIR/SST (CamelCase
+    // node kinds like `Function`, `BinaryOp`, `Int`).
+    const makeSexpParser = (name, kw, sorts, ops) => ({
+      name,
       startState: () => ({}),
       token(stream) {
         if (stream.eatSpace()) return null;
@@ -426,20 +536,77 @@
         // `:weight`, …). Render distinctly from command keywords.
         if (w.startsWith(':')) return 'attributeName';
         if (w === 'true' || w === 'false') return 'atom';
-        if (SMT_KEYWORDS.has(w)) return 'keyword';
-        if (SMT_SORTS.has(w)) return 'typeName';
-        if (SMT_OPERATORS.has(w)) return 'operator';
+        if (kw.has(w)) return 'keyword';
+        if (sorts.has(w)) return 'typeName';
+        if (ops.has(w)) return 'operator';
         return null;
       },
-    };
-    const sexpLanguage = StreamLanguage.define(sexpParser);
+    });
+    const sexpLanguage = StreamLanguage.define(
+      makeSexpParser('sexp', SMT_KEYWORDS, SMT_SORTS, SMT_OPERATORS),
+    );
+    // VIR / SST pretty-prints look like s-expressions but the heads are
+    // Verus's own CamelCase node kinds (see `vir/src/printer.rs`, `sst.rs`).
+    // We split them into the same keyword / typeName / operator buckets
+    // the SMT parser uses, so the theme colors stay consistent.
+    const VIR_KEYWORDS = new Set([
+      // top-level items
+      'Function', 'Datatype', 'Trait', 'TraitImpl', 'Module', 'Variant', 'Field',
+      // statement / expr forms
+      'Stmt', 'Expr', 'Block', 'Decl', 'LocalDecl', 'Param', 'Arm', 'Pattern',
+      'Let', 'If', 'IfElse', 'Match', 'Loop', 'While', 'Break', 'Continue', 'Return',
+      'Call', 'Assign', 'Var', 'Const', 'Ctor', 'Tuple', 'Array', 'Index', 'Cast',
+      'Lambda', 'Closure', 'Bind', 'Binding', 'Choose', 'Old', 'WithExpr',
+      'FieldUpdate', 'IsVariant', 'Quant', 'Forall', 'Exists', 'Multi',
+      // clauses / specs
+      'Requires', 'Ensures', 'Decreases', 'Recommends', 'Invariant',
+      'LoopInvariant', 'Assert', 'Assume', 'DecreasesBy', 'CheckDecreaseHeight',
+      'OpenInvariantMask', 'RevealGroup', 'PostConditionKind', 'UnwindSst',
+    ]);
+    const VIR_MODES = new Set([
+      'Spec', 'Proof', 'Exec', 'Ghost', 'Tracked',
+      'Public', 'Private', 'Open', 'Closed',
+      'Uninterpreted', 'FnDef', 'SpecFn',
+    ]);
+    const VIR_TYPES = new Set([
+      'Bool', 'Int', 'Nat', 'Real', 'Float', 'String', 'Char',
+      'BitVector', 'BitVec', 'USize', 'ISize',
+      'Boxed', 'Unboxed', 'Sized', 'TypeId', 'TypParam', 'Named', 'Fun',
+      'Primitive', 'Decorate', 'MutRef', 'Dyn', 'Opaque',
+      'AnonymousClosure', 'PointeeMetadata', 'Projection',
+      'ConstInt', 'ConstBool',
+    ]);
+    const VIR_OPERATORS = new Set([
+      // arithmetic / comparison
+      'Add', 'Sub', 'Mul', 'Div', 'Mod', 'Neg',
+      'EuclideanDiv', 'EuclideanMod',
+      'Le', 'Lt', 'Ge', 'Gt', 'Eq', 'Ne',
+      // logical
+      'And', 'Or', 'Xor', 'Not', 'Implies',
+      // bitvec
+      'BitAdd', 'BitSub', 'BitMul', 'BitUDiv', 'BitURem', 'BitSDiv', 'BitSRem',
+      'BitAnd', 'BitOr', 'BitXor', 'BitNot', 'BitConcat',
+      'BitExtract', 'BitZeroExtend', 'BitSignExtend',
+      'Shl', 'Shr',
+      // unary / conversion / float
+      'Unary', 'Binary', 'Arith', 'RealArith', 'Bitwise',
+      'Inequality', 'Chained',
+      'IntToReal', 'RealToInt', 'FloatToBits',
+      'IsZero', 'IsNaN', 'IsInfinite', 'IsNormal', 'IsSubnormal',
+    ]);
+    // Merge modes into the keyword bucket so they color the same as the
+    // surrounding node-kind heads (they're effectively tags, not types).
+    const VIR_KW_ALL = new Set([...VIR_KEYWORDS, ...VIR_MODES]);
+    const virLanguage = StreamLanguage.define(
+      makeSexpParser('vir', VIR_KW_ALL, VIR_TYPES, VIR_OPERATORS),
+    );
     // Per-section language, looked up on every tab switch. Sections not
     // listed get `[]` (plain). Rust mode for AST/HIR since those are
     // pseudo-Rust pretty-prints; s-expressions for everything downstream
     // (VIR/SST also pretty-print as parenthesized trees, close enough).
     const LANGUAGE_FOR_SECTION = {
-      AST: rust(), HIR: rust(),
-      VIR: sexpLanguage, SST_AST: sexpLanguage, SST_POLY: sexpLanguage,
+      AST_PRE: rust(), AST: rust(), HIR: rust(),
+      VIR: virLanguage, SST_AST: virLanguage, SST_POLY: virLanguage,
       AIR_INITIAL: sexpLanguage, AIR_MIDDLE: sexpLanguage, AIR_FINAL: sexpLanguage,
       SMT: sexpLanguage, Z3: sexpLanguage,
     };
@@ -448,17 +615,65 @@
     // the search panel's state).
     const outputLanguage = new Compartment();
 
+    // Fold service for the SMT / AIR tabs. Two shapes are foldable:
+    //   1. `(push)` / `(pop)` pairs — Verus wraps each check_valid in them
+    //      (air/context.rs:429), so each query collapses to one line.
+    //   2. `;; -- setup --` header — folds the preamble up to the line
+    //      right before the first `(push)` so the (usually large) axiom /
+    //      datatype setup can be hidden in one click. The setup marker
+    //      comes from `split_setup_queries` in `src/lib.rs`.
+    // basicSetup's foldGutter asks this service per line; non-foldable
+    // lines return null. `renderOutputView` then auto-folds the setup
+    // range on every tab switch so it starts collapsed by default.
+    const sectionFold = foldService.of((state, lineStart, lineEnd) => {
+      const head = state.doc.sliceString(lineStart, lineEnd);
+      if (/^;; -- setup --\s*$/.test(head)) {
+        const idx = state.doc.toString().indexOf('\n(push)', lineEnd);
+        return idx < 0 ? null : { from: lineEnd, to: idx };
+      }
+      if (/^\(push\)\s*$/.test(head)) {
+        let depth = 1;
+        let pos = lineEnd;
+        while (pos < state.doc.length) {
+          const nextLine = state.doc.lineAt(pos + 1);
+          const text = state.doc.sliceString(nextLine.from, nextLine.to);
+          if (/^\s*\(push\)\s*$/.test(text)) depth++;
+          else if (/^\s*\(pop\)\s*$/.test(text)) {
+            depth--;
+            if (depth === 0) return { from: lineEnd, to: nextLine.to };
+          }
+          if (nextLine.to >= state.doc.length) break;
+          pos = nextLine.to;
+        }
+      }
+      return null;
+    });
+
     // Replace the read-only CM6 viewer's doc with the selected section body,
     // then restore the user's last scroll position for that tab (0 on first
     // visit). One long-lived view is cheaper than N-per-tab; the scroll map
     // is what buys back the "pick up where I left off" feel.
     const renderOutputView = () => {
-      const body = currentTab && sectionCache.has(currentTab)
-        ? sectionCache.get(currentTab) : '';
+      const key = currentTab ? sectionFor(currentTab) : null;
+      const body = key && sectionCache.has(key) ? sectionCache.get(key) : '';
       outputView.dispatch({
         changes: { from: 0, to: outputView.state.doc.length, insert: body },
         effects: outputLanguage.reconfigure(LANGUAGE_FOR_SECTION[currentTab] ?? []),
       });
+      // Auto-fold the `;; -- setup --` preamble so the tab opens focused
+      // on the queries. Applies to every body produced by
+      // `split_setup_queries` — SMT and all three AIR tabs. The whole-doc
+      // replacement above wipes any prior fold state (folds over a
+      // deleted range collapse to zero width), so we re-apply on every
+      // render. If the body has no `(push)` (unreachable after the guard
+      // in `split_setup_queries`, but defensive) or isn't an SMT/AIR
+      // tab, nothing folds.
+      const pushIdx = body.indexOf('\n(push)');
+      if (body.startsWith(';; -- setup --') && pushIdx > 0) {
+        outputView.dispatch({
+          effects: foldEffect.of({ from: ';; -- setup --'.length, to: pushIdx }),
+        });
+      }
       outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
     };
 
@@ -559,14 +774,17 @@
         sectionCache.set('Z3', z3ResponseBuffer.join('\n'));
       }
       // Preserve user's tab selection when it survives the new run;
-      // otherwise default to VIR (first "interesting" IR) or whichever
-      // stage made it the furthest.
+      // otherwise default to Z3-in (the actual solver input — most useful
+      // for debugging why a query failed) or whichever stage made it the
+      // furthest if SMT wasn't reached.
       if (!currentTab || !sectionCache.has(currentTab)) {
-        currentTab = sectionCache.has('VIR') ? 'VIR'
+        currentTab = sectionCache.has('SMT') ? 'SMT'
           : (SECTION_ORDER.find(n => sectionCache.has(n)) ?? null);
       }
+      if (currentTab) lastVariantInGroup.set(GROUP_OF.get(currentTab), currentTab);
       renderMeta();
       renderTabs();
+      renderSubtabs();
       renderOutputView();
       updateErrorDecorations();
       buildInlineDiagnostics();
@@ -642,6 +860,10 @@
     autoVerifyCheckbox.checked = localStorage.getItem(AUTO_VERIFY_KEY) !== 'false';
     autoVerifyCheckbox.addEventListener('change', () => {
       localStorage.setItem(AUTO_VERIFY_KEY, autoVerifyCheckbox.checked);
+      // Flipping the checkbox on is effectively a request to verify now —
+      // the user just expressed "yes, I want verification running" — so
+      // kick off a run. Flipping off is silent; we only cancel pending work.
+      if (autoVerifyCheckbox.checked) runParse();
     });
     // Expand-errors: default off — runs per-conjunct sub-queries on a failed
     // body, which doubles-to-triples verify time but pinpoints which sub-
@@ -650,6 +872,10 @@
     expandErrorsCheckbox.checked = localStorage.getItem(EXPAND_ERRORS_KEY) === 'true';
     expandErrorsCheckbox.addEventListener('change', () => {
       localStorage.setItem(EXPAND_ERRORS_KEY, expandErrorsCheckbox.checked);
+      // The flag is only read by `parse_source`, so a re-run is required to
+      // see the effect — do it eagerly instead of waiting for the next edit
+      // or manual Verify click.
+      runParse();
     });
     let autoVerifyTimer;
     const scheduleAutoVerify = () => {
@@ -703,6 +929,7 @@
         basicSetup,
         search({ top: true }),
         outputLanguage.of([]),
+        sectionFold,
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         ...(dark ? [oneDark] : []),
@@ -730,6 +957,7 @@
     parseButton.disabled = false;
 
     renderTabs();
+    renderSubtabs();
     runParse();
   </script>
 

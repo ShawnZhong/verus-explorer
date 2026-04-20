@@ -10,7 +10,7 @@ export { StateField, StateEffect, EditorState, Compartment } from "@codemirror/s
 // StreamLanguage is reached transitively through `codemirror`; export it
 // so `index.html` can define a tiny inline s-expression parser for the
 // SMT-LIB / AIR output tabs without pulling in a legacy-modes package.
-export { StreamLanguage } from "@codemirror/language";
+export { StreamLanguage, foldService, foldEffect } from "@codemirror/language";
 export { indentWithTab } from "@codemirror/commands";
 export { rust } from "@codemirror/lang-rust";
 export { oneDark } from "@codemirror/theme-one-dark";

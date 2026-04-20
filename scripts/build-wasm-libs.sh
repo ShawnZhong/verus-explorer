@@ -47,12 +47,22 @@ RUSTC="$repo/target/host-rust/bin/rustc"
 }
 export RUSTC_BOOTSTRAP=1
 
-# Rewrite `$repo/` → `` in every rustc/rust_verify invocation so the spans
-# baked into rmetas and `vstd.vir` are repo-relative instead of leaking the
-# developer's absolute path. rustc applies this to all `RemapPathScopeComponents`
-# by default, which includes DIAGNOSTICS — the scope `span_to_diagnostic_string`
-# reads when producing the `span.as_string` field Verus serializes into the VIR.
-remap="--remap-path-prefix=$repo/="
+# Rewrite `$repo/third_party/verus/source/` → `` in every rustc/rust_verify
+# invocation so the spans baked into rmetas and `vstd.vir` end up as
+# `vstd/seq.rs` rather than `$repo/third_party/verus/source/vstd/seq.rs` —
+# no developer absolute path, no vendored-submodule noise. rustc applies
+# this to all `RemapPathScopeComponents` by default, which includes
+# DIAGNOSTICS, the scope `span_to_diagnostic_string` reads when producing
+# the `span.as_string` field Verus serializes into the VIR.
+#
+# Every `$repo/`-rooted source we compile here lives under
+# `third_party/verus/source/` (vstd, verus_builtin, builtin_macros,
+# state_machines_macros), so one remap covers all of them. core / alloc /
+# compiler_builtins come from `$rust_src` (rustup's rust-src, outside
+# `$repo`) and aren't affected by any remap — the baked-in paths for those
+# stay absolute, which in practice isn't user-visible because diagnostics
+# almost never span into core/alloc from a Verus user's source.
+remap="--remap-path-prefix=$repo/third_party/verus/source/="
 
 # Chain: core (no deps) → compiler_builtins (deps core) → alloc (deps core
 # + compiler_builtins) → verus_builtin (deps core). compiler_builtins'

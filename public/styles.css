@@ -205,6 +205,18 @@ pre {
 .hint {
   font-size: .8em;
 }
+/* Checkbox labels: the default baseline alignment leaves the box
+   noticeably higher than the shrunken .hint text. Flexing the label
+   with align-items: center lines the checkbox's midline up with the
+   label text's midline. */
+label.hint {
+  display: inline-flex;
+  align-items: center;
+  gap: .35em;
+}
+label.hint > input[type="checkbox"] {
+  margin: 0;
+}
 kbd {
   font: inherit;
   font-size: .85em;
@@ -256,6 +268,52 @@ kbd {
   margin-bottom: -1px;
 }
 .tab:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Subtab row: sits right under the top tab bar, above the CM6 view.
+   Holds two kinds of children — variant pills (e.g. raw / SSA / flat
+   inside AIR) and group-level controls (the VIR `Show vstd` toggle).
+   The control block uses `margin-left: auto` so variants hug the left
+   edge and controls hug the right. Pill styling keeps variants visually
+   subordinate to the main tab strip above, and the wrapper hides itself
+   when the row is empty so tabs with a single variant and no controls
+   don't leave a dead band above the editor. */
+.output-subtabs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .3em;
+  padding: .3em 0;
+}
+.output-subtabs:empty { display: none; }
+.subtab {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font: inherit;
+  font-size: .75em;
+  padding: .15em .6em;
+  cursor: pointer;
+  border-radius: 999px;
+}
+.subtab:hover:not(:disabled) { color: var(--fg); border-color: var(--focus-ring); }
+.subtab.active {
+  background: var(--pre-bg);
+  color: var(--fg);
+}
+.subtab:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Group-level control in the subtab row (currently just VIR's
+   `Show vstd`). `margin-left: auto` pushes it to the right edge, so the
+   variant pills stay left-anchored and the toggle lands visually
+   symmetric with the controls row on the left pane. */
+.tab-control {
+  display: inline-flex;
+  align-items: center;
+  gap: .35em;
+  margin-left: auto;
+  font-size: .75em;
+}
+.tab-control > input[type="checkbox"] { margin: 0; }
 
 /* Verdict + diagnostics live under the source editor in the left
    pane. Capped height with internal scroll so a long rustc dump

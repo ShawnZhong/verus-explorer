@@ -30,6 +30,7 @@
 
 #![feature(rustc_private)]
 
+extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_driver;
 extern crate rustc_errors;
@@ -342,6 +343,13 @@ pub fn parse_and_verify(src: &str, verify: bool, expand_errors: bool) -> String 
 fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) -> String {
     let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
     let mut out = String::new();
+    // Parser output — pretty-prints essentially verbatim source wrapped in
+    // `verus! { ... }` (plus the implicit `no_std` / register_tool
+    // attributes we injected via `-Zcrate-attr`). Dumping it here, before
+    // `create_and_enter_global_ctxt` moves `krate`, gives the UI a
+    // before/after pair against the expanded AST so the reader can see
+    // what the `verus!` macro actually rewrites into.
+    dump_ast_pre_expansion(&mut out, &krate);
     // `create_and_enter_global_ctxt` itself is cheap — the expensive work
     // (name resolution, HIR lowering, type-check) happens lazily inside the
     // closure via `tcx` queries fired by `build_vir`. We time the enter call
@@ -354,6 +362,13 @@ fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) -> Strin
         })
     });
     out
+}
+
+fn dump_ast_pre_expansion(out: &mut String, krate: &rustc_ast::Crate) {
+    time("dump.ast_pre", || {
+        let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
+        emit_section(out, "AST_PRE", &body);
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -388,6 +403,16 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         "-Zcrate-attr=feature(proc_macro_hygiene)",
         "-Zcrate-attr=register_tool(verus)",
         "-Zcrate-attr=register_tool(verifier)",
+        // `verus!` macro expansion triggers a pile of rustc lints that are
+        // false positives against the *source* (e.g. `unused_parens` on
+        // `x * (x - 1)` where dropping the parens changes precedence;
+        // `non_shorthand_field_patterns` on `MyStruct { f }` rewritten to
+        // `{ f: f }`). This is the same list Verus's own driver suppresses
+        // — see `rust_verify/src/driver.rs`.
+        "-Aunused_imports", "-Aunused_variables", "-Aunused_assignments",
+        "-Aunreachable_patterns", "-Aunused_parens", "-Aunused_braces",
+        "-Adead_code", "-Aunreachable_code", "-Aunused_mut", "-Aunused_labels",
+        "-Aunused_attributes", "-Anon_shorthand_field_patterns",
     ]
     .into_iter()
     .map(String::from)
@@ -636,6 +661,17 @@ fn dump_vir_and_verify(
         vir::printer::write_krate(&mut buf, &pruned, &vir::printer::COMPACT_TONODEOPTS);
         emit_section(out, "VIR", &String::from_utf8_lossy(&buf));
     });
+    // Unfiltered version alongside, for the UI's "Show vstd" checkbox.
+    // Pretty-printing runs over vstd (~150 modules), so this doubles the
+    // VIR dump cost and ~10×s the byte count — acceptable because the
+    // user already opted in to seeing wasm-bindgen calls back every
+    // queued section, and a hidden tab variant shouldn't spend extra
+    // round-trips to refetch it.
+    time("dump.vir_full", || {
+        let mut buf: Vec<u8> = Vec::new();
+        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
+        emit_section(out, "VIR_FULL", &String::from_utf8_lossy(&buf));
+    });
     if !verify {
         return;
     }
@@ -716,9 +752,14 @@ struct VerifyOutput {
     /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
     /// (still polymorphic; function bodies as SST expressions/statements).
     sst_ast: String,
+    /// `sst_ast` but with the `prune_krate_sst_to_user` filter lifted —
+    /// includes vstd items. UI's "Show vstd" checkbox swaps to this.
+    sst_ast_full: String,
     /// After `poly::poly_krate_for_module` — monomorphized SST
     /// (polymorphism erased; the form the AIR lowerer consumes).
     sst_poly: String,
+    /// Unfiltered companion to `sst_poly`.
+    sst_poly_full: String,
     /// Raw AIR (Block/Switch/Assert tree, AIR syntax).
     air_initial: String,
     /// After `var_to_const::lower_query` (SSA-style versioning of mutable vars).
@@ -947,9 +988,11 @@ fn verify_module(
         &bucket_funs,
         &pruned,
     ))?;
-    time("dump.sst_ast", || append_sst_dump(&mut output.sst_ast, &krate_sst));
+    time("dump.sst_ast", || append_sst_dump(&mut output.sst_ast, &krate_sst, true));
+    time("dump.sst_ast_full", || append_sst_dump(&mut output.sst_ast_full, &krate_sst, false));
     let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
-    time("dump.sst_poly", || append_sst_dump(&mut output.sst_poly, &krate_sst));
+    time("dump.sst_poly", || append_sst_dump(&mut output.sst_poly, &krate_sst, true));
+    time("dump.sst_poly_full", || append_sst_dump(&mut output.sst_poly_full, &krate_sst, false));
 
     let visible_dts: Vec<Datatype> = krate_sst
         .datatypes
@@ -1262,10 +1305,14 @@ fn run_queries(
 // section contains every module's SSTs in order. Same local-crate filter as
 // VIR — vstd items don't drown out the user's functions. Verify still runs
 // on the full krate; this pruned copy is display-only.
-fn append_sst_dump(buf: &mut String, krate_sst: &KrateSst) {
-    let pruned = prune_krate_sst_to_user(krate_sst);
+fn append_sst_dump(buf: &mut String, krate_sst: &KrateSst, prune: bool) {
     let mut bytes: Vec<u8> = Vec::new();
-    vir::printer::write_krate_sst(&mut bytes, &pruned, &vir::printer::COMPACT_TONODEOPTS);
+    if prune {
+        let pruned = prune_krate_sst_to_user(krate_sst);
+        vir::printer::write_krate_sst(&mut bytes, &pruned, &vir::printer::COMPACT_TONODEOPTS);
+    } else {
+        vir::printer::write_krate_sst(&mut bytes, krate_sst, &vir::printer::COMPACT_TONODEOPTS);
+    }
     buf.push_str(&String::from_utf8_lossy(&bytes));
 }
 
@@ -1283,26 +1330,67 @@ fn prune_krate_sst_to_user(krate: &KrateSst) -> KrateSst {
 
 // Each AIR/SMT dump begins with the global axiom/datatype preamble and then
 // transitions to query blocks at the first `(push)` (logged by `check_valid`
-// before each query — see air/context.rs:429). Insert `-- setup --` /
-// `-- queries --` banners so the browser can fold the preamble by default
-// without mangling the content.
+// before each query — see air/context.rs:429). Inject `-- setup --` before
+// the preamble and `-- query N: <label> --` before each `(push)`, where
+// `<label>` is the first `;; ...` comment Verus wrote just before the push
+// (typically `Function-Def foo` / `Function-Termination bar`). The browser
+// uses the setup marker as a fold trigger (auto-collapsed on render) and
+// folds each `(push) ... (pop)` pair into a one-line summary.
 fn split_setup_queries(body: &str) -> String {
     let needle = "\n(push";
-    match body.find(needle) {
-        Some(idx) => {
-            let (setup, queries) = body.split_at(idx);
-            format!(
-                ";; -- setup --\n{}\n;; -- queries --{}",
-                setup.trim_end(),
-                queries,
-            )
-        }
-        None => body.to_string(),
+    let Some(first) = body.find(needle) else { return body.to_string(); };
+    let mut out = String::with_capacity(body.len() + 256);
+    out.push_str(";; -- setup --\n");
+    out.push_str(body[..first].trim_end());
+    let mut cursor = first;
+    let mut n = 0;
+    while let Some(rel) = body[cursor..].find(needle) {
+        let push_nl = cursor + rel;           // position of the '\n' before '(push'
+        let push_start = push_nl + 1;          // position of '(push'
+        n += 1;
+        out.push_str(&body[cursor..push_nl]);
+        let banner = match label_before(&body[..push_nl]) {
+            Some(label) => format!("\n;; -- query {}: {} --", n, label),
+            None => format!("\n;; -- query {} --", n),
+        };
+        out.push_str(&banner);
+        out.push_str(&body[push_nl..push_start]);
+        cursor = push_start;
     }
+    out.push_str(&body[cursor..]);
+    out
+}
+
+// Walk back from the end of `preceding` through blank lines and `;;`
+// comments; return the *topmost* comment of that contiguous block as the
+// query label (the `Function-Def ...` / `Function-Termination ...` line
+// Verus emits before calling `push`). `None` if no comment was found, so
+// the caller can emit a bare `;; -- query N --` instead of appending an
+// empty or placeholder label.
+fn label_before(preceding: &str) -> Option<String> {
+    let mut comments: Vec<&str> = Vec::new();
+    for line in preceding.lines().rev() {
+        let t = line.trim();
+        if t.is_empty() {
+            if comments.is_empty() { continue; }
+            break;
+        }
+        if let Some(rest) = t.strip_prefix(";;") {
+            comments.push(rest.trim());
+        } else {
+            break;
+        }
+    }
+    comments.last().copied().filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 fn write_verify_output(out: &mut String, output: &VerifyOutput) {
-    for (name, body) in [("SST_AST", &output.sst_ast), ("SST_POLY", &output.sst_poly)] {
+    for (name, body) in [
+        ("SST_AST", &output.sst_ast),
+        ("SST_AST_FULL", &output.sst_ast_full),
+        ("SST_POLY", &output.sst_poly),
+        ("SST_POLY_FULL", &output.sst_poly_full),
+    ] {
         if body.is_empty() {
             continue;
         }
