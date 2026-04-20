@@ -10,8 +10,10 @@
 <body>
 
   <header>
-    <h1><a href="https://github.com/ShawnZhong/verus-explorer" target="_blank" rel="noopener">verus-explorer</a></h1>
-    <p class="muted">Verus → HIR → VIR → AIR → Z3 pipeline, running as wasm in your browser.</p>
+    <h1>
+      <span><a href="https://shawnzhong.github.io/verus-explorer/">Verus Explorer</a> <span class="muted">Every stage of Verus, from source to solver, running live as wasm in your browser.</span></span>
+      <a class="header-link" href="https://github.com/ShawnZhong/verus-explorer" target="_blank" rel="noopener">GitHub</a>
+    </h1>
   </header>
 
   <main id="workbench">
@@ -30,10 +32,10 @@
           <kbd class="shortcut">⌘↵</kbd>
         </button>
         <label class="hint muted" title="Re-verify 800ms after each edit">
-          <input type="checkbox" id="auto-verify" /> Auto-verify
+          <input type="checkbox" id="auto-verify" /> Rerun on edit
         </label>
         <label class="hint muted" title="Run expand-errors after a failed query to pinpoint which sub-conjunct breaks (slower)">
-          <input type="checkbox" id="expand-errors" /> Expand errors
+          <input type="checkbox" id="expand-errors" /> Diagnostics
         </label>
       </div>
     </section>
@@ -166,9 +168,10 @@
     // when no URL hash is present.
     const EXAMPLE_GROUPS = [
       { group: 'Tutorial', items: [
-        { file: 'sequence.rs', label: 'Sequence' },
         { file: 'arith.rs', label: 'Arithmetic' },
         { file: 'requires_ensures.rs', label: 'Requires / ensures' },
+        { file: 'sequence.rs', label: 'Sequence' },
+        { file: 'map.rs', label: 'Map' },
         { file: 'loop.rs', label: 'Loop invariant' },
         { file: 'recursion.rs', label: 'Recursive spec fn' },
         { file: 'struct_invariant.rs', label: 'Struct + ghost binding' },
@@ -865,13 +868,12 @@
       // kick off a run. Flipping off is silent; we only cancel pending work.
       if (autoVerifyCheckbox.checked) runParse();
     });
-    // Expand-errors: default off — runs per-conjunct sub-queries on a failed
-    // body, which doubles-to-triples verify time but pinpoints which sub-
-    // assertion broke. Persisted so the pref survives reloads.
-    const EXPAND_ERRORS_KEY = 've-expand-errors';
-    expandErrorsCheckbox.checked = localStorage.getItem(EXPAND_ERRORS_KEY) === 'true';
+    // Expand-errors: always default off — runs per-conjunct sub-queries on a
+    // failed body, which doubles-to-triples verify time but pinpoints which
+    // sub-assertion broke. Not persisted: starting clean each page load keeps
+    // the slower path opt-in rather than sticky.
+    expandErrorsCheckbox.checked = false;
     expandErrorsCheckbox.addEventListener('change', () => {
-      localStorage.setItem(EXPAND_ERRORS_KEY, expandErrorsCheckbox.checked);
       // The flag is only read by `parse_source`, so a re-run is required to
       // see the effect — do it eagerly instead of waiting for the next edit
       // or manual Verify click.

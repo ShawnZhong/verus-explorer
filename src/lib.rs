@@ -675,10 +675,21 @@ fn dump_vir_and_verify(
     if !verify {
         return;
     }
-    match time("verify", || verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans, expand_errors)) {
-        Ok(output) => write_verify_output(out, &output),
-        Err(e) => writeln!(out, "  verify error: {}", e.note).unwrap(),
-    }
+    // Thread `output` in by-ref so dumps from earlier modules / earlier
+    // pipeline stages survive a later failure. Upstream Verus bails with `?`
+    // on the first module error, which would otherwise discard every SST /
+    // AIR / SMT section accumulated up to that point and leave the UI
+    // showing only VIR.
+    let mut output = VerifyOutput::default();
+    // Any `VirErr` that bubbles out has already been routed through the
+    // reporter → DiagCtxt inside `verify_simplified_krate`, matching
+    // upstream Verus' `finish_verus` handler (verifier.rs:3531). So we
+    // just write whatever dumps we managed to accumulate and let the
+    // HumanEmitter-backed DIAGNOSTICS section render the error.
+    let _ = time("verify", || {
+        verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans, expand_errors, &mut output)
+    });
+    write_verify_output(out, &output);
 }
 
 // Drives Verus's HIR→VIR pipeline. `Verifier::build_vir_crate` (vendored
@@ -909,7 +920,8 @@ fn verify_simplified_krate<'tcx>(
     compiler: &'tcx Compiler,
     spans: &SpanContext,
     expand_errors: bool,
-) -> Result<VerifyOutput, VirErr> {
+    output: &mut VerifyOutput,
+) -> Result<(), VirErr> {
     let msg = Arc::new(VirMessageInterface {});
     // Routes VIR/AIR messages through rustc's `DiagCtxt` — the emitter
     // attached in `psess_created` (a `HumanEmitter` over a shared string
@@ -925,7 +937,6 @@ fn verify_simplified_krate<'tcx>(
         arch_word_bits: krate.arch.word_bits,
         expand_errors,
     };
-    let mut output = VerifyOutput::default();
     // After `build_vir_crate` merges vstd into the local krate, `krate.modules`
     // is ~155 entries; of those only the user's modules need verification.
     // Verus itself filters via `current_crate_modules` (captured before the
@@ -933,11 +944,20 @@ fn verify_simplified_krate<'tcx>(
     // local modules and Some(crate_name) for externs — the same distinction,
     // derivable post-merge so we don't have to rework `build_vir`.
     for module in krate.modules.iter().filter(|m| m.x.path.krate.is_none()) {
-        global_ctx = time("verify.module", || {
-            verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output)
-        })?;
+        match time("verify.module", || verify_module(&mctx, module.x.path.clone(), global_ctx, output)) {
+            Ok(gctx) => global_ctx = gctx,
+            Err(e) => {
+                // Route spanned VirErrs through the reporter → DiagCtxt →
+                // HumanEmitter so the UI renders them with the same
+                // `error: … --> file:L:C | source` framing as upstream
+                // (verifier.rs:3531). Writing `e.note` alone loses every
+                // span, producing a bare sentence with no source context.
+                reporter.report_as(&e.clone().to_any(), MessageLevel::Error);
+                return Err(e);
+            }
+        }
     }
-    Ok(output)
+    Ok(())
 }
 
 fn verify_module(
@@ -1020,14 +1040,21 @@ fn verify_module(
     let bufs = AirBufs::attach(&mut air_ctx);
 
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
-    time("verify.feed_decls", || {
-        feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)
-    })?;
-    time("verify.queries", || {
-        run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts, mctx.expand_errors)
-    })?;
-
+    // Drain AIR/SMT buffers regardless of pass/fail: if `run_queries` errors
+    // partway through, every command fed before that point is still valuable
+    // dump material for the UI. Pipe the Err back out via `result?` after
+    // draining so the caller still sees the failure.
+    let result: Result<(), VirErr> = (|| {
+        time("verify.feed_decls", || {
+            feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)
+        })?;
+        time("verify.queries", || {
+            run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts, mctx.expand_errors)
+        })?;
+        Ok(())
+    })();
     bufs.drain_into(output);
+    result?;
     // `ctx.free()` drops the AirBufs-attached Z3 context → `Z3_del_context`.
     // Any deferred solver teardown shows up here.
     Ok(time("verify.ctx_free", || ctx.free()))

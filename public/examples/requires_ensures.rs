@@ -1,18 +1,14 @@
 use vstd::prelude::*;
 
-// Function contracts: `requires` constrains what the caller must prove
-// before the call; `ensures` states what the function guarantees on
-// return. The verifier discharges every call site against `requires`
-// and the body against `ensures`.
 verus! {
 
-fn octuple(x: i8) -> (r: i8)
-    requires
-        -16 <= x < 16,
-    ensures
-        r == 8 * x,
+fn octuple(x1: i8) -> (x8: i8)
+    // requires
+    //     -16 <= x1 < 16,
+    // ensures
+    //     x8 == 8 * x1,
 {
-    let x2 = x + x;
+    let x2 = x1 + x1;
     let x4 = x2 + x2;
     x4 + x4
 }
