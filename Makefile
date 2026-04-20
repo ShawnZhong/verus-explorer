@@ -8,8 +8,8 @@
 #   make test      # run headless-browser wasm-bindgen tests (needs chrome/chromedriver)
 #   make host-rust # build patched stage1 rustc → target/host-rust/ (slow, ~10min; rare)
 #   make host-verus# build host rust_verify driver → target/host-verus/release/
-#   make clean     # remove cargo + wasm-z3 + host-verus artifacts (keeps host-rust)
-#   make distclean # also remove host-rust (full nuke; forces stage1 rebuild)
+#   make clean     # remove cargo + wasm-z3 (keeps host-rust + host-verus)
+#   make distclean # also remove host-rust + host-verus (full nuke)
 #
 # Build artifact layout (all under target/):
 #   target/cargo/      cargo workspace (debug, release, wasm32-unknown-unknown)
@@ -86,10 +86,11 @@ deploy: release
 	git branch -M gh-pages && \
 	git push --force origin gh-pages
 
-# Spare target/host-rust/ — it's the expensive stage1 rustc (~1 GB,
-# ~10 min to rebuild from x.py). Use `make distclean` for a full nuke.
+# Spare host-rust (~10 min stage1 rebuild) and host-verus (~2 min cargo
+# build of rust_verify) — both are stable across normal wasm iteration.
+# Use `make distclean` for a full nuke.
 clean:
-	rm -rf target/cargo target/host-verus $(WASM_Z3)
+	rm -rf target/cargo $(WASM_Z3)
 
 distclean: clean
-	rm -rf target/host-rust
+	rm -rf target/host-rust target/host-verus

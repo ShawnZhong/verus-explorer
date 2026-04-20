@@ -5,15 +5,18 @@
 # symbol for version-gated attribute checks.
 [env]
 RUSTC_BOOTSTRAP = "1"
-CFG_RELEASE = "1.94.0"
-# Baked into each rmeta's header; rustc rejects rmetas whose stamp doesn't
-# match `rustc $CFG_VERSION`. Must match what stable 1.94.0 (the toolchain
-# pinned in `rust-toolchain.toml`) self-reports via `rustc --version`. Update
-# together with `rust-toolchain.toml`.
-CFG_VERSION = "1.94.0 (4a4ef493e 2026-03-02)"
-# rustc_metadata checks `env!("CFG_RELEASE_CHANNEL") == "dev"` for a diagnostic
-# hint about missing std. "stable" matches what 1.94.0 release builds use.
-CFG_RELEASE_CHANNEL = "stable"
+# Must match the patched stage1 rustc's self-reported version (the host rustc
+# in target/host-rust/, see `rustc -vV`). Sysroot rmetas built by that rustc
+# (scripts/build-wasm-libs.sh, scripts/build-host-verus.sh) get stamped with
+# its baked-in version; the in-wasm rustc compiled here picks up these envs
+# at compile time via `env!()`/`option_env!()` and bakes the same string in,
+# so rmeta version checks (E0514) line up. x.py builds without a configured
+# channel default to `1.94.0-dev`; if we ever rebuild the patched rustc with
+# `[rust] channel = "stable"` in third_party/rust/config.toml, update these
+# to match what the new binary reports.
+CFG_RELEASE = "1.94.0-dev"
+CFG_VERSION = "1.94.0-dev"
+CFG_RELEASE_CHANNEL = "dev"
 # rustc_interface bakes this path into the binary to find the sysroot-relative
 # rustc bin. Unused on wasm32 (no sysroot), but `env!()` is a compile-time
 # failure unless set.
