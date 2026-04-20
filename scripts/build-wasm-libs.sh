@@ -15,13 +15,17 @@
 #   vstd.rmeta + vstd.vir — vstd compiled via the host rust_verify driver
 #     against our self-built sysroot (SVH chain matches user-code rustc-
 #     in-wasm's lookups).
-# `-Cextra-filename=-explorer` gives every rmeta a predictable filename
-# matching the names the in-wasm crate locator probes for.
+#
+# `rustc --emit=metadata` without `-Cextra-filename` produces plain
+# `lib<crate>.rmeta` files (no hash suffix), so the `--extern=...` paths
+# below are stable and need no globbing. The in-wasm crate locator
+# accepts both hashed (`lib<name>-<hash>.rmeta`) and unhashed names.
 #
 # $out is both the write destination and the `--sysroot=` value passed to
 # subsequent rustc/rust_verify invocations; rmetas land in
-# $out/lib/rustlib/wasm32-unknown-unknown/lib/. build.rs passes an
-# OUT_DIR-scoped path; the default below is for manual runs.
+# $out/lib/rustlib/wasm32-unknown-unknown/lib/. build.rs passes
+# `target/wasm-libs/` (the default below) so re-running this script
+# manually hits the same location.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -59,13 +63,11 @@ rust_src="$("$RUSTC" --print sysroot)/lib/rustlib/src/rust/library"
 set -x
 "$RUSTC" --edition=2024 --crate-type=lib --crate-name=core \
     --target=wasm32-unknown-unknown --emit=metadata \
-    -Cextra-filename=-explorer \
     --out-dir "$lib" \
     "$rust_src/core/src/lib.rs"
 
 "$RUSTC" --edition=2024 --crate-type=lib --crate-name=compiler_builtins \
     --target=wasm32-unknown-unknown --emit=metadata \
-    -Cextra-filename=-explorer \
     --cfg='feature="compiler-builtins"' \
     --check-cfg='cfg(feature, values("compiler-builtins"))' \
     --cap-lints=allow \
@@ -75,7 +77,6 @@ set -x
 
 "$RUSTC" --edition=2024 --crate-type=lib --crate-name=alloc \
     --target=wasm32-unknown-unknown --emit=metadata \
-    -Cextra-filename=-explorer \
     --sysroot="$out" \
     --out-dir "$lib" \
     "$rust_src/alloc/src/lib.rs"
@@ -84,7 +85,6 @@ set -x
 # from `#![cfg_attr(verus_keep_ghost, feature(...))]`.
 "$RUSTC" --edition=2018 --crate-type=lib --crate-name=verus_builtin \
     --target=wasm32-unknown-unknown --emit=metadata \
-    -Cextra-filename=-explorer \
     --cfg=verus_keep_ghost \
     --sysroot="$out" \
     --out-dir "$lib" \
@@ -99,7 +99,6 @@ build_stub_rmeta() {
     local name=$1 src=$2
     "$RUSTC" --edition=2018 --crate-type=lib --crate-name="$name" \
         --target=wasm32-unknown-unknown --emit=metadata \
-        -Cextra-filename=-explorer \
         --cfg=stub_only \
         --check-cfg='cfg(stub_only)' \
         --check-cfg='cfg(verus_keep_ghost)' \
@@ -125,8 +124,8 @@ host_dir="$repo/target/host-verus/release"
 rust_verify="$host_dir/rust_verify"
 # Both macro crates' wasm32 stub rmetas were built directly above (lives in
 # $lib next to verus_builtin); vstd's --externs point at those.
-macros="$lib/libverus_builtin_macros-explorer.rmeta"
-sm_macros="$lib/libverus_state_machines_macros-explorer.rmeta"
+macros="$lib/libverus_builtin_macros.rmeta"
+sm_macros="$lib/libverus_state_machines_macros.rmeta"
 [ -e "$rust_verify" ] || {
     echo "missing host artifact: $rust_verify — run \`make host-verus\` first." >&2
     exit 1
@@ -151,7 +150,7 @@ VSTD_KIND=IsVstd \
     --target=wasm32-unknown-unknown \
     --emit=metadata \
     --sysroot="$out" \
-    --extern=verus_builtin="$lib/libverus_builtin-explorer.rmeta" \
+    --extern=verus_builtin="$lib/libverus_builtin.rmeta" \
     --extern=verus_builtin_macros="$macros" \
     --extern=verus_state_machines_macros="$sm_macros" \
     --crate-type=lib \

@@ -6,7 +6,7 @@
 // exposes the test bundle — it can't serve the ~60 MB of rmetas + vstd.vir
 // that rustc's crate locator needs. In Node mode we have real filesystem
 // access via the `fs` module and can read those files from the path
-// `build.rs` emits as the `SYSROOT_DIR` env var.
+// `build.rs` emits as the `WASM_LIBS_DIR` env var.
 //
 // Intentionally a single test: rustc's `SESSION_GLOBALS` is a scoped TLS, and
 // on wasm32 `panic = abort` doesn't unwind RAII guards, so a panicking test
@@ -36,19 +36,19 @@ fn pipeline_preserves_ghost_proof_block() {
     // cdylib, so install the panic hook + proc-macro shims by hand.
     verus_explorer::init();
 
-    // Stream every rmeta + `vstd.vir` staged by `build.rs` into the virtual
-    // sysroot. `manifest.json` lives alongside them but isn't an rmeta, so
-    // skip it.
-    let dir = env!("SYSROOT_DIR");
+    // Stream every rmeta + `vstd.vir` staged by `build.rs` into the
+    // wasm-libs bundle. `manifest.json` lives alongside them but isn't an
+    // rmeta, so skip it.
+    let dir = env!("WASM_LIBS_DIR");
     for entry in readdir_sync(dir) {
         let name = entry.as_string().expect("readdirSync returns strings");
         if name == "manifest.json" {
             continue;
         }
         let bytes = read_file_sync(&format!("{dir}/{name}"));
-        verus_explorer::sysroot_add_file(name, bytes);
+        verus_explorer::wasm_libs_add_file(name, bytes);
     }
-    verus_explorer::sysroot_finalize();
+    verus_explorer::wasm_libs_finalize();
 
     // `assert(false)` inside a `proof { }` block is a direct witness of
     // ghost preservation: if `cfg_erase()` returns anything but `Keep`, the

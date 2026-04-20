@@ -154,19 +154,20 @@
   <h1>verus-explorer</h1>
 
   <section id="parse-section">
-    <h2>rustc_interface::run_compiler → HIR (vendored, wasm32)</h2>
+    <h2>rustc → VIR → AIR → Z3 (vendored, wasm32)</h2>
     <p class="muted">Rustc front-end invoked directly through
       <code>rustc_interface::run_compiler</code> (skipping
       <code>rustc_driver</code>'s CLI/ICE/panic-hook glue), source fed via
-      <code>Input::Str</code>, driven past crate-root parsing into
-      <code>create_and_enter_global_ctxt</code> +
-      <code>tcx.resolver_for_lowering()</code> to force macro expansion,
-      name resolution, and HIR lowering. Dumps AST top-level items and
-      HIR free-item def-paths. <code>#![no_core]</code> +
-      <code>#![feature(no_core)]</code> are injected via <code>-Zcrate-attr</code>
-      to suppress the auto <code>extern crate core/std</code> — no sysroot
-      metadata is bundled, so anything touching lang items
-      (<code>+</code>, <code>Sized</code>, generics) won't typeck.</p>
+      <code>Input::Str</code>. Extern-crate resolution is served out of a
+      prebuilt wasm-libs bundle (core, alloc, compiler_builtins, vstd,
+      verus_builtin, and the Verus macro-stub rmetas) fetched from
+      <code>./wasm-libs/</code>; rustc sees them via a virtual
+      <code>--sysroot=/virtual</code> wired through
+      <code>rustc_session::filesearch::sysroot::Callbacks</code>.
+      <code>#![no_std]</code> is injected via <code>-Zcrate-attr</code> to
+      keep the std import out (only <code>core</code> is bundled). After HIR
+      lowering, Verus takes over: HIR → simplified VIR → ast_to_sst → poly
+      → AIR → Z3, with each stage exposed via the toggles below.</p>
     <textarea id="parse-input" spellcheck="false">use vstd::prelude::*;
 
 verus! {
@@ -240,16 +241,16 @@ fn main() {
       fetch('./verus_explorer_bg.wasm')
     );
 
-    // Virtual sysroot: rustc-in-wasm resolves `extern crate core/alloc/vstd`
+    // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
     // against rmetas laid out at `/virtual/lib/rustlib/wasm32-unknown-unknown/lib`.
-    // `build.rs` stages the bytes under `./sysroot/` and emits a `manifest.json`
+    // `build.rs` stages the bytes under `./wasm-libs/` and emits a `manifest.json`
     // listing the files to fetch. We load them once (HTTP/2 multiplexes the
     // per-file requests, browser caches each independently), then re-install
-    // into every fresh wasm instance via `sysroot_add_file` + `sysroot_finalize`.
-    const sysrootFiles = await (async () => {
-      const manifest = await fetch('./sysroot/manifest.json').then(r => r.json());
+    // into every fresh wasm instance via `wasm_libs_add_file` + `wasm_libs_finalize`.
+    const wasmLibs = await (async () => {
+      const manifest = await fetch('./wasm-libs/manifest.json').then(r => r.json());
       return Promise.all(manifest.map(async name => {
-        const buf = await fetch(`./sysroot/${name}`).then(r => r.arrayBuffer());
+        const buf = await fetch(`./wasm-libs/${name}`).then(r => r.arrayBuffer());
         return [name, new Uint8Array(buf)];
       }));
     })();
@@ -263,10 +264,10 @@ fn main() {
     const freshVerus = async () => {
       const mod = await import(`./verus_explorer.js?nonce=${++freshNonce}`);
       await mod.default({ module_or_path: verusModule });
-      // Each fresh instance gets a fresh (empty) sysroot; re-install before
-      // `parse_source` touches rustc's crate locator.
-      for (const [name, bytes] of sysrootFiles) mod.sysroot_add_file(name, bytes);
-      mod.sysroot_finalize();
+      // Each fresh instance gets a fresh (empty) wasm-libs bundle;
+      // re-install before `parse_source` touches rustc's crate locator.
+      for (const [name, bytes] of wasmLibs) mod.wasm_libs_add_file(name, bytes);
+      mod.wasm_libs_finalize();
       return mod;
     };
 

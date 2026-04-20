@@ -43,12 +43,14 @@ dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm host-verus
 	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
 	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
 	rm -rf $(PKG)
-	# Copy the virtual-sysroot files (one rmeta per extern crate, plus
-	# vstd.vir and manifest.json) that `build.rs` emitted into OUT_DIR.
-	# `OUT_DIR` isn't exported by cargo, so reach under target/ directly —
-	# the location is stable across cargo versions for this crate layout.
-	rm -rf $(DIST)/sysroot
-	cp -r target/cargo/wasm32-unknown-unknown/$(if $(filter release,$@),release,debug)/build/verus-explorer-*/out/sysroot $(DIST)/sysroot
+	# Copy the wasm-libs files (one rmeta per extern crate, plus vstd.vir
+	# and manifest.json) that `build.rs` emitted. The nested lib dir only
+	# ever contains these files, so `*` is safe and flattens them for the
+	# browser. Stable profile-independent path, so no glob/mtime sort
+	# needed and debug + release share the same build.
+	rm -rf $(DIST)/wasm-libs
+	mkdir -p $(DIST)/wasm-libs
+	cp target/wasm-libs/lib/rustlib/wasm32-unknown-unknown/lib/* $(DIST)/wasm-libs/
 
 # Build the patched stage1 rustc. Slow (~10 min) and rarely needed (only
 # when third_party/rust source changes). Phony so each invocation re-runs
@@ -58,8 +60,8 @@ host-rust:
 
 # Build the host rust_verify driver. build.rs's wasm-libs script invokes
 # rust_verify to compile vstd → wasm32 rmeta + .vir, both of which get
-# bundled into the virtual sysroot. Phony so each invocation re-checks via
-# cargo (cargo itself skips work when nothing changed).
+# bundled into the wasm-libs directory. Phony so each invocation re-checks
+# via cargo (cargo itself skips work when nothing changed).
 host-verus:
 	./scripts/build-host-verus.sh
 
@@ -82,7 +84,7 @@ serve:
 # We run under Node (not headless Chrome) because `wasm-bindgen-test-runner`'s
 # web server only serves the test bundle, so the browser path can't fetch
 # the ~60 MB of staged rmetas + `vstd.vir`. Under Node, the test reads them
-# straight off disk from `SYSROOT_DIR` (emitted by `build.rs`).
+# straight off disk from `WASM_LIBS_DIR` (emitted by `build.rs`).
 #
 # `wasm-bindgen-test-runner` invokes `node` via plain `Command::new("node")`
 # (pure PATH lookup — no override env var), so prepending the vendored
@@ -109,7 +111,7 @@ deploy: release
 # build of rust_verify) — both are stable across normal wasm iteration.
 # Use `make distclean` for a full nuke.
 clean:
-	rm -rf target/cargo $(WASM_Z3)
+	rm -rf target/cargo target/wasm-libs $(WASM_Z3)
 
 distclean: clean
 	rm -rf target/host-rust target/host-verus

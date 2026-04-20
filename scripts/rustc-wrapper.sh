@@ -65,7 +65,6 @@ fi
 case "$crate_name" in
     verus_builtin_macros|verus_state_machines_macros)
         extra+=(--cfg=verus_keep_ghost)
-        echo "rustc-wrapper: injected --cfg=verus_keep_ghost for $crate_name (target=$target)" >&2
         ;;
 esac
 

@@ -26,7 +26,7 @@ use rustc_interface::interface::Compiler;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::EarlyDiagCtxt;
 use rustc_session::config::{self, ErrorOutputType, Input};
-use rustc_span::FileName;
+use rustc_span::{FileName, Symbol};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::FileLoader;
 use vir::ast::{ArchWordBits, Datatype, Fun, Krate, VirErr};
@@ -137,14 +137,14 @@ fn build_vir<'tcx>(
     let mut args = ArgsX::new();
     // `Vstd::Imported` is the default and matches the user's
     // `extern crate vstd;` injection. The vstd VIR is served out of the
-    // fetched sysroot bundle (`crate::sysroot::vstd_vir()`) and passed
+    // fetched wasm-libs bundle (`crate::wasm_libs::vstd_vir()`) and passed
     // straight in as `other_vir_crates` — `args.import` is path-based and
     // doesn't work on wasm32, so we bypass the filesystem loader.
     args.no_lifetime = true;
     args.no_external_by_default = true;
     let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
     let CrateWithMetadata { krate: vstd_krate, .. } =
-        bincode::deserialize(crate::sysroot::vstd_vir())
+        bincode::deserialize(crate::wasm_libs::vstd_vir())
             .map_err(|_| vec![vir::messages::error_bare(
                 "failed to deserialize embedded VIR crate — version mismatch?",
             )])?;
@@ -519,26 +519,19 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
 
 // ---------- top-level entry ----------
 
-// `--sysroot=/virtual` pairs with the virtual sysroot callbacks installed in
-// `lib::init` — rustc's crate locator finds `libcore.rmeta` (and friends), plus
-// our prebuilt `libverus_builtin.rmeta`, in the embedded bundle instead of on
-// disk. `#![no_std]` keeps std out (only `core` is needed), and the caller
-// prepends `extern crate verus_builtin;` so that crate is linked and its
-// `#[rustc_diagnostic_item]` registrations fire — Verus keys its builtin
-// lookups off those.
+// `--sysroot=/virtual` pairs with the filesearch callbacks installed by
+// `wasm_libs::finalize` — rustc's crate locator finds `libcore.rmeta` (and
+// friends), plus our prebuilt `libverus_builtin.rmeta`, in the wasm-libs
+// bundle instead of on disk. `#![no_std]` keeps std out (only `core` is
+// needed), and the caller prepends `extern crate verus_builtin;` so that
+// crate is linked and its `#[rustc_diagnostic_item]` registrations fire —
+// Verus keys its builtin lookups off those.
 fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     let argv: Vec<String> = [
         "--edition=2021",
         "--crate-type=lib",
         "--crate-name=v",
         "--sysroot=/virtual",
-        // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck) but
-        // the `verus!` proc-macro's `cfg_erase()` strips ghost bodies unless
-        // `verus_keep_ghost_body` is also on — see builtin_macros/src/lib.rs.
-        // Without this, every `proof { ... }` in user code shows up as an
-        // empty block in VIR and the verifier "proves" a trivially-empty body.
-        "--cfg=verus_keep_ghost",
-        "--cfg=verus_keep_ghost_body",
         "-Zcrate-attr=no_std",
         "-Zcrate-attr=feature(register_tool)",
         // `verus!` expansion emits `#[...]` attributes on expressions
@@ -558,6 +551,11 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
 
     rustc_interface::interface::Config {
         opts,
+        // `crate_cfg` is intentionally empty — `parse_cfg` constructs a fresh
+        // `ParseSess` per entry, which builds a `SourceMap` with the default
+        // `RealFileLoader`, and `current_directory()` traps on wasm32. Inject
+        // the cfgs from `psess_created` instead, where the SourceMap is already
+        // wired to our `VirtualFileLoader`.
         crate_cfg: vec![],
         crate_check_cfg: vec![],
         input: Input::Str { name: FileName::Custom("input.rs".into()), input: src },
@@ -573,6 +571,13 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
             let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
                 .sm(Some(psess.clone_source_map()));
             psess.dcx().set_emitter(Box::new(emitter));
+            // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck)
+            // but the `verus!` proc-macro's `cfg_erase()` strips ghost bodies
+            // unless `verus_keep_ghost_body` is also on — see
+            // builtin_macros/src/lib.rs. `cfg_erase` evaluates these via
+            // `expand_expr`, which reads `psess.config`.
+            psess.config.insert((Symbol::intern("verus_keep_ghost"), None));
+            psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
         })),
         hash_untracked_state: None,
         register_lints: None,

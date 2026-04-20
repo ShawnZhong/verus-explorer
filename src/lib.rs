@@ -28,7 +28,7 @@ extern crate rustc_span;
 // `public/index.html` installs for the browser build.
 pub mod pipeline;
 mod proc_macros;
-mod sysroot;
+mod wasm_libs;
 
 use wasm_bindgen::prelude::*;
 
@@ -55,19 +55,19 @@ pub fn init() {
     proc_macros::install();
 }
 
-/// Register one virtual-sysroot file (rmeta or `vstd.vir`) fetched by the
-/// JS loader from `./sysroot/<name>`. Call once per manifest entry, then
-/// call `sysroot_finalize` before the first `parse_source` invocation.
+/// Register one wasm-libs file (rmeta or `vstd.vir`) fetched by the JS
+/// loader from `./wasm-libs/<name>`. Call once per manifest entry, then call
+/// `wasm_libs_finalize` before the first `parse_source` invocation.
 #[wasm_bindgen]
-pub fn sysroot_add_file(name: String, bytes: Vec<u8>) {
-    sysroot::add_file(name, bytes);
+pub fn wasm_libs_add_file(name: String, bytes: Vec<u8>) {
+    wasm_libs::add_file(name, bytes);
 }
 
 /// Freeze the registered files and wire up rustc's filesearch callbacks.
-/// Must be called after all `sysroot_add_file` calls for this wasm instance.
+/// Must be called after all `wasm_libs_add_file` calls for this wasm instance.
 #[wasm_bindgen]
-pub fn sysroot_finalize() {
-    sysroot::finalize();
+pub fn wasm_libs_finalize() {
+    wasm_libs::finalize();
 }
 
 /// Run the rustc front-end on `src`, lower HIR → simplified VIR, then drive
