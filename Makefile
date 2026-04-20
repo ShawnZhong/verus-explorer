@@ -83,8 +83,17 @@ serve:
 # web server only serves the test bundle, so the browser path can't fetch
 # the ~60 MB of staged rmetas + `vstd.vir`. Under Node, the test reads them
 # straight off disk from `SYSROOT_DIR` (emitted by `build.rs`).
+#
+# `wasm-bindgen-test-runner` invokes `node` via plain `Command::new("node")`
+# (pure PATH lookup — no override env var), so prepending the vendored
+# `third_party/node/bin` here pins the Node version regardless of what's in
+# the user's PATH. The directory is gitignored; populate it by extracting
+# an official node tarball, e.g. on Apple Silicon:
+#   curl -sL https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz \
+#     | tar xz -C third_party && mv third_party/node-v24.15.0-darwin-arm64 \
+#     third_party/node
 test: host-verus
-	wasm-pack test --node
+	PATH="$(CURDIR)/third_party/node/bin:$$PATH" wasm-pack test --node
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
 # and force-pushes, so there's no history either locally or remotely.

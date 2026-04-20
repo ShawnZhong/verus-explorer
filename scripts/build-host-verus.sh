@@ -14,6 +14,12 @@
 # ghost `pub use` — the latter makes vstd typecheck fail with ~85 E0603
 # "private import" errors. `--check-cfg` silences "unexpected cfg"
 # warnings from deps that don't declare these names.
+#
+# An env-var RUSTFLAGS overrides the `[build].rustflags` from our
+# `.cargo/config.toml` (cargo picks one source, not both), which would drop
+# the repo-wide `--allow=unexpected_cfgs` and flood the log with
+# `#[cfg(bootstrap)]` warnings from the vendored rustc tree. Repeat the
+# allow here so the suppression sticks for this cargo invocation too.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -26,7 +32,7 @@ export RUSTC="$PWD/target/host-rust/bin/rustc"
 
 set -x
 
-RUSTFLAGS="--cfg=verus_keep_ghost --check-cfg=cfg(verus_keep_ghost) --check-cfg=cfg(verus_keep_ghost_body)" \
+RUSTFLAGS="--allow=unexpected_cfgs --cfg=verus_keep_ghost --check-cfg=cfg(verus_keep_ghost) --check-cfg=cfg(verus_keep_ghost_body)" \
   cargo build \
     --manifest-path third_party/verus/source/Cargo.toml \
     --target-dir target/host-verus \
