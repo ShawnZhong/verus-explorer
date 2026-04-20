@@ -40,6 +40,7 @@ extern "C" {
 #[wasm_bindgen(inline_js = "\
     export function install_pipeline_stubs() {\n\
       globalThis.verus_diagnostic = () => {};\n\
+      globalThis.verus_diagnostic_json = () => {};\n\
       globalThis.verus_dump = () => {};\n\
       globalThis.verus_bench = (label, ms) => {\n\
         process.stderr.write(`[stage] ${label}=${ms.toFixed(0)}ms\\n`);\n\

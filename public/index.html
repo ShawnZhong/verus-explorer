@@ -175,10 +175,6 @@
         { file: 'recursion.rs', label: 'Recursive spec fn' },
         { file: 'struct_invariant.rs', label: 'Struct + ghost binding' },
       ]},
-      { group: 'Test (expected failures)', items: [
-        { file: 'failure.rs', label: 'assert(false)' },
-        { file: 'precondition_fail.rs', label: 'Precondition violation' },
-      ]},
     ];
     const EXAMPLES = EXAMPLE_GROUPS.flatMap(g => g.items);
     for (const { group, items } of EXAMPLE_GROUPS) {
@@ -251,6 +247,13 @@
     const sectionCache = new Map();
     let verdictCache = null;
     const diagnosticCache = [];
+    // Structured mirror of `diagnosticCache`, populated from the wasm
+    // `verus_diagnostic_json` callback. Each entry is the parsed output of
+    // rustc's JsonEmitter (one object per diagnostic, with `spans[]`
+    // carrying `byte_start`/`byte_end` + `line_start`/`column_start` etc.).
+    // Used by `buildInlineDiagnostics` to drive CM6 squiggle ranges with
+    // rustc-exact widths instead of "column → end-of-line".
+    const diagnosticJsonCache = [];
     // Which IR the output view currently shows; preserved across runParse
     // calls so the user doesn't lose their tab selection on every edit.
     // Null until the first successful parse; `renderTabs` picks a default.
@@ -680,21 +683,51 @@
     };
 
     // Build CM6 `Diagnostic` objects (the @codemirror/lint shape) from the
-    // rustc diagnostic strings — one per message with a known line:col.
+    // structured JsonEmitter payloads — one per primary span, with
+    // rustc-exact widths and level. Falls back to the text-only cache when
+    // no JSON arrived (e.g., a message routed through a non-rustc path).
     // Yields the hover tooltip + squiggle underline in the editor, in sync
     // with the line-bg wash `updateErrorDecorations` applies.
     const buildInlineDiagnostics = () => {
       const doc = view.state.doc;
       const diags = [];
-      for (const msg of diagnosticCache) {
-        const loc = extractLoc(msg);
-        if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
-        const lineInfo = doc.line(loc.line);
-        // rustc emits `--> file:L:C` with a 1-based column; CM6 document
-        // offsets are 0-based, so subtract one to line the squiggle up
-        // under the character rustc's ^^^^^ caret points at.
-        const from = Math.min(lineInfo.from + Math.max(0, loc.col - 1), lineInfo.to);
-        diags.push({ from, to: lineInfo.to, severity: severity(msg), message: msg });
+      // The wasm side feeds a single `input.rs` through `Input::Str`, so
+      // every span's `file_name` is that virtual path. Use `line_start` +
+      // `column_start` to map into the CM6 doc: JS strings are UTF-16 and
+      // rustc's `column_start` is a 1-based character offset, so walking
+      // from the line start by `column_start - 1` characters lines the
+      // squiggle up on the exact grapheme rustc caret'd. (Using byte
+      // offsets directly would desync on any non-ASCII source byte.)
+      const toOffset = (line, col) => {
+        if (line < 1 || line > doc.lines) return null;
+        const info = doc.line(line);
+        return Math.min(info.from + Math.max(0, col - 1), info.to);
+      };
+      for (const d of diagnosticJsonCache) {
+        const primary = d.spans?.find(s => s.is_primary) ?? d.spans?.[0];
+        if (!primary) continue;
+        const from = toOffset(primary.line_start, primary.column_start);
+        let to = toOffset(primary.line_end, primary.column_end);
+        if (from === null || to === null) continue;
+        if (to <= from) to = Math.min(from + 1, doc.length);
+        const sev = d.level === 'warning' ? 'warning'
+                 : (d.level === 'note' || d.level === 'help') ? 'note'
+                 : 'error';
+        // Tooltip prefers the rendered text (what the DIAGNOSTICS pane
+        // shows) so hover and pane stay consistent; fall back to the bare
+        // message if `rendered` is empty.
+        const message = d.rendered ?? d.message ?? '';
+        diags.push({ from, to, severity: sev, message });
+      }
+      if (diags.length === 0) {
+        // Pre-MultiEmitter fallback / non-rustc messages.
+        for (const msg of diagnosticCache) {
+          const loc = extractLoc(msg);
+          if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
+          const lineInfo = doc.line(loc.line);
+          const from = Math.min(lineInfo.from + Math.max(0, loc.col - 1), lineInfo.to);
+          diags.push({ from, to: lineInfo.to, severity: severity(msg), message: msg });
+        }
       }
       // CM6 requires diagnostics sorted by `from`.
       diags.sort((a, b) => a.from - b.from);
@@ -737,6 +770,10 @@
     // unwind and `finally`-time renderers flush what's there.
     // ------------------------------------------------------------------
     globalThis.verus_diagnostic = (msg) => { diagnosticCache.push(msg); };
+    globalThis.verus_diagnostic_json = (msg) => {
+      try { diagnosticJsonCache.push(JSON.parse(msg)); }
+      catch (e) { console.warn('verus_diagnostic_json: parse failed', e, msg); }
+    };
     globalThis.verus_dump = (section, body) => {
       if (section === 'VERDICT') verdictCache = body;
       else sectionCache.set(section, body);
@@ -753,6 +790,7 @@
       sectionCache.clear();
       verdictCache = null;
       diagnosticCache.length = 0;
+      diagnosticJsonCache.length = 0;
       z3ResponseBuffer = [];
       try {
         const tParse = performance.now();

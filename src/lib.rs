@@ -58,9 +58,13 @@ use rust_verify::expand_errors_driver::ExpandErrorsResult;
 use rust_verify::import_export::CrateWithMetadata;
 use rust_verify::spans::SpanContext;
 use rust_verify::verifier::{Reporter, Verifier};
-use rustc_errors::emitter::HumanEmitter;
+use rustc_errors::DiagInner;
+use rustc_errors::emitter::{ColorConfig, Emitter, HumanEmitter, HumanReadableErrorType};
+use rustc_errors::json::JsonEmitter;
 use rustc_errors::registry::Registry;
+use rustc_errors::translation::Translator;
 use rustc_errors::{AutoStream, ColorChoice};
+use rustc_span::source_map::SourceMap;
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::EarlyDiagCtxt;
@@ -91,6 +95,14 @@ extern "C" {
     // rustc's `abort_if_errors` turns into a wasm `unreachable` trap.
     #[wasm_bindgen(js_name = verus_diagnostic)]
     fn verus_diagnostic(msg: &str);
+
+    // Same survivability reasoning as `verus_diagnostic`, but carries the
+    // structured JsonEmitter output (one diagnostic per line). The JS side
+    // parses it into `byte_start`/`byte_end` + `line`/`col` spans and feeds
+    // CM6 `setDiagnostics` — gives us precise squiggle ranges and
+    // secondary-label spans without scraping the human-readable text.
+    #[wasm_bindgen(js_name = verus_diagnostic_json)]
+    fn verus_diagnostic_json(msg: &str);
 
     // Streams each completed pipeline section (AST / HIR / VIR /
     // AIR_INITIAL / AIR_MIDDLE / AIR_FINAL / SMT / VERDICT) out to the
@@ -439,11 +451,26 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps: Default::default(),
         psess_created: Some(Box::new(move |psess| {
-            let writer: Box<dyn io::Write + Send> = Box::new(DomWriter::new());
-            let dst = AutoStream::new(writer, ColorChoice::Never);
-            let emitter = HumanEmitter::new(dst, rustc_driver::default_translator())
-                .sm(Some(psess.clone_source_map()));
-            psess.dcx().set_emitter(Box::new(emitter));
+            let sm = psess.clone_source_map();
+            let translator = rustc_driver::default_translator();
+            let human_writer: Box<dyn io::Write + Send> = Box::new(DomWriter::new());
+            let human_dst = AutoStream::new(human_writer, ColorChoice::Never);
+            let human = HumanEmitter::new(human_dst, translator.clone()).sm(Some(sm.clone()));
+            let json_writer: Box<dyn io::Write + Send> = Box::new(JsonDomWriter::new());
+            // `pretty: false` → one JSON object per line, matching the
+            // `\n`-delimited contract `JsonDomWriter` relies on. `json_rendered`
+            // controls the `rendered` field's formatting; we don't consume it
+            // on the JS side but keeping `short: false` keeps the shape
+            // stable in case we want it later.
+            let json = JsonEmitter::new(
+                json_writer,
+                Some(sm),
+                translator,
+                /* pretty */ false,
+                HumanReadableErrorType { short: false, unicode: false },
+                ColorConfig::Never,
+            );
+            psess.dcx().set_emitter(Box::new(MultiEmitter { human, json }));
             // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck)
             // but the `verus!` proc-macro's `cfg_erase()` strips ghost bodies
             // unless `verus_keep_ghost_body` is also on — see
@@ -554,6 +581,75 @@ impl Drop for DomWriter {
             emit_block(&self.pending);
             self.pending.clear();
         }
+    }
+}
+
+// Sister of `DomWriter` for the JSON side. `JsonEmitter` writes one object
+// per diagnostic terminated by `\n` (see `json.rs:94`). Buffer bytes until
+// we see `\n`, then hand the complete line to `verus_diagnostic_json`.
+// Unlike the human path we don't need to coalesce multiple writer cycles
+// into one UI entry — the JSON emitter produces one line per diagnostic.
+struct JsonDomWriter {
+    pending: Vec<u8>,
+}
+
+impl JsonDomWriter {
+    fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+    fn emit_complete_lines(&mut self) {
+        while let Some(idx) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = &self.pending[..idx];
+            if !line.is_empty() {
+                verus_diagnostic_json(&String::from_utf8_lossy(line));
+            }
+            self.pending.drain(..idx + 1);
+        }
+    }
+}
+
+impl io::Write for JsonDomWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        self.emit_complete_lines();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit_complete_lines();
+        Ok(())
+    }
+}
+
+impl Drop for JsonDomWriter {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            verus_diagnostic_json(&String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
+        }
+    }
+}
+
+// Fan-out emitter: every diagnostic goes to both the HumanEmitter (text →
+// DIAGNOSTICS pane) and the JsonEmitter (structured → CM6 inline squiggles).
+// `DiagInner` is `Clone`, so we can hand each side its own copy.
+// `source_map`/`translator` both delegate to the human side because the
+// `Emitter` trait expects single references; the JSON side carries its own
+// clones internally.
+struct MultiEmitter {
+    human: HumanEmitter,
+    json: JsonEmitter,
+}
+
+impl Emitter for MultiEmitter {
+    fn emit_diagnostic(&mut self, diag: DiagInner, registry: &Registry) {
+        self.json.emit_diagnostic(diag.clone(), registry);
+        self.human.emit_diagnostic(diag, registry);
+    }
+    fn source_map(&self) -> Option<&SourceMap> {
+        self.human.source_map()
+    }
+    fn translator(&self) -> &Translator {
+        self.human.translator()
     }
 }
 
