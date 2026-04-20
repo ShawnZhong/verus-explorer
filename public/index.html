@@ -665,8 +665,13 @@
     // no JSON arrived (e.g., a message routed through a non-rustc path).
     // Yields the hover tooltip + squiggle underline in the editor, in sync
     // with the line-bg wash `updateErrorDecorations` applies.
-    const buildInlineDiagnostics = () => {
-      const doc = view.state.doc;
+    //
+    // Pure: reads from the diagnostic caches and a given `doc`, returns a
+    // fresh array. Used both by the post-parse dispatch in `runParse` and
+    // by the `linter(...)` source below — the latter re-fires on every
+    // doc change, so returning the cached diagnostics (instead of `[]`)
+    // keeps the lint field idempotent across those auto-firings.
+    const computeInlineDiagnostics = (doc) => {
       const diags = [];
       // The wasm side feeds a single `input.rs` through `Input::Str`, so
       // every span's `file_name` is that virtual path. Use `line_start` +
@@ -708,7 +713,10 @@
       }
       // CM6 requires diagnostics sorted by `from`.
       diags.sort((a, b) => a.from - b.from);
-      view.dispatch(setDiagnostics(view.state, diags));
+      return diags;
+    };
+    const buildInlineDiagnostics = () => {
+      view.dispatch(setDiagnostics(view.state, computeInlineDiagnostics(view.state.doc)));
     };
 
     // Convert diagnostic locations into line decorations on the source
@@ -917,10 +925,13 @@
         // isn't clipped by the flex container; basicSetup's searchKeymap
         // already binds Mod-f, we just need the panel installed.
         search({ top: true }),
-        // No-op source — we push diagnostics directly via `setDiagnostics`
-        // after each parse. The extension itself is what enables CM6's
-        // hover-tooltip rendering of those diagnostics.
-        linter(() => []),
+        // Source recomputes from the current diagnostic caches so the
+        // auto-firing on every doc change (default 750ms) is idempotent
+        // instead of wiping the squiggles that `runParse` just set. The
+        // fresh squiggles after a parse still land via the direct
+        // `setDiagnostics` dispatch in `buildInlineDiagnostics` — the
+        // linter extension itself is what enables the hover tooltip.
+        linter(v => computeInlineDiagnostics(v.state.doc)),
         EditorView.updateListener.of(u => {
           if (u.docChanged) { scheduleHashSave(); scheduleAutoVerify(); }
         }),
