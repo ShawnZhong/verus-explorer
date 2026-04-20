@@ -1,15 +1,16 @@
 # verus-explorer convenience targets.
 #
 # Usage:
-#   make           # dev build into dist/ (fast, skips wasm-opt)
-#   make release   # optimized build into dist/
-#   make serve     # dev build + serve dist/ on :8000
-#   make deploy    # release build + push dist/ to origin/gh-pages
-#   make test      # run headless-browser wasm-bindgen tests (needs chrome/chromedriver)
-#   make host-rust # build patched stage1 rustc → target/host-rust/ (slow, ~10min; rare)
-#   make host-verus# build host rust_verify driver → target/host-verus/release/
-#   make clean     # remove cargo + wasm-z3 (keeps host-rust + host-verus)
-#   make distclean # also remove host-rust + host-verus (full nuke)
+#   make            # dev build into dist/ (fast, skips wasm-opt)
+#   make release    # optimized build into dist/
+#   make serve      # dev build + serve dist/ on :8000
+#   make deploy     # release build + push dist/ to origin/gh-pages
+#   make test       # run headless-browser wasm-bindgen tests (needs chrome/chromedriver)
+#   make host-rust  # build patched stage1 rustc → target/host-rust/ (slow, ~10min; rare)
+#   make host-verus # build host rust_verify driver → target/host-verus/release/
+#   make clean      # remove cargo + wasm-libs + wasm-z3 (keeps host-rust + host-verus)
+#   make clean-host # remove host-rust + host-verus (slow to rebuild; use sparingly)
+#   make clean-dist # remove dist/ (detaches the gh-pages worktree)
 #
 # Build artifact layout (all under target/):
 #   target/cargo/      cargo workspace (debug, release, wasm32-unknown-unknown)
@@ -17,14 +18,10 @@
 #   target/host-verus/ rust_verify + verus macro crates (host build)
 #   target/wasm-z3/    z3.{js,wasm} for the in-browser SMT runtime
 
-.PHONY: dev release serve deploy test host-rust host-verus clean distclean
+.PHONY: dev release serve deploy test host-rust host-verus clean clean-host clean-dist
 
 DIST  := dist
 WASM_Z3 := target/wasm-z3
-# wasm-pack's staging directory, kept separate from $(DIST) so its post-build
-# wasm-opt pass only sees our own bundle — otherwise it chokes on
-# $(DIST)/z3.wasm, which uses the WebAssembly exception-handling proposal.
-PKG   := $(DIST)/pkg
 
 # Patched rustc staged at target/host-rust/ by build-host-rust.sh. Injected
 # into every cargo/wasm-pack invocation here (and the build scripts do the
@@ -39,10 +36,20 @@ export RUSTC := $(CURDIR)/target/host-rust/bin/rustc
 # `target/cargo/wasm32-unknown-unknown/<profile>/deps` — where the explorer's
 # `extern crate rustc_*;` lookups resolve them via the `-L dependency=...`
 # rustflag in `.cargo/config.toml`.
-dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm host-verus
-	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
-	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
-	rm -rf $(PKG)
+#
+# wasm-pack's post-build wasm-opt pass runs on every `*.wasm` in its
+# `--out-dir`, so we tuck z3.{js,wasm} into `$(DIST)/z3/` to keep them out
+# of sight — otherwise wasm-opt chokes on z3.wasm's exception-handling
+# tags. Emscripten's MODULARIZE glue resolves z3.wasm relative to z3.js's
+# own `document.currentScript?.src`, so the subfolder move is transparent
+# as long as `public/index.html` loads `./z3/z3.js`.
+dev release: $(DIST)/index.html $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm host-verus
+	wasm-pack build --$@ --target web --out-dir $(DIST) --no-typescript
+	# wasm-pack always drops a bundler-flavored `package.json` + `.gitignore`
+	# next to the wasm/js (for `npm publish`). We're shipping static files
+	# to GitHub Pages, so both are noise — remove them so `dist/` stays a
+	# clean browser-servable tree.
+	rm -f $(DIST)/package.json $(DIST)/.gitignore
 	# Copy the wasm-libs bundle `build.rs` emitted: the pre-gzipped rmetas
 	# + vstd.vir. The browser fetches `${name}.gz` from here and
 	# decompresses via `DecompressionStream('gzip')` before handing the
@@ -67,7 +74,8 @@ host-rust:
 host-verus:
 	./scripts/build-host-verus.sh
 
-$(DIST)/z3.%: $(WASM_Z3)/z3.% | $(DIST)
+$(DIST)/z3/z3.%: $(WASM_Z3)/z3.% | $(DIST)
+	mkdir -p $(DIST)/z3
 	cp $< $@
 $(DIST)/index.html: public/index.html | $(DIST)
 	cp $< $@
@@ -111,9 +119,23 @@ deploy: release
 
 # Spare host-rust (~10 min stage1 rebuild) and host-verus (~2 min cargo
 # build of rust_verify) — both are stable across normal wasm iteration.
-# Use `make distclean` for a full nuke.
+# `clean-host` / `clean-dist` are opt-in for their specific nukes.
 clean:
 	rm -rf target/cargo target/wasm-libs $(WASM_Z3)
 
-distclean: clean
+clean-host:
 	rm -rf target/host-rust target/host-verus
+
+# `dist/` is a git worktree on the gh-pages branch (see the `$(DIST):`
+# recipe above), so detach via `git worktree remove` rather than a raw
+# `rm -rf`, which would leak the worktree reference in `.git/worktrees/`.
+# Also delete the local `gh-pages` branch — otherwise the next
+# `make dev`/`release` fails at `git worktree add --orphan -b gh-pages`
+# with "a branch named 'gh-pages' already exists". `deploy` force-pushes
+# an orphan branch anyway, so nothing of value lives on the local branch.
+# Leading `-` on each line so make keeps going if the worktree or branch
+# doesn't exist yet.
+clean-dist:
+	-git worktree remove --force $(DIST)
+	-git branch -D gh-pages
+	rm -rf $(DIST)

@@ -209,8 +209,11 @@ fn main() {
     <div id="parse-out" class="query"></div>
   </section>
 
-  <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config). -->
-  <script src="./z3.js"></script>
+  <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config).
+       Lives under ./z3/ so wasm-pack's post-build wasm-opt pass (which
+       scans every top-level *.wasm in its --out-dir) doesn't try to
+       re-optimize z3.wasm and abort on its exception-handling tags. -->
+  <script src="./z3/z3.js"></script>
 
   <script type="module">
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`

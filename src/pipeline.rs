@@ -14,7 +14,7 @@ use air::context::{Context, SmtSolver, ValidityResult};
 use air::messages::{Diagnostics, MessageLevel};
 use rust_verify::buckets::Bucket;
 use rust_verify::cargo_verus_dep_tracker::DepTracker;
-use rust_verify::commands::{OpGenerator, OpKind};
+use rust_verify::commands::{OpGenerator, OpKind, QueryOp, Style};
 use rust_verify::config::ArgsX;
 use rust_verify::import_export::CrateWithMetadata;
 use rust_verify::spans::SpanContext;
@@ -167,8 +167,13 @@ fn build_vir<'tcx>(
     // fetched wasm-libs bundle (`crate::wasm_libs::vstd_vir()`) and passed
     // straight in as `other_vir_crates` — `args.import` is path-based and
     // doesn't work on wasm32, so we bypass the filesystem loader.
+    // Only non-default override: skip the Polonius-based lifetime check
+    // (wasm has no std::thread, and the lifetime pass isn't wasm-friendly).
+    // All other knobs — `no_external_by_default`, `no_auto_recommends_check`,
+    // etc. — stay at `ArgsX::new()` defaults, matching `cargo verify`. That
+    // turns on auto-recommends-on-failure (the `retry_with_recommends` call
+    // in `run_queries` below fires without further flag-wrangling).
     args.no_lifetime = true;
-    args.no_external_by_default = true;
     let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
     let CrateWithMetadata { krate: vstd_krate, .. } =
         bincode::deserialize(crate::wasm_libs::vstd_vir())
@@ -359,8 +364,13 @@ fn verify_simplified_krate<'tcx>(
         arch_word_bits: krate.arch.word_bits,
     };
     let mut output = VerifyOutput::default();
-    verus_bench("verify.module_count", krate.modules.len() as f64);
-    for module in &krate.modules {
+    // After `build_vir_crate` merges vstd into the local krate, `krate.modules`
+    // is ~155 entries; of those only the user's modules need verification.
+    // Verus itself filters via `current_crate_modules` (captured before the
+    // merge in `rust_verify/src/verifier.rs:2861`). `PathX.krate` is None for
+    // local modules and Some(crate_name) for externs — the same distinction,
+    // derivable post-merge so we don't have to rework `build_vir`.
+    for module in krate.modules.iter().filter(|m| m.x.path.krate.is_none()) {
         global_ctx = time("verify.module", || {
             verify_module(&mctx, module.x.path.clone(), global_ctx, &mut output, stages)
         })?;
@@ -496,10 +506,16 @@ fn run_queries(
                 .as_ref()
                 .map(|f| fun_as_friendly_rust_name(&f.x.name))
                 .unwrap_or_default();
+            // Tracked across the (possibly multiple) `CheckValid` commands in
+            // this one op so that on a failed proof/spec body we can enqueue
+            // the recommends-retry ops. Matches Verus' verifier.rs:1829-1879.
+            let mut any_invalid = false;
+            let mut retry_kind: Option<QueryOp> = None;
             match &op.kind {
                 OpKind::Context(_, commands) => feeder.feed_all(commands),
                 OpKind::Query { commands_with_context_list, query_op, .. } => {
                     let kind = format!("{:?}", query_op);
+                    retry_kind = Some(*query_op);
                     for cmds in commands_with_context_list.iter() {
                         for cmd in cmds.commands.iter() {
                             let result = feeder.feed(cmd);
@@ -512,6 +528,10 @@ fn run_queries(
                                 if let ValidityResult::Invalid(_, Some(err), _) = &result {
                                     feeder.reporter.report_as(err, MessageLevel::Error);
                                 }
+                                let proved = matches!(result, ValidityResult::Valid(_));
+                                if !proved {
+                                    any_invalid = true;
+                                }
                                 verdicts.push(Verdict::from_result(
                                     &result,
                                     func_name.clone(),
@@ -521,6 +541,21 @@ fn run_queries(
                             }
                         }
                     }
+                }
+            }
+            // Auto-recommends: on a failed Normal body or spec-termination
+            // query, enqueue recommends-retry ops. Mirrors the trigger in
+            // Verus' `verifier.rs:1829-1879`. `check_recommends` attribute on
+            // the function is another trigger in Verus, but reading it
+            // requires digging into the function's attrs — auto-on-error
+            // covers the common case. Only fires on failure, so no cost for
+            // passing proofs.
+            if any_invalid {
+                if matches!(
+                    retry_kind,
+                    Some(QueryOp::Body(Style::Normal)) | Some(QueryOp::SpecTermination)
+                ) {
+                    function_opgen.retry_with_recommends(&op, /* from_error */ true)?;
                 }
             }
         }
