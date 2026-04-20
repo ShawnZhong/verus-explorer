@@ -23,6 +23,12 @@
 DIST  := dist
 WASM_Z3 := target/wasm-z3
 
+# `public/` holds only browser-servable files — HTML, CSS, examples. The
+# whole tree copies into `dist/` verbatim (the `$(DIST)/public.stamp`
+# recipe). JS tooling (esbuild entry + npm manifest + node_modules) lives
+# in `editor/` so it doesn't need to be hand-excluded from that copy.
+PUBLIC_FILES := $(shell find public -type f)
+
 # Patched rustc staged at target/host-rust/ by build-host-rust.sh. Injected
 # into every cargo/wasm-pack invocation here (and the build scripts do the
 # same) so cargo uses our rustc without needing rustup-toolchain-link or
@@ -43,7 +49,7 @@ export RUSTC := $(CURDIR)/target/host-rust/bin/rustc
 # tags. Emscripten's MODULARIZE glue resolves z3.wasm relative to z3.js's
 # own `document.currentScript?.src`, so the subfolder move is transparent
 # as long as `public/index.html` loads `./z3/z3.js`.
-dev release: $(DIST)/index.html $(DIST)/editor.js $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm host-verus
+dev release: $(DIST)/public.stamp $(DIST)/editor.js $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm host-verus
 	wasm-pack build --$@ --target web --out-dir $(DIST) --no-typescript
 	# wasm-pack always drops a bundler-flavored `package.json` + `.gitignore`
 	# next to the wasm/js (for `npm publish`). We're shipping static files
@@ -77,17 +83,18 @@ host-verus:
 $(DIST)/z3/z3.%: $(WASM_Z3)/z3.% | $(DIST)
 	mkdir -p $(DIST)/z3
 	cp $< $@
-$(DIST)/index.html: public/index.html | $(DIST)
-	cp $< $@
+$(DIST)/public.stamp: $(PUBLIC_FILES) | $(DIST)
+	cp -R public/. $(DIST)/
+	@touch $@
 
 # Bundle CodeMirror 6 straight into `$(DIST)/editor.js` via esbuild. The
-# entry point `public/editor-src.js` re-exports every CM6 symbol that
+# entry point `editor/editor-src.js` re-exports every CM6 symbol that
 # `public/index.html` imports; esbuild resolves the bare specifiers against
-# `node_modules/` (CWD is the repo root) and emits one minified ESM bundle
-# with all of CM6's transitive deps (~470KB) inlined. `node_modules/.stamp`
+# `editor/node_modules/` and emits one minified ESM bundle with all of
+# CM6's transitive deps (~470KB) inlined. `editor/node_modules/.stamp`
 # forces `npm install` on first build.
-$(DIST)/editor.js: public/editor-src.js node_modules/.stamp | $(DIST)
-	npx esbuild $< --bundle --format=esm --outfile=$@ --minify --target=es2022
+$(DIST)/editor.js: editor/editor-src.js editor/node_modules/.stamp | $(DIST)
+	editor/node_modules/.bin/esbuild $< --bundle --format=esm --outfile=$@ --minify --target=es2022
 
 $(DIST):
 	git worktree add --orphan -b gh-pages $(DIST)
@@ -95,12 +102,12 @@ $(DIST):
 $(WASM_Z3)/z3.js $(WASM_Z3)/z3.wasm &: scripts/build-z3.sh
 	./scripts/build-z3.sh
 
-# `npm install` gate. `node_modules/.stamp` is the Make witness so the
-# install only reruns when `package.json` bumps. `npm ci` would be stricter
-# (fails on lockfile drift) but `npm install` tolerates a missing lockfile
-# on fresh clones and refreshes it when deps bump.
-node_modules/.stamp: package.json
-	npm install --no-audit --no-fund
+# `npm install` gate. `editor/node_modules/.stamp` is the Make witness so
+# the install only reruns when `editor/package.json` bumps. `npm ci` would
+# be stricter (fails on lockfile drift) but `npm install` tolerates a
+# missing lockfile on fresh clones and refreshes it when deps bump.
+editor/node_modules/.stamp: editor/package.json
+	npm install --prefix editor --no-audit --no-fund
 	@touch $@
 
 serve:
@@ -115,14 +122,13 @@ serve:
 #
 # `wasm-bindgen-test-runner` invokes `node` via plain `Command::new("node")`
 # (pure PATH lookup — no override env var), so prepending the vendored
-# `third_party/node/bin` here pins the Node version regardless of what's in
+# `editor/node/bin` here pins the Node version regardless of what's in
 # the user's PATH. The directory is gitignored; populate it by extracting
 # an official node tarball, e.g. on Apple Silicon:
 #   curl -sL https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz \
-#     | tar xz -C third_party && mv third_party/node-v24.15.0-darwin-arm64 \
-#     third_party/node
+#     | tar xz -C editor && mv editor/node-v24.15.0-darwin-arm64 editor/node
 test: host-verus
-	PATH="$(CURDIR)/third_party/node/bin:$$PATH" wasm-pack test --node
+	PATH="$(CURDIR)/editor/node/bin:$$PATH" wasm-pack test --node
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
 # and force-pushes, so there's no history either locally or remotely.

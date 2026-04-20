@@ -4,292 +4,7 @@
 <head>
   <meta charset="utf-8" />
   <title>verus-explorer</title>
-  <style>
-    /* Single palette driven by CSS custom properties — one light set as
-       root defaults, overridden in a `prefers-color-scheme: dark` media
-       query. CM6 picks up its own `oneDark` theme via the script below,
-       so the variables here only drive the surrounding chrome. */
-    :root {
-      --bg: #fff;
-      --fg: #111;
-      --muted: #666;
-      --subtle: #888;
-      --pre-bg: #f5f5f5;
-      --border: #ddd;
-      --border-soft: #e5e5e5;
-      --ok-fg: #087a3c;
-      --ok-bg: #ecfdf3;
-      --ok-border: #abefc6;
-      --bad-fg: #b42318;
-      --bad-bg: #fdf2f2;
-      --bad-border: #f5c2c0;
-      --diag-bg: #fdf2f2;
-      --diag-border: #b42318;
-      --warn-bg: #fffaf0;
-      --warn-border: #d4a017;
-      --focus-ring: #4a9eff;
-      --pill-bg: #f0f0f0;
-      --pill-pending: #999;
-      --pill-done-bg: #e3f7ec;
-      --pill-done-fg: #087a3c;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #1a1a1a;
-        --fg: #e0e0e0;
-        --muted: #999;
-        --subtle: #777;
-        --pre-bg: #242424;
-        --border: #333;
-        --border-soft: #2a2a2a;
-        --ok-fg: #3fb371;
-        --ok-bg: #10291c;
-        --ok-border: #2d5e3f;
-        --bad-fg: #e07b75;
-        --bad-bg: #2a1010;
-        --bad-border: #5a2f2d;
-        --diag-bg: #2a1010;
-        --diag-border: #e07b75;
-        --warn-bg: #2a2310;
-        --warn-border: #d4a017;
-        --focus-ring: #6fb2ff;
-        --pill-bg: #2a2a2a;
-        --pill-pending: #666;
-        --pill-done-bg: #10291c;
-        --pill-done-fg: #3fb371;
-      }
-    }
-
-    html, body {
-      background: var(--bg);
-      color: var(--fg);
-    }
-    body {
-      font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace;
-      max-width: 1200px;
-      margin: 1.5rem auto;
-      padding: 0 1rem;
-    }
-
-    h1 {
-      font-size: 1.25rem;
-      margin: 0 0 .4em;
-    }
-    h1 a {
-      color: inherit;
-      text-decoration: none;
-    }
-    h1 a:hover {
-      text-decoration: underline;
-    }
-
-    header p {
-      margin: 0 0 1rem;
-    }
-
-    button {
-      font: inherit;
-      padding: .4em 1em;
-      cursor: pointer;
-      background: var(--bg);
-      color: var(--fg);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-    }
-    button:hover:not(:disabled) { border-color: var(--focus-ring); }
-    button:disabled { cursor: not-allowed; opacity: .6; }
-
-    select {
-      font: inherit;
-      padding: .2em .4em;
-      background: var(--bg);
-      color: var(--fg);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-    }
-
-    .muted { color: var(--muted); }
-
-    pre {
-      background: var(--pre-bg);
-      color: var(--fg);
-      padding: .6em .8em;
-      border-radius: 6px;
-      overflow-x: auto;
-      white-space: pre-wrap;
-      margin: .2em 0;
-      font-size: .85em;
-    }
-
-    /* Split-pane workbench: editor on the left, output on the right.
-       Each pane is a flex column that owns its own scroll; `min-height: 0`
-       on the grid children is what lets the inner `overflow: auto` track
-       work instead of the pane ballooning to fit content. Collapses to a
-       single column under ~900px. */
-    #workbench {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 1rem;
-      height: calc(100vh - 9rem);
-      min-height: 420px;
-    }
-    .pane {
-      display: flex;
-      flex-direction: column;
-      min-height: 0;
-    }
-    .pane-header {
-      display: flex;
-      align-items: center;
-      gap: .5em;
-      margin-bottom: .4em;
-      flex-wrap: wrap;
-    }
-    #parse-input {
-      flex: 1;
-      min-height: 0;
-      display: flex;
-    }
-    #parse-input .cm-editor {
-      flex: 1;
-      min-height: 0;
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      font-size: 13px;
-    }
-    #parse-input .cm-editor.cm-focused {
-      outline: 2px solid var(--focus-ring);
-      outline-offset: -2px;
-    }
-    #parse-input .cm-scroller {
-      font-family: ui-monospace, Menlo, Consolas, monospace;
-    }
-    #parse-output-view {
-      flex: 1;
-      min-height: 0;
-      display: flex;
-    }
-    #parse-output-view .cm-editor {
-      flex: 1;
-      min-height: 0;
-      border: 1px solid var(--border);
-      border-radius: 0 6px 6px 6px;
-      font-size: 13px;
-    }
-    #parse-output-view .cm-scroller {
-      font-family: ui-monospace, Menlo, Consolas, monospace;
-    }
-    /* Source-editor decorations for diagnostics flagged by the loc
-       extractor. Errors get a red wash, warnings a softer yellow — same
-       severity palette as the diagnostic panes below the editor. */
-    .cm-error-line { background-color: var(--bad-bg); }
-    .cm-warning-line { background-color: var(--warn-bg); }
-    @media (max-width: 900px) {
-      #workbench {
-        grid-template-columns: minmax(0, 1fr);
-        height: auto;
-        min-height: 0;
-      }
-      .pane { overflow: visible; }
-      #parse-input .cm-editor { min-height: 14em; }
-      #parse-output-view { min-height: 20em; }
-    }
-
-    .controls {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: .5em 1em;
-      margin-top: .5em;
-    }
-    .hint {
-      font-size: .8em;
-    }
-    kbd {
-      font: inherit;
-      font-size: .85em;
-      background: var(--pre-bg);
-      border: 1px solid var(--border);
-      border-radius: 3px;
-      padding: 0 .3em;
-    }
-    /* In-button shortcut hint. Inherits the button's disabled opacity so it
-       dims along with the label while cold-loading / mid-run. */
-    #parse-run {
-      display: inline-flex;
-      align-items: center;
-      gap: .5em;
-    }
-    .shortcut {
-      font-size: .75em;
-      opacity: .7;
-      padding: 0 .25em;
-    }
-
-    /* Tab strip selecting which IR stage shows in the output CM6 view
-       below. Tabs are disabled until the matching section lands in
-       `sectionCache`; the active tab sits flush with its CM6 body so the
-       border reads as one continuous surface. */
-    .output-tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: .2em;
-      border-bottom: 1px solid var(--border);
-      margin-bottom: 0;
-    }
-    .tab {
-      background: none;
-      border: 1px solid transparent;
-      border-bottom: none;
-      color: var(--muted);
-      font: inherit;
-      font-size: .8em;
-      padding: .3em .7em;
-      cursor: pointer;
-      border-radius: 4px 4px 0 0;
-    }
-    .tab:hover:not(:disabled) { color: var(--fg); }
-    .tab.active {
-      background: var(--pre-bg);
-      color: var(--fg);
-      border-color: var(--border);
-      margin-bottom: -1px;
-    }
-    .tab:disabled { opacity: .4; cursor: not-allowed; }
-
-    /* Verdict + diagnostics live under the source editor in the left
-       pane. Capped height with internal scroll so a long rustc dump
-       doesn't squeeze the editor; collapses to zero when no run has
-       produced a verdict yet (so the source fills the whole pane). */
-    #parse-meta {
-      max-height: 10em;
-      overflow-y: auto;
-    }
-    #parse-meta:not(:empty) { margin-top: .6em; }
-
-    .verdict {
-      padding: .5em .8em;
-      border-radius: 6px;
-      margin-bottom: .4em;
-    }
-    .verdict.ok {
-      background: var(--ok-bg);
-      border: 1px solid var(--ok-border);
-    }
-    .verdict.bad {
-      background: var(--bad-bg);
-      border: 1px solid var(--bad-border);
-    }
-    .verdict-status { font-size: 1rem; font-weight: bold; }
-    .verdict-status.ok { color: var(--ok-fg); }
-    .verdict-status.bad { color: var(--bad-fg); }
-    .verdict-detail {
-      font-size: .82em;
-      margin-top: .3em;
-      color: var(--muted);
-      white-space: pre-wrap;
-    }
-  </style>
+  <link rel="stylesheet" href="./styles.css" />
 </head>
 
 <body>
@@ -306,9 +21,6 @@
           Example:
           <select id="example-select">
             <option value="">— load —</option>
-            <option value="sequence">Sequence (passes)</option>
-            <option value="failure">Assertion failure</option>
-            <option value="arith">Arithmetic proof</option>
           </select>
         </label>
       </div>
@@ -334,66 +46,6 @@
     </section>
   </main>
 
-  <!-- Example payloads. Not rendered; read by JS on dropdown change. The
-       `sequence` one doubles as the default first-load content when there's
-       no URL hash to hydrate from. Kept as `<script type="text/plain">` so
-       the source stays human-readable in the HTML. -->
-  <script id="example-sequence" type="text/plain">use vstd::prelude::*;
-
-verus! {
-
-// Seq<int> is vstd's specification-level sequence. The verifier knows
-// the semantics of empty / push / len / indexing, so every `assert`
-// below is discharged automatically via the SMT encoding.
-fn main() {
-    proof {
-        let s: Seq<int> = Seq::empty().push(1).push(2).push(3);
-        assert(s.len() == 3);
-        assert(s[0] == 1);
-        assert(s[1] == 2);
-        assert(s[2] == 3);
-        assert(s.push(4).len() == 4);
-        assert(s.push(4)[3] == 4);
-        assert(forall|i: int| 0 <= i < s.len() ==> s.push(4)[i] == s[i]);
-    }
-}
-
-} // verus!
-</script>
-  <script id="example-failure" type="text/plain">use vstd::prelude::*;
-
-// Deliberate verification failure: the assertion is unconditionally
-// false, so Z3 returns `sat` and the pipeline emits a failed query.
-// Useful for seeing what the diagnostic + VERDICT paths look like.
-verus! {
-
-fn main() {
-    proof {
-        assert(false);
-    }
-}
-
-} // verus!
-</script>
-  <script id="example-arith" type="text/plain">use vstd::prelude::*;
-
-// Specification-level integer arithmetic (`int`, not `i32`). Outside of
-// spec context the literals would infer as `i32` and trip E0308.
-verus! {
-
-fn main() {
-    proof {
-        let x: int = 10;
-        assert(x * x == 100);
-        assert(x + x == 20);
-        assert(x * (x - 1) == 90);
-        assert(forall|k: int| k > 0 ==> k * x > 0);
-    }
-}
-
-} // verus!
-</script>
-
   <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config).
        Lives under ./z3/ so wasm-pack's post-build wasm-opt pass (which
        scans every top-level *.wasm in its --out-dir) doesn't try to
@@ -403,11 +55,12 @@ fn main() {
   <script type="module">
     // CodeMirror 6 bundle, built by `make dev` (see the `$(DIST)/editor.js`
     // Makefile target). All CM6 imports flow through this one file; the
-    // export list lives in `public/editor-src.js`.
+    // export list lives in `editor/editor-src.js`.
     import {
       EditorView, basicSetup, keymap, indentWithTab, rust, oneDark,
       Decoration, StateField, StateEffect, EditorState,
       linter, setDiagnostics,
+      search,
     } from './editor.js';
 
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
@@ -502,6 +155,28 @@ fn main() {
     const exampleSelect = document.getElementById('example-select');
     const autoVerifyCheckbox = document.getElementById('auto-verify');
     const expandErrorsCheckbox = document.getElementById('expand-errors');
+
+    // Example manifest: each entry drives one `<option>` in the dropdown,
+    // and the `file` field names a source file under `public/examples/`
+    // (copied to `dist/examples/` by the Makefile). Add an entry here to
+    // add a new example — no other wiring needed. The first entry also
+    // doubles as the cold-load default when no URL hash is present.
+    const EXAMPLES = [
+      { file: 'sequence.rs', label: 'Sequence (passes)' },
+      { file: 'failure.rs', label: 'Assertion failure' },
+      { file: 'arith.rs', label: 'Arithmetic proof' },
+      { file: 'requires_ensures.rs', label: 'Requires / ensures' },
+      { file: 'loop.rs', label: 'Loop invariant' },
+      { file: 'recursion.rs', label: 'Recursive spec fn' },
+      { file: 'struct_invariant.rs', label: 'Struct + nonlinear hint' },
+    ];
+    for (const { file, label } of EXAMPLES) {
+      const opt = document.createElement('option');
+      opt.value = file;
+      opt.textContent = label;
+      exampleSelect.appendChild(opt);
+    }
+    const fetchExample = (file) => fetch(`./examples/${file}`).then(r => r.text());
     const SECTION_ORDER = [
       'AST', 'HIR', 'VIR', 'SST_AST', 'SST_POLY',
       'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT', 'Z3',
@@ -580,30 +255,65 @@ fn main() {
       return m ? { line: parseInt(m[1], 10), col: parseInt(m[2], 10) } : null;
     };
 
-    // Diagnostic text is surfaced inline via the CM6 lint extension
-    // (squiggles + hover tooltips) — see `buildInlineDiagnostics`. This
-    // panel only hosts the high-level verdict (verified / N queries failed).
+    // Jump the source editor to the span a diagnostic points at and flash
+    // the line so the eye catches the move. Caller is responsible for
+    // passing a (line, col) pair that's already bounds-checked against the
+    // current doc.
+    const jumpToLoc = (loc) => {
+      const doc = view.state.doc;
+      if (loc.line < 1 || loc.line > doc.lines) return;
+      const lineInfo = doc.line(loc.line);
+      const pos = Math.min(lineInfo.from + Math.max(0, loc.col - 1), lineInfo.to);
+      view.dispatch({
+        selection: { anchor: pos },
+        effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+      });
+      view.focus();
+      // Temporary line-background flash so the user sees *which* line the
+      // list item jumped to even when the cursor is off-screen. Reuses the
+      // errorLineField StateField by overlaying a short-lived decoration
+      // then clearing back to the post-parse set after a beat.
+      const flash = Decoration.line({ attributes: { class: 'cm-diag-flash' } }).range(lineInfo.from);
+      view.dispatch({ effects: setErrorLines.of([flash]) });
+      setTimeout(() => updateErrorDecorations(), 600);
+    };
+
+    // Under the verdict we list each diagnostic as its own block. Messages
+    // whose line:col we can parse become clickable — click jumps the source
+    // editor to that span and opens the matching inline-lint tooltip,
+    // giving the bottom list and the in-editor squiggle a shared hand-off
+    // point (useful for expand-errors notes that span many lines).
     const renderMeta = () => {
       parseMeta.textContent = '';
-      if (verdictCache === null) return;
-      // First line is the headline ("verified" / "N/M queries failed" /
-      // "no queries"); rest is per-query detail.
-      const [headline, ...rest] = verdictCache.split('\n');
-      const isOk = headline === 'verified';
-      const div = document.createElement('div');
-      div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
-      const status = document.createElement('div');
-      status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
-      status.textContent = isOk ? '✓ verified' : `✗ ${headline}`;
-      div.appendChild(status);
-      const detail = rest.join('\n').trim();
-      if (detail) {
-        const d = document.createElement('div');
-        d.className = 'verdict-detail';
-        d.textContent = detail;
-        div.appendChild(d);
+      if (verdictCache !== null) {
+        const [headline, ...rest] = verdictCache.split('\n');
+        const isOk = headline === 'verified';
+        const div = document.createElement('div');
+        div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
+        const status = document.createElement('div');
+        status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
+        status.textContent = isOk ? '✓ verified' : `✗ ${headline}`;
+        div.appendChild(status);
+        const detail = rest.join('\n').trim();
+        if (detail) {
+          const d = document.createElement('div');
+          d.className = 'verdict-detail';
+          d.textContent = detail;
+          div.appendChild(d);
+        }
+        parseMeta.appendChild(div);
       }
-      parseMeta.appendChild(div);
+      for (const msg of diagnosticCache) {
+        const pre = document.createElement('pre');
+        pre.className = `diagnostic ${severity(msg)}`;
+        pre.textContent = msg;
+        const loc = extractLoc(msg);
+        if (loc && loc.line >= 1 && loc.line <= view.state.doc.lines) {
+          pre.classList.add('clickable');
+          pre.addEventListener('click', () => jumpToLoc(loc));
+        }
+        parseMeta.appendChild(pre);
+      }
     };
 
     // Tab strip. Sections not yet cached render as disabled buttons so the
@@ -649,11 +359,10 @@ fn main() {
         const loc = extractLoc(msg);
         if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
         const lineInfo = doc.line(loc.line);
-        // rustc's `--> file:L:C` already emits a 1-based char column, and
-        // CM6's lint renderer places the squiggle starting one char after
-        // `from` — so we add `loc.col` directly (no -1) to land the
-        // underline exactly under the character rustc's ^^^^^ points at.
-        const from = Math.min(lineInfo.from + Math.max(0, loc.col), lineInfo.to);
+        // rustc emits `--> file:L:C` with a 1-based column; CM6 document
+        // offsets are 0-based, so subtract one to line the squiggle up
+        // under the character rustc's ^^^^^ caret points at.
+        const from = Math.min(lineInfo.from + Math.max(0, loc.col - 1), lineInfo.to);
         diags.push({ from, to: lineInfo.to, severity: severity(msg), message: msg });
       }
       // CM6 requires diagnostics sorted by `from`.
@@ -795,7 +504,7 @@ fn main() {
         try { return await decodeSrc(hash); }
         catch (e) { console.warn('hash decode failed:', e); }
       }
-      return document.getElementById('example-sequence').textContent;
+      return fetchExample(EXAMPLES[0].file);
     })();
 
     // ------------------------------------------------------------------
@@ -840,6 +549,10 @@ fn main() {
         rust(),
         ...(dark ? [oneDark] : []),
         errorLineField,
+        // Pin the search panel to the top so Cmd+F opens it in a spot that
+        // isn't clipped by the flex container; basicSetup's searchKeymap
+        // already binds Mod-f, we just need the panel installed.
+        search({ top: true }),
         // No-op source — we push diagnostics directly via `setDiagnostics`
         // after each parse. The extension itself is what enables CM6's
         // hover-tooltip rendering of those diagnostics.
@@ -864,6 +577,7 @@ fn main() {
       doc: '',
       extensions: [
         basicSetup,
+        search({ top: true }),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         ...(dark ? [oneDark] : []),
@@ -879,10 +593,10 @@ fn main() {
     // ------------------------------------------------------------------
     // Wiring: example dropdown + Verify button.
     // ------------------------------------------------------------------
-    exampleSelect.addEventListener('change', () => {
+    exampleSelect.addEventListener('change', async () => {
       const val = exampleSelect.value;
       if (!val) return;
-      const src = document.getElementById(`example-${val}`).textContent;
+      const src = await fetchExample(val);
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
       runParse();
     });

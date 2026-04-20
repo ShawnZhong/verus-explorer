@@ -1,0 +1,317 @@
+/* Single palette driven by CSS custom properties — one light set as
+   root defaults, overridden in a `prefers-color-scheme: dark` media
+   query. CM6 picks up its own `oneDark` theme via the script below,
+   so the variables here only drive the surrounding chrome. */
+:root {
+  --bg: #fff;
+  --fg: #111;
+  --muted: #666;
+  --subtle: #888;
+  --pre-bg: #f5f5f5;
+  --border: #ddd;
+  --border-soft: #e5e5e5;
+  --ok-fg: #087a3c;
+  --ok-bg: #ecfdf3;
+  --ok-border: #abefc6;
+  --bad-fg: #b42318;
+  --bad-bg: #fdf2f2;
+  --bad-border: #f5c2c0;
+  --diag-bg: #fdf2f2;
+  --diag-border: #b42318;
+  --warn-bg: #fffaf0;
+  --warn-border: #d4a017;
+  --focus-ring: #4a9eff;
+  --pill-bg: #f0f0f0;
+  --pill-pending: #999;
+  --pill-done-bg: #e3f7ec;
+  --pill-done-fg: #087a3c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a1a;
+    --fg: #e0e0e0;
+    --muted: #999;
+    --subtle: #777;
+    --pre-bg: #242424;
+    --border: #333;
+    --border-soft: #2a2a2a;
+    --ok-fg: #3fb371;
+    --ok-bg: #10291c;
+    --ok-border: #2d5e3f;
+    --bad-fg: #e07b75;
+    --bad-bg: #2a1010;
+    --bad-border: #5a2f2d;
+    --diag-bg: #2a1010;
+    --diag-border: #e07b75;
+    --warn-bg: #2a2310;
+    --warn-border: #d4a017;
+    --focus-ring: #6fb2ff;
+    --pill-bg: #2a2a2a;
+    --pill-pending: #666;
+    --pill-done-bg: #10291c;
+    --pill-done-fg: #3fb371;
+  }
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--fg);
+}
+body {
+  font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  max-width: 1200px;
+  margin: 1.5rem auto;
+  padding: 0 1rem;
+}
+
+h1 {
+  font-size: 1.25rem;
+  margin: 0 0 .4em;
+}
+h1 a {
+  color: inherit;
+  text-decoration: none;
+}
+h1 a:hover {
+  text-decoration: underline;
+}
+
+header p {
+  margin: 0 0 1rem;
+}
+
+button {
+  font: inherit;
+  padding: .4em 1em;
+  cursor: pointer;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+button:hover:not(:disabled) { border-color: var(--focus-ring); }
+button:disabled { cursor: not-allowed; opacity: .6; }
+
+select {
+  font: inherit;
+  padding: .2em .4em;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.muted { color: var(--muted); }
+
+pre {
+  background: var(--pre-bg);
+  color: var(--fg);
+  padding: .6em .8em;
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  margin: .2em 0;
+  font-size: .85em;
+}
+
+/* Split-pane workbench: editor on the left, output on the right.
+   Each pane is a flex column that owns its own scroll; `min-height: 0`
+   on the grid children is what lets the inner `overflow: auto` track
+   work instead of the pane ballooning to fit content. Collapses to a
+   single column under ~900px. */
+#workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1rem;
+  height: calc(100vh - 9rem);
+  min-height: 420px;
+}
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: .5em;
+  margin-bottom: .4em;
+  flex-wrap: wrap;
+}
+#parse-input {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+#parse-input .cm-editor {
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+#parse-input .cm-editor.cm-focused {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+#parse-input .cm-scroller {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+#parse-output-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+#parse-output-view .cm-editor {
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 0 6px 6px 6px;
+  font-size: 13px;
+}
+#parse-output-view .cm-scroller {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+/* Source-editor decorations for diagnostics flagged by the loc
+   extractor. Errors get a red wash, warnings a softer yellow — same
+   severity palette as the diagnostic panes below the editor. */
+.cm-error-line { background-color: var(--bad-bg); }
+.cm-warning-line { background-color: var(--warn-bg); }
+@media (max-width: 900px) {
+  #workbench {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+    min-height: 0;
+  }
+  .pane { overflow: visible; }
+  #parse-input .cm-editor { min-height: 14em; }
+  #parse-output-view { min-height: 20em; }
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5em 1em;
+  margin-top: .5em;
+}
+.hint {
+  font-size: .8em;
+}
+kbd {
+  font: inherit;
+  font-size: .85em;
+  background: var(--pre-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 .3em;
+}
+/* In-button shortcut hint. Inherits the button's disabled opacity so it
+   dims along with the label while cold-loading / mid-run. */
+#parse-run {
+  display: inline-flex;
+  align-items: center;
+  gap: .5em;
+}
+.shortcut {
+  font-size: .75em;
+  opacity: .7;
+  padding: 0 .25em;
+}
+
+/* Tab strip selecting which IR stage shows in the output CM6 view
+   below. Tabs are disabled until the matching section lands in
+   `sectionCache`; the active tab sits flush with its CM6 body so the
+   border reads as one continuous surface. */
+.output-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .2em;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0;
+}
+.tab {
+  background: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: .8em;
+  padding: .3em .7em;
+  cursor: pointer;
+  border-radius: 4px 4px 0 0;
+}
+.tab:hover:not(:disabled) { color: var(--fg); }
+.tab.active {
+  background: var(--pre-bg);
+  color: var(--fg);
+  border-color: var(--border);
+  margin-bottom: -1px;
+}
+.tab:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Verdict + diagnostics live under the source editor in the left
+   pane. Capped height with internal scroll so a long rustc dump
+   doesn't squeeze the editor; collapses to zero when no run has
+   produced a verdict yet (so the source fills the whole pane). */
+#parse-meta {
+  max-height: 10em;
+  overflow-y: auto;
+}
+#parse-meta:not(:empty) { margin-top: .6em; }
+
+.verdict {
+  padding: .5em .8em;
+  border-radius: 6px;
+  margin-bottom: .4em;
+}
+.verdict.ok {
+  background: var(--ok-bg);
+  border: 1px solid var(--ok-border);
+}
+.verdict.bad {
+  background: var(--bad-bg);
+  border: 1px solid var(--bad-border);
+}
+.verdict-status { font-size: 1rem; font-weight: bold; }
+.verdict-status.ok { color: var(--ok-fg); }
+.verdict-status.bad { color: var(--bad-fg); }
+.verdict-detail {
+  font-size: .82em;
+  margin-top: .3em;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+
+/* One rustc/verus diagnostic per block, color-coded by severity. The
+   `clickable` modifier marks messages whose `file:L:C` we managed to
+   parse — those jump the source editor to the span on click and open
+   the matching inline-lint tooltip. Hover highlights both the list
+   item and the corresponding editor line so the two views stay
+   visually linked. */
+pre.diagnostic {
+  background: var(--pre-bg);
+  border-left: 3px solid var(--border);
+  padding: .4em .6em;
+  border-radius: 0 6px 6px 0;
+  margin: .3em 0;
+  font-size: .82em;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+pre.diagnostic.error {
+  background: var(--diag-bg);
+  border-left-color: var(--diag-border);
+}
+pre.diagnostic.warning {
+  background: var(--warn-bg);
+  border-left-color: var(--warn-border);
+}
+pre.diagnostic.clickable { cursor: pointer; }
+pre.diagnostic.clickable:hover { filter: brightness(0.97); }
+@media (prefers-color-scheme: dark) {
+  pre.diagnostic.clickable:hover { filter: brightness(1.3); }
+}
+/* Flash applied to the source-editor line that a clicked diagnostic
+   points at, so the eye catches the jump target. */
+.cm-diag-flash { background-color: var(--focus-ring) !important; }

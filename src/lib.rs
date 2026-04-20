@@ -485,10 +485,7 @@ impl DomWriter {
     }
     fn emit_complete_blocks(&mut self) {
         while let Some(idx) = find_block_end(&self.pending) {
-            let trimmed = &self.pending[..idx];
-            if !trimmed.is_empty() {
-                verus_diagnostic(&String::from_utf8_lossy(trimmed));
-            }
+            emit_block(&self.pending[..idx]);
             self.pending.drain(..idx + 2);
         }
     }
@@ -496,6 +493,22 @@ impl DomWriter {
 
 fn find_block_end(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
+}
+
+// Forward a completed diagnostic block to the UI, with one exception: rustc's
+// session-teardown footer `error: aborting due to N previous error[s]` is pure
+// duplication of our verdict headline (`N/M queries failed`), so drop it.
+// Emitted by `DiagCtxtInner::print_error_count` through the same HumanEmitter
+// we attached in `psess_created`, which is why it shows up here at all.
+fn emit_block(block: &[u8]) {
+    if block.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(block);
+    if text.starts_with("error: aborting due to ") {
+        return;
+    }
+    verus_diagnostic(&text);
 }
 
 impl io::Write for DomWriter {
@@ -513,7 +526,7 @@ impl io::Write for DomWriter {
 impl Drop for DomWriter {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
-            verus_diagnostic(&String::from_utf8_lossy(&self.pending));
+            emit_block(&self.pending);
             self.pending.clear();
         }
     }
@@ -1064,6 +1077,27 @@ fn run_queries(
                 OpKind::Context(_, commands) => feeder.feed_all(commands),
                 OpKind::Query { commands_with_context_list, query_op, .. } => {
                     retry_kind = Some(*query_op);
+                    // Upstream maps each QueryOp to a MessageLevel
+                    // (`verifier.rs:1558-1563`). Recommends retries emit at
+                    // Note / Warning (informational context around a real
+                    // failure), not Error. Routing them through rustc at the
+                    // right level is what makes the UI render them as muted
+                    // notes instead of blocking errors.
+                    let level = match query_op {
+                        QueryOp::SpecTermination
+                        | QueryOp::Body(Style::Normal)
+                        | QueryOp::Body(Style::Expanded)
+                        | QueryOp::Body(Style::CheckApiSafety) => MessageLevel::Error,
+                        QueryOp::Body(Style::RecommendsFollowupFromError) => MessageLevel::Note,
+                        QueryOp::Body(Style::RecommendsChecked) => MessageLevel::Warning,
+                    };
+                    // Only Error-level ops count as pass/fail queries in the
+                    // verdict list. Recommends variants are diagnostic
+                    // side-channels — if they fail, the reporter surfaces them
+                    // as notes/warnings alongside the original error; counting
+                    // them toward `N/M queries failed` would just inflate the
+                    // tally with informational output.
+                    let verdict_is_query = level == MessageLevel::Error;
                     for cmds in commands_with_context_list.iter() {
                         // Contextual advice that Verus attaches to certain
                         // proof obligations (e.g. loop-invariant hints). Upstream
@@ -1100,7 +1134,7 @@ fn run_queries(
                                 let mut is_first_check = true;
                                 loop {
                                     if let ValidityResult::Invalid(_, Some(err), _) = &result {
-                                        feeder.reporter.report_as(err, MessageLevel::Error);
+                                        feeder.reporter.report_as(err, level);
                                         // Emit the hint right after the first
                                         // failure's error so the user sees
                                         // them grouped. Matches upstream's
@@ -1129,11 +1163,22 @@ fn run_queries(
                                     if !proved {
                                         any_invalid = true;
                                     }
-                                    verdicts.push(Verdict::from_result(
-                                        &result,
-                                        func_name.clone(),
-                                        *query_op,
-                                    ));
+                                    // Push a verdict only for the first check
+                                    // of an Error-level op, or for any
+                                    // subsequent Invalid probe (more failing
+                                    // asserts in the same body). Valid probe
+                                    // responses are end-of-probe sentinels,
+                                    // not results — skipping them is what
+                                    // keeps `1/N queries failed` meaningful.
+                                    let push = verdict_is_query
+                                        && (is_first_check || !proved);
+                                    if push {
+                                        verdicts.push(Verdict::from_result(
+                                            &result,
+                                            func_name.clone(),
+                                            *query_op,
+                                        ));
+                                    }
 
                                     // `check_valid_again` panics unless the
                                     // previous result was Invalid with both
