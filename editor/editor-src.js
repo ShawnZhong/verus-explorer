@@ -6,7 +6,11 @@
 // `index.html` wants a new CM6 feature (e.g. `lineNumbers`).
 export { EditorView, basicSetup } from "codemirror";
 export { keymap, Decoration } from "@codemirror/view";
-export { StateField, StateEffect, EditorState } from "@codemirror/state";
+export { StateField, StateEffect, EditorState, Compartment } from "@codemirror/state";
+// StreamLanguage is reached transitively through `codemirror`; export it
+// so `index.html` can define a tiny inline s-expression parser for the
+// SMT-LIB / AIR output tabs without pulling in a legacy-modes package.
+export { StreamLanguage } from "@codemirror/language";
 export { indentWithTab } from "@codemirror/commands";
 export { rust } from "@codemirror/lang-rust";
 export { oneDark } from "@codemirror/theme-one-dark";

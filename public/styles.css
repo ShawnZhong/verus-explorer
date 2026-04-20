@@ -145,6 +145,7 @@ pre {
 }
 #parse-input .cm-editor {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -164,6 +165,12 @@ pre {
 }
 #parse-output-view .cm-editor {
   flex: 1;
+  /* `min-width: 0` lets the editor shrink to its grid cell instead of
+     inflating to its widest line (flex children default to
+     `min-width: auto`). Without it, one multi-kilobyte SMT-LIB line
+     pushes the whole right pane wider than the viewport; with it, CM6's
+     own `.cm-scroller` takes over horizontal overflow. */
+  min-width: 0;
   min-height: 0;
   border: 1px solid var(--border);
   border-radius: 0 6px 6px 6px;

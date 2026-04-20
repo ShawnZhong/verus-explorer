@@ -59,6 +59,7 @@
       Decoration, StateField, StateEffect, EditorState,
       linter, setDiagnostics,
       search,
+      Compartment, StreamLanguage,
     } from './editor.js';
 
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
@@ -162,16 +163,17 @@
     // wiring needed. The first entry also doubles as the cold-load default
     // when no URL hash is present.
     const EXAMPLE_GROUPS = [
-      { group: 'Basics', items: [
-        { file: 'sequence.rs', label: 'Sequence (passes)' },
-        { file: 'failure.rs', label: 'Assertion failure' },
-        { file: 'arith.rs', label: 'Arithmetic proof' },
-      ]},
-      { group: 'Language features', items: [
+      { group: 'Tutorial', items: [
+        { file: 'sequence.rs', label: 'Sequence' },
+        { file: 'arith.rs', label: 'Arithmetic' },
         { file: 'requires_ensures.rs', label: 'Requires / ensures' },
         { file: 'loop.rs', label: 'Loop invariant' },
         { file: 'recursion.rs', label: 'Recursive spec fn' },
         { file: 'struct_invariant.rs', label: 'Struct + ghost binding' },
+      ]},
+      { group: 'Test (expected failures)', items: [
+        { file: 'failure.rs', label: 'assert(false)' },
+        { file: 'precondition_fail.rs', label: 'Precondition violation' },
       ]},
     ];
     const EXAMPLES = EXAMPLE_GROUPS.flatMap(g => g.items);
@@ -192,13 +194,16 @@
       'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT', 'Z3',
     ];
     // Tab labels name what the stage actually *produced* rather than pipeline
-    // positions — SST has two dumps (post-ast_to_sst, post-poly), AIR has
-    // three (initial block tree, SSA-versioned, flattened to one assertion).
-    // SMT-in is what we send to Z3; SMT-out is Z3's reply. Both sides are
-    // SMT-LIB2, so the direction suffix carries the information.
+    // positions. The `VIR-*` family all lives in the `vir` crate: `VIR` is
+    // the AST form, `VIR-sst` is after `ast_to_sst_krate` (statement /
+    // expression trees closer to SMT), `VIR-sst-poly` is after the `poly`
+    // pass (generics monomorphized / type-erased — what AIR consumes). AIR
+    // has three: initial block tree, SSA-versioned, flattened to one
+    // assertion. SMT-in is what we send to Z3; SMT-out is Z3's reply —
+    // both SMT-LIB2, direction in the suffix.
     const SECTION_LABEL = {
       AST: 'AST', HIR: 'HIR', VIR: 'VIR',
-      SST_AST: 'SST', SST_POLY: 'SST-poly',
+      SST_AST: 'VIR-sst', SST_POLY: 'VIR-poly',
       AIR_INITIAL: 'AIR-raw', AIR_MIDDLE: 'AIR-SSA', AIR_FINAL: 'AIR-flat',
       SMT: 'SMT-in', Z3: 'SMT-out',
     };
@@ -345,6 +350,104 @@
       }
     };
 
+    // Minimal s-expression stream parser for the AIR / SMT / Z3 tabs.
+    // Groups SMT-LIB tokens into a handful of CM6 tag buckets so the
+    // theme can give each its own color: commands & connectives →
+    // keyword, built-in sorts → typeName, booleans → atom, arithmetic /
+    // comparison / bitvec / string / array ops → operator, `:foo`
+    // attribute keywords → attributeName. Unknown tokens fall through
+    // as plain identifiers.
+    const SMT_KEYWORDS = new Set([
+      // commands
+      'assert', 'check-sat', 'check-sat-assuming',
+      'declare-const', 'declare-fun', 'declare-sort',
+      'declare-datatype', 'declare-datatypes', 'declare-rel', 'declare-var',
+      'define-const', 'define-fun', 'define-fun-rec', 'define-funs-rec', 'define-sort',
+      'push', 'pop', 'reset', 'reset-assertions',
+      'set-option', 'set-logic', 'set-info',
+      'get-info', 'get-model', 'get-value', 'get-option',
+      'get-assertions', 'get-assignment', 'get-proof',
+      'get-unsat-core', 'get-unsat-assumptions',
+      'exit', 'echo', 'simplify', 'eval', 'help', 'labels', 'display',
+      'rule', 'query',
+      // connectives, quantifiers, binders
+      'and', 'or', 'not', 'xor', '=>', 'iff', 'ite', 'distinct',
+      'forall', 'exists', 'let', 'match', 'par', 'as', '!',
+    ]);
+    const SMT_SORTS = new Set([
+      'Bool', 'Int', 'Real', 'String', 'Array', 'BitVec', 'Seq', 'RegLan',
+    ]);
+    const SMT_OPERATORS = new Set([
+      // arithmetic / comparison
+      '=', '<', '>', '<=', '>=', '+', '-', '*', '/', 'div', 'mod', 'abs', 'rem',
+      'to_real', 'to_int', 'is_int',
+      // array
+      'select', 'store',
+      // bitvec
+      'concat', 'extract', 'bvcomp', 'zero_extend', 'sign_extend', 'repeat',
+      'rotate_left', 'rotate_right',
+      'bvadd', 'bvsub', 'bvmul', 'bvudiv', 'bvurem', 'bvsdiv', 'bvsrem', 'bvsmod',
+      'bvshl', 'bvlshr', 'bvashr',
+      'bvand', 'bvor', 'bvxor', 'bvnot', 'bvneg', 'bvnand', 'bvnor', 'bvxnor',
+      'bvult', 'bvule', 'bvugt', 'bvuge', 'bvslt', 'bvsle', 'bvsgt', 'bvsge',
+      // string
+      'str.len', 'str.++', 'str.at', 'str.substr', 'str.indexof', 'str.contains',
+      'str.prefixof', 'str.suffixof', 'str.replace', 'str.to_int', 'str.from_int',
+    ]);
+    const sexpParser = {
+      name: 'sexp',
+      startState: () => ({}),
+      token(stream) {
+        if (stream.eatSpace()) return null;
+        const ch = stream.peek();
+        if (ch === ';') { stream.skipToEnd(); return 'comment'; }
+        if (ch === '"') {
+          stream.next();
+          while (!stream.eol()) {
+            const c = stream.next();
+            if (c === '\\') { stream.next(); continue; }
+            if (c === '"') break;
+          }
+          return 'string';
+        }
+        // SMT-LIB allows arbitrary characters inside `|...|` — eat to
+        // the closing bar so internal whitespace / parens don't break
+        // tokenization.
+        if (ch === '|') {
+          stream.next();
+          while (!stream.eol()) { if (stream.next() === '|') break; }
+          return 'variableName';
+        }
+        if (ch === '(' || ch === ')') { stream.next(); return 'bracket'; }
+        if (/[0-9]/.test(ch)) { stream.eatWhile(/[\w.]/); return 'number'; }
+        stream.eatWhile(/[^\s()"';|]/);
+        const w = stream.current();
+        // `:foo` is an SMT-LIB attribute keyword (`:named`, `:pattern`,
+        // `:weight`, …). Render distinctly from command keywords.
+        if (w.startsWith(':')) return 'attributeName';
+        if (w === 'true' || w === 'false') return 'atom';
+        if (SMT_KEYWORDS.has(w)) return 'keyword';
+        if (SMT_SORTS.has(w)) return 'typeName';
+        if (SMT_OPERATORS.has(w)) return 'operator';
+        return null;
+      },
+    };
+    const sexpLanguage = StreamLanguage.define(sexpParser);
+    // Per-section language, looked up on every tab switch. Sections not
+    // listed get `[]` (plain). Rust mode for AST/HIR since those are
+    // pseudo-Rust pretty-prints; s-expressions for everything downstream
+    // (VIR/SST also pretty-print as parenthesized trees, close enough).
+    const LANGUAGE_FOR_SECTION = {
+      AST: rust(), HIR: rust(),
+      VIR: sexpLanguage, SST_AST: sexpLanguage, SST_POLY: sexpLanguage,
+      AIR_INITIAL: sexpLanguage, AIR_MIDDLE: sexpLanguage, AIR_FINAL: sexpLanguage,
+      SMT: sexpLanguage, Z3: sexpLanguage,
+    };
+    // Compartment lets us hot-swap the output editor's language on tab
+    // flips without re-creating the view (which would drop scroll + lose
+    // the search panel's state).
+    const outputLanguage = new Compartment();
+
     // Replace the read-only CM6 viewer's doc with the selected section body,
     // then restore the user's last scroll position for that tab (0 on first
     // visit). One long-lived view is cheaper than N-per-tab; the scroll map
@@ -354,6 +457,7 @@
         ? sectionCache.get(currentTab) : '';
       outputView.dispatch({
         changes: { from: 0, to: outputView.state.doc.length, insert: body },
+        effects: outputLanguage.reconfigure(LANGUAGE_FOR_SECTION[currentTab] ?? []),
       });
       outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
     };
@@ -590,14 +694,15 @@
     // Second CM6 instance, read-only, hosts the selected IR stage's
     // output. `basicSetup` gets us line numbers + folding + search for
     // free, which matters when the SMT stage dump runs to thousands of
-    // lines. No language extension: the IR formats don't map cleanly to
-    // any built-in highlighter, so we treat them as plain monospace text.
+    // lines. `outputLanguage.of([])` reserves a language slot we swap
+    // per tab via `renderOutputView`.
     const outputView = new EditorView({
       parent: parseOutputViewEl,
       doc: '',
       extensions: [
         basicSetup,
         search({ top: true }),
+        outputLanguage.of([]),
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         ...(dark ? [oneDark] : []),
