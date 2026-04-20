@@ -87,6 +87,65 @@
       font-size: 1rem;
       margin: 0 0 .4em;
     }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: .5em 1em;
+      margin: .6em 0;
+    }
+
+    .toggles {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: .5em 1em;
+      align-items: center;
+    }
+
+    .toggles label {
+      display: inline-flex;
+      align-items: center;
+      gap: .25em;
+    }
+
+    .verdict {
+      padding: .6em .9em;
+      border-radius: 6px;
+      margin-bottom: .8em;
+    }
+
+    .verdict.ok {
+      background: #ecfdf3;
+      border: 1px solid #abefc6;
+    }
+
+    .verdict.bad {
+      background: #fdf2f2;
+      border: 1px solid #f5c2c0;
+    }
+
+    .verdict-status {
+      font-size: 1.05rem;
+    }
+
+    .verdict-detail {
+      font-size: .85em;
+      margin-top: .3em;
+      color: #444;
+      white-space: pre-wrap;
+    }
+
+    .section-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin: 1em 0 .3em;
+      color: #555;
+      font-size: .85em;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
   </style>
 </head>
 
@@ -133,13 +192,19 @@ fn main() {
 
 } // verus!
 </textarea>
-    <button id="parse-run">Verify</button>
-    <span style="margin-left: .6em; display: inline-flex; gap: .8em;">
-      <label><input type="checkbox" id="parse-dump-air-initial" /> air initial</label>
-      <label><input type="checkbox" id="parse-dump-air-middle" /> air middle</label>
-      <label><input type="checkbox" id="parse-dump-air-final" /> air final</label>
-      <label><input type="checkbox" id="parse-dump-smt" /> smt</label>
-    </span>
+    <div class="controls">
+      <button id="parse-run">Verify</button>
+      <span class="muted">Show:</span>
+      <span class="toggles" id="parse-toggles">
+        <label><input type="checkbox" data-section="AST" /> AST</label>
+        <label><input type="checkbox" data-section="HIR" /> HIR</label>
+        <label><input type="checkbox" data-section="VIR" /> VIR</label>
+        <label><input type="checkbox" data-section="AIR_INITIAL" /> AIR initial</label>
+        <label><input type="checkbox" data-section="AIR_MIDDLE" /> AIR middle</label>
+        <label><input type="checkbox" data-section="AIR_FINAL" /> AIR final</label>
+        <label><input type="checkbox" data-section="SMT" /> SMT</label>
+      </span>
+    </div>
     <div id="parse-out" class="query"></div>
   </section>
 
@@ -193,99 +258,94 @@ fn main() {
       pre.textContent = msg;
       parseOut.appendChild(pre);
     };
-    const dumpAirInitial = document.getElementById('parse-dump-air-initial');
-    const dumpAirMiddle = document.getElementById('parse-dump-air-middle');
-    const dumpAirFinal = document.getElementById('parse-dump-air-final');
-    const dumpSmt = document.getElementById('parse-dump-smt');
-    const addParseBlock = (title, body) => {
+    // Order matches `parse_source`'s positional bool arguments — keep in sync
+    // with `src/lib.rs::parse_source`.
+    const SECTION_ORDER = ['AST', 'HIR', 'VIR', 'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
+    const SECTION_LABEL = {
+      AST: 'AST', HIR: 'HIR', VIR: 'VIR',
+      AIR_INITIAL: 'AIR initial', AIR_MIDDLE: 'AIR middle',
+      AIR_FINAL: 'AIR final', SMT: 'SMT',
+    };
+    const toggles = Object.fromEntries(
+      [...document.querySelectorAll('#parse-toggles input[type=checkbox]')]
+        .map(cb => [cb.dataset.section, cb])
+    );
+
+    const renderVerdict = (body) => {
+      // `body` is the VERDICT section emitted by `write_verify_output` —
+      // first line is the headline ("Valid", "N/M queries failed", "no
+      // queries"), remaining lines are per-query detail.
+      const [headline, ...rest] = body.split('\n');
+      const isOk = headline === 'Valid';
+      const div = document.createElement('div');
+      div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
+      const status = document.createElement('div');
+      status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
+      status.textContent = isOk ? '✓ Valid' : `✗ ${headline}`;
+      div.appendChild(status);
+      const detail = rest.join('\n').trim();
+      if (detail) {
+        const d = document.createElement('div');
+        d.className = 'verdict-detail';
+        d.textContent = detail;
+        div.appendChild(d);
+      }
+      parseOut.appendChild(div);
+    };
+
+    const renderSection = (name, body) => {
       if (!body) return;
-      const label = document.createElement('div');
-      label.className = 'muted';
-      label.textContent = title;
-      parseOut.appendChild(label);
+      const title = document.createElement('div');
+      title.className = 'section-title';
+      title.textContent = SECTION_LABEL[name] ?? name;
+      parseOut.appendChild(title);
       const pre = document.createElement('pre');
       pre.textContent = body;
       parseOut.appendChild(pre);
     };
-    // AIR_* sections share one pre block + a stage toggle. Each button swaps
-    // the visible body so users can compare initial / middle / final / smt
-    // without scrolling.
-    const addAirToggle = (stages) => {
-      const order = ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
-      const present = order.filter(k => stages[k]);
-      if (present.length === 0) return;
-      const bar = document.createElement('div');
-      bar.style.display = 'flex';
-      bar.style.gap = '.4em';
-      bar.style.margin = '.4em 0';
-      const pre = document.createElement('pre');
-      const buttons = {};
-      const show = (key) => {
-        pre.textContent = stages[key];
-        for (const [k, b] of Object.entries(buttons)) {
-          b.disabled = (k === key);
-        }
-      };
-      for (const key of present) {
-        const b = document.createElement('button');
-        b.textContent = key.toLowerCase().replace('air_', 'air ');
-        b.addEventListener('click', () => show(key));
-        bar.appendChild(b);
-        buttons[key] = b;
-      }
-      parseOut.appendChild(bar);
-      parseOut.appendChild(pre);
-      show(present[0]);
-    };
+
+    let runId = 0;
     const runParse = async () => {
+      const myRun = ++runId;
       parseOut.textContent = '';
       parseButton.disabled = true;
+      const flags = SECTION_ORDER.map(k => toggles[k].checked);
       try {
         const { parse_source } = await freshVerus();
-        const text = parse_source(
-          parseInput.value,
-          dumpAirInitial.checked,
-          dumpAirMiddle.checked,
-          dumpAirFinal.checked,
-          dumpSmt.checked,
-          true, // verify
-        );
+        const text = parse_source(parseInput.value, ...flags);
+        if (myRun !== runId) return; // a newer toggle change superseded us.
         // Split on "=== NAME ===" markers; the preamble (before any marker)
-        // is panic/stderr fallback. Render order is verdict-first (the answer
-        // the user came for) → pipeline stages (AST/HIR/VIR/AIR toggle).
+        // is panic/stderr fallback.
         const chunks = text.split(/^=== (\w+) ===$/m);
         const sections = {};
-        const air = {};
         if (chunks[0].trim()) sections.output = chunks[0].trimEnd();
         for (let i = 1; i < chunks.length; i += 2) {
-          const name = chunks[i];
-          const body = chunks[i + 1].trim();
-          if (name.startsWith('AIR_') || name === 'SMT') {
-            if (body) air[name] = body;
-          } else {
-            sections[name] = body;
-          }
+          sections[chunks[i]] = chunks[i + 1].trim();
         }
-        for (const name of ['output', 'VERDICT', 'AST', 'HIR', 'VIR']) {
-          if (sections[name] !== undefined) addParseBlock(name, sections[name]);
+        if (sections.output) renderSection('output', sections.output);
+        if (sections.VERDICT !== undefined) renderVerdict(sections.VERDICT);
+        for (const name of SECTION_ORDER) {
+          if (sections[name] !== undefined) renderSection(name, sections[name]);
         }
-        addAirToggle(air);
       } catch (e) {
+        if (myRun !== runId) return;
         // When rustc emits diagnostics, `abort_if_errors` degrades to a wasm
         // `unreachable` trap that propagates here as `RuntimeError`. The
         // diagnostic text was already appended to `parse-out` live via
         // `verus_diagnostic`, so treat the trap as informational rather than
         // an opaque crash.
-        const hasDiag = parseOut.querySelector('pre.diagnostic');
-        if (!hasDiag) {
-          addParseBlock('error', 'Parse crashed: ' + (e?.message ?? e));
+        if (!parseOut.querySelector('pre.diagnostic')) {
+          renderSection('error', 'Parse crashed: ' + (e?.message ?? e));
           console.error(e);
         }
       } finally {
-        parseButton.disabled = false;
+        if (myRun === runId) parseButton.disabled = false;
       }
     };
     parseButton.addEventListener('click', runParse);
+    for (const cb of Object.values(toggles)) {
+      cb.addEventListener('change', runParse);
+    }
     runParse();
   </script>
 

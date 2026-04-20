@@ -9,28 +9,8 @@
 # absorbed (its members rely on `lints = { workspace = true }` from
 # Verus's own `source/Cargo.toml`).
 [workspace]
-members = [
-    "rustc-rlibs",
-    # Pulled in as explicit members so they inherit `[workspace.lints]` below
-    # (their own ancestor workspace `third_party/rust/Cargo.toml` doesn't
-    # define it). Listing wins over `exclude` for these specific paths.
-    "third_party/rust/compiler/rustc_macros",
-    "third_party/rust/compiler/rustc_fluent_macro",
-]
+members = ["rustc-rlibs"]
 exclude = ["third_party"]
-
-# Inherited by the two vendored proc-macro crates
-# (`third_party/rust/compiler/rustc_macros` and `rustc_fluent_macro`) via
-# `[lints] workspace = true`. Needed because `cfg(bootstrap)` attrs across the
-# vendored rustc tree would otherwise trip `unexpected_cfgs`. `bootstrap` is
-# set by rustc's x.py when stage0-building rustc with the previous stable
-# compiler; we build with plain cargo, so it's always unset and those attrs
-# are silent no-ops. The rest of the rustc tree picks up an equivalent
-# `--check-cfg=cfg(bootstrap)` from `[target.wasm32-unknown-unknown].rustflags`
-# in `.cargo/config.toml` — but stable cargo doesn't apply target rustflags to
-# host proc-macro builds, hence this workspace-lints fallback.
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(bootstrap)'] }
 
 [package]
 name = "verus-explorer"
@@ -53,6 +33,10 @@ verus_builtin_macros = { path = "third_party/verus/source/builtin_macros" }
 verus_state_machines_macros = { path = "third_party/verus/source/state_machines_macros" }
 proc-macro2 = "1.0.39"
 wasm-bindgen = "0.2"
+# Match the version `rust_verify` uses (source/rust_verify/Cargo.toml) so cargo
+# resolves a single copy. Used in `src/pipeline.rs` to deserialize the embedded
+# vstd.vir bytes into `rust_verify::import_export::CrateWithMetadata`.
+bincode = "1.0.1"
 # rustc_* crates that this crate uses directly are not declared here — they
 # are produced as rlibs by `rustc-rlibs/` and resolved at link time via
 # `-L dependency=...` (set in `.cargo/config.toml`). See `src/lib.rs` for

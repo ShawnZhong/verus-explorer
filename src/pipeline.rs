@@ -16,7 +16,7 @@ use rust_verify::buckets::Bucket;
 use rust_verify::cargo_verus_dep_tracker::DepTracker;
 use rust_verify::commands::{OpGenerator, OpKind};
 use rust_verify::config::ArgsX;
-use rust_verify::import_export::{decode_crate_with_metadata, CrateWithMetadata};
+use rust_verify::import_export::CrateWithMetadata;
 use rust_verify::spans::SpanContext;
 use rust_verify::verifier::{Reporter, Verifier};
 use rustc_errors::emitter::HumanEmitter;
@@ -145,8 +145,10 @@ fn build_vir<'tcx>(
     args.no_external_by_default = true;
     let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
     let CrateWithMetadata { krate: vstd_krate, .. } =
-        decode_crate_with_metadata(crate::sysroot::bundle::VSTD_VIR)
-            .map_err(|e| vec![e])?;
+        bincode::deserialize(crate::sysroot::bundle::VSTD_VIR)
+            .map_err(|_| vec![vir::messages::error_bare(
+                "failed to deserialize embedded VIR crate — version mismatch?",
+            )])?;
     let (krate, global_ctx, spans) =
         Verifier::new(Arc::new(args), None, false, DepTracker::init())
             .build_vir_crate(compiler, tcx, vec!["vstd".to_string()], vec![vstd_krate])?;
@@ -203,11 +205,16 @@ struct AirBufs {
     smt: SharedBuf,
 }
 
-// Each flag gates the corresponding log writer attachment below — attaching a
-// writer makes the air crate serialize every command to text, so unchecked
-// stages save their formatting work entirely.
+// Each flag gates emission of one section. AIR/SMT flags also gate the
+// corresponding log-writer attachment below — attaching a writer makes the
+// air crate serialize every command to text, so unchecked stages save their
+// formatting work entirely. AST/HIR/VIR are cheap to dump but flagging them
+// avoids shipping multi-MB blobs back to JS when nobody asked.
 #[derive(Clone, Copy, Default)]
 pub struct DumpStages {
+    pub ast: bool,
+    pub hir: bool,
+    pub vir: bool,
     pub air_initial: bool,
     pub air_middle: bool,
     pub air_final: bool,
@@ -572,24 +579,28 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     }
 }
 
-fn run_pipeline(compiler: &Compiler, stages: DumpStages, verify: bool) -> String {
+fn run_pipeline(compiler: &Compiler, stages: DumpStages) -> String {
     let krate = rustc_interface::passes::parse(&compiler.sess);
     let mut out = String::new();
-    writeln!(out, "=== AST ===").unwrap();
-    writeln!(out, "crate items: {}", krate.items.len()).unwrap();
-    for item in &krate.items {
-        writeln!(
-            out,
-            "  {:?} {}",
-            item.kind.descr(),
-            item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
-        )
-        .unwrap();
+    if stages.ast {
+        writeln!(out, "=== AST ===").unwrap();
+        writeln!(out, "crate items: {}", krate.items.len()).unwrap();
+        for item in &krate.items {
+            writeln!(
+                out,
+                "  {:?} {}",
+                item.kind.descr(),
+                item.kind.ident().map(|i| i.name.to_string()).unwrap_or_default()
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
     }
-    writeln!(out).unwrap();
     rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-        dump_hir(&mut out, tcx);
-        dump_vir_and_verify(&mut out, compiler, tcx, stages, verify);
+        if stages.hir {
+            dump_hir(&mut out, tcx);
+        }
+        dump_vir_and_verify(&mut out, compiler, tcx, stages);
     });
     out
 }
@@ -611,14 +622,7 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
     writeln!(out).unwrap();
 }
 
-fn dump_vir_and_verify(
-    out: &mut String,
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    stages: DumpStages,
-    verify: bool,
-) {
-    writeln!(out, "=== VIR ===").unwrap();
+fn dump_vir_and_verify(out: &mut String, compiler: &Compiler, tcx: TyCtxt<'_>, stages: DumpStages) {
     let (krate, global_ctx, crate_name, spans) = match build_vir(compiler, tcx) {
         Ok(v) => v,
         Err(errs) => {
@@ -628,15 +632,12 @@ fn dump_vir_and_verify(
             return;
         }
     };
-    let mut buf: Vec<u8> = Vec::new();
-    vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
-    out.push_str(&String::from_utf8_lossy(&buf));
-    writeln!(out).unwrap();
-    // Skipping verify short-circuits before `air_ctx.command()` — the first
-    // point that talks to Z3. Everything above (parse/HIR/VIR) is pure Rust,
-    // so tests can exercise the pipeline without a Z3 runtime installed.
-    if !verify {
-        return;
+    if stages.vir {
+        writeln!(out, "=== VIR ===").unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
+        out.push_str(&String::from_utf8_lossy(&buf));
+        writeln!(out).unwrap();
     }
     match verify_simplified_krate(krate, global_ctx, crate_name, stages, compiler, &spans) {
         Ok(output) => write_verify_output(out, &output),
@@ -668,7 +669,7 @@ fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> Str
 /// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
 /// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
 /// the UI splits on.
-pub fn parse_source(src: &str, stages: DumpStages, verify: bool) -> String {
+pub fn parse_source(src: &str, stages: DumpStages) -> String {
     // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
     // code has to be told to link it. vstd's own prelude transitively
     // re-exports `verus_builtin` items and the `verus_builtin_macros`
@@ -678,7 +679,7 @@ pub fn parse_source(src: &str, stages: DumpStages, verify: bool) -> String {
     let dump_clone = dump.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
+            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages);
         });
     }));
     let partial = dump.lock().unwrap().clone();

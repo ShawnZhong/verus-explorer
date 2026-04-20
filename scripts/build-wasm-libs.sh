@@ -31,7 +31,12 @@ out="${1:-target/wasm-libs}"
 lib="$out/lib/rustlib/wasm32-unknown-unknown/lib"
 mkdir -p "$lib"
 
-RUSTC="${RUSTC:-$repo/target/host-rust/bin/rustc}"
+# Always use the patched stage1 rustc — never inherit cargo's RUSTC, which on
+# build.rs invocations is set to rustup's rustc and would (1) skew SVHs vs.
+# what `rustc-in-wasm` later sees and (2) point `--print sysroot` at rustup,
+# so DYLD_FALLBACK_LIBRARY_PATH below would miss rust_verify's
+# `librustc_driver-*.dylib` (which lives under host-rust's rustlib).
+RUSTC="$repo/target/host-rust/bin/rustc"
 [ -x "$RUSTC" ] || {
     echo "missing $RUSTC — run \`make host-rust\` first." >&2
     exit 1

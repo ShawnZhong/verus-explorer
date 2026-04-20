@@ -54,25 +54,29 @@ pub fn init() {
 
 /// Run the rustc front-end on `src`, lower HIR → simplified VIR, then drive
 /// the krate through the AIR generation + Z3 pipeline. Returns a multi-section
-/// string of AST/HIR/VIR/AIR + verdicts so the existing UI can split and
-/// display each section.
+/// `=== NAME ===` string. The verdict is always emitted; each `dump_*` flag
+/// gates the corresponding intermediate-representation section.
 #[wasm_bindgen]
 pub fn parse_source(
     src: &str,
+    dump_ast: bool,
+    dump_hir: bool,
+    dump_vir: bool,
     dump_air_initial: bool,
     dump_air_middle: bool,
     dump_air_final: bool,
     dump_smt: bool,
-    verify: bool,
 ) -> String {
     pipeline::parse_source(
         src,
         pipeline::DumpStages {
+            ast: dump_ast,
+            hir: dump_hir,
+            vir: dump_vir,
             air_initial: dump_air_initial,
             air_middle: dump_air_middle,
             air_final: dump_air_final,
             smt: dump_smt,
         },
-        verify,
     )
 }
