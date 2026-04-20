@@ -34,7 +34,7 @@ extern "C" {
 // externs there). The browser installs them on `globalThis`; under
 // `wasm-pack test --node` nothing does, so every call site would
 // ReferenceError. Stub them before `parse_source` reaches any diagnostic,
-// `emit_section`, or `pipeline::time` call site. `verus_bench` routes
+// `emit_section`, or `time` call site. `verus_bench` routes
 // through `process.stderr.write` so stage timings show up in `make test`
 // output alongside the per-call bench line — see `bench_log` above.
 #[wasm_bindgen(inline_js = "\
@@ -131,10 +131,9 @@ fn pipeline_preserves_ghost_proof_block() {
     // stay wired up in `pipeline.rs::build_rustc_config` to sustain this.
     let src = "use vstd::prelude::*;\n\
                verus! { fn main() { proof { assert(false); } } }";
-    let stages = || verus_explorer::pipeline::DumpStages { vir: true, ..Default::default() };
 
     let t1 = perf_now();
-    let out1 = verus_explorer::pipeline::parse_source(src, stages(), /* verify */ true);
+    let out1 = verus_explorer::parse_and_verify(src, /* verify */ true);
     let t2 = perf_now();
 
     // Second and third parse_source in the *same* wasm instance. The JS
@@ -145,9 +144,9 @@ fn pipeline_preserves_ghost_proof_block() {
     // `verus_explorer::init`) surfaces via wasm-pack's output — telling
     // us exactly which global-state invariant trips. #3 confirms whether
     // #2 was a one-shot warmup or whether subsequent calls are steady-state.
-    let out2 = verus_explorer::pipeline::parse_source(src, stages(), /* verify */ true);
+    let out2 = verus_explorer::parse_and_verify(src, /* verify */ true);
     let t3 = perf_now();
-    let out3 = verus_explorer::pipeline::parse_source(src, stages(), /* verify */ true);
+    let out3 = verus_explorer::parse_and_verify(src, /* verify */ true);
     let t4 = perf_now();
 
     bench_log(&format!(

@@ -5,87 +5,194 @@
   <meta charset="utf-8" />
   <title>verus-explorer</title>
   <style>
+    /* Single palette driven by CSS custom properties — one light set as
+       root defaults, overridden in a `prefers-color-scheme: dark` media
+       query. CM6 picks up its own `oneDark` theme via the script below,
+       so the variables here only drive the surrounding chrome. */
+    :root {
+      --bg: #fff;
+      --fg: #111;
+      --muted: #666;
+      --subtle: #888;
+      --pre-bg: #f5f5f5;
+      --border: #ddd;
+      --border-soft: #e5e5e5;
+      --ok-fg: #087a3c;
+      --ok-bg: #ecfdf3;
+      --ok-border: #abefc6;
+      --bad-fg: #b42318;
+      --bad-bg: #fdf2f2;
+      --bad-border: #f5c2c0;
+      --diag-bg: #fdf2f2;
+      --diag-border: #b42318;
+      --focus-ring: #4a9eff;
+      --pill-bg: #f0f0f0;
+      --pill-pending: #999;
+      --pill-done-bg: #e3f7ec;
+      --pill-done-fg: #087a3c;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1a1a1a;
+        --fg: #e0e0e0;
+        --muted: #999;
+        --subtle: #777;
+        --pre-bg: #242424;
+        --border: #333;
+        --border-soft: #2a2a2a;
+        --ok-fg: #3fb371;
+        --ok-bg: #10291c;
+        --ok-border: #2d5e3f;
+        --bad-fg: #e07b75;
+        --bad-bg: #2a1010;
+        --bad-border: #5a2f2d;
+        --diag-bg: #2a1010;
+        --diag-border: #e07b75;
+        --focus-ring: #6fb2ff;
+        --pill-bg: #2a2a2a;
+        --pill-pending: #666;
+        --pill-done-bg: #10291c;
+        --pill-done-fg: #3fb371;
+      }
+    }
+
+    html, body {
+      background: var(--bg);
+      color: var(--fg);
+    }
     body {
       font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace;
-      max-width: 860px;
-      margin: 2rem auto;
+      max-width: 1200px;
+      margin: 1.5rem auto;
       padding: 0 1rem;
     }
 
     h1 {
       font-size: 1.25rem;
+      margin: 0 0 .4em;
+    }
+    h1 a {
+      color: inherit;
+      text-decoration: none;
+    }
+    h1 a:hover {
+      text-decoration: underline;
+    }
+
+    header p {
+      margin: 0 0 1rem;
     }
 
     button {
       font: inherit;
-      padding: .5em 1em;
+      padding: .4em 1em;
       cursor: pointer;
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+    }
+    button:hover:not(:disabled) { border-color: var(--focus-ring); }
+    button:disabled { cursor: not-allowed; opacity: .6; }
+
+    select {
+      font: inherit;
+      padding: .2em .4em;
+      background: var(--bg);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
     }
 
-    button:disabled {
-      cursor: not-allowed;
-      opacity: .6;
-    }
+    .muted { color: var(--muted); }
 
     pre {
-      background: #f5f5f5;
-      padding: 1em;
+      background: var(--pre-bg);
+      color: var(--fg);
+      padding: .6em .8em;
       border-radius: 6px;
       overflow-x: auto;
       white-space: pre-wrap;
-    }
-
-    .ok {
-      color: #087a3c;
-      font-weight: bold;
-    }
-
-    .bad {
-      color: #b42318;
-      font-weight: bold;
-    }
-
-    .muted {
-      color: #666;
-    }
-
-    .query {
-      border: 1px solid #ddd;
-      border-radius: 6px;
-      padding: .6em .9em;
-      margin-bottom: .8em;
-    }
-
-    .query h3 {
-      font-size: .95rem;
-      margin: 0 0 .4em;
-    }
-
-    .query pre {
-      margin: .3em 0;
+      margin: .2em 0;
       font-size: .85em;
     }
 
     pre.diagnostic {
-      background: #fdf2f2;
-      border-left: 3px solid #b42318;
+      background: var(--diag-bg);
+      border-left: 3px solid var(--diag-border);
+    }
+    pre.diagnostic.clickable {
+      cursor: pointer;
+    }
+    pre.diagnostic.clickable:hover {
+      outline: 1px solid var(--diag-border);
     }
 
-    textarea {
-      width: 100%;
-      min-height: 10em;
-      font: inherit;
-      padding: .5em;
-      box-sizing: border-box;
+    /* Split-pane workbench: editor on the left, output on the right.
+       Each pane is a flex column that owns its own scroll; `min-height: 0`
+       on the grid children is what lets the inner `overflow: auto` track
+       work instead of the pane ballooning to fit content. Collapses to a
+       single column under ~900px. */
+    #workbench {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 1rem;
+      height: calc(100vh - 9rem);
+      min-height: 420px;
     }
-
-    section {
-      margin-top: 2rem;
+    .pane {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
-
-    section h2 {
-      font-size: 1rem;
-      margin: 0 0 .4em;
+    .pane-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: .5em;
+      margin-bottom: .4em;
+      flex-wrap: wrap;
+    }
+    .pane-label {
+      font-size: .8em;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--subtle);
+    }
+    #parse-input {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+    }
+    #parse-input .cm-editor {
+      flex: 1;
+      min-height: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    #parse-input .cm-editor.cm-focused {
+      outline: 2px solid var(--focus-ring);
+      outline-offset: -2px;
+    }
+    #parse-input .cm-scroller {
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+    }
+    #parse-out {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding-right: .3em;
+    }
+    @media (max-width: 900px) {
+      #workbench {
+        grid-template-columns: minmax(0, 1fr);
+        height: auto;
+        min-height: 0;
+      }
+      .pane { overflow: visible; }
+      #parse-input .cm-editor { min-height: 14em; }
+      #parse-out { overflow: visible; min-height: 0; }
     }
 
     .controls {
@@ -93,91 +200,163 @@
       flex-wrap: wrap;
       align-items: center;
       gap: .5em 1em;
-      margin: .6em 0;
+      margin-top: .5em;
+    }
+    .hint {
+      font-size: .8em;
+    }
+    kbd {
+      font: inherit;
+      font-size: .85em;
+      background: var(--pre-bg);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      padding: 0 .3em;
     }
 
     .toggles {
       display: inline-flex;
       flex-wrap: wrap;
-      gap: .5em 1em;
+      gap: .3em .8em;
       align-items: center;
+      font-size: .85em;
     }
-
     .toggles label {
       display: inline-flex;
       align-items: center;
       gap: .25em;
+      color: var(--muted);
+    }
+
+    .progress-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .3em;
+      margin-bottom: .6em;
+    }
+    .pill {
+      font-size: .75em;
+      padding: .15em .55em;
+      background: var(--pill-bg);
+      color: var(--pill-pending);
+      border-radius: 99px;
+      transition: background-color .15s, color .15s;
+    }
+    .pill.done {
+      background: var(--pill-done-bg);
+      color: var(--pill-done-fg);
     }
 
     .verdict {
-      padding: .6em .9em;
+      padding: .5em .8em;
       border-radius: 6px;
-      margin-bottom: .8em;
+      margin-bottom: .6em;
     }
-
     .verdict.ok {
-      background: #ecfdf3;
-      border: 1px solid #abefc6;
+      background: var(--ok-bg);
+      border: 1px solid var(--ok-border);
     }
-
     .verdict.bad {
-      background: #fdf2f2;
-      border: 1px solid #f5c2c0;
+      background: var(--bad-bg);
+      border: 1px solid var(--bad-border);
     }
-
-    .verdict-status {
-      font-size: 1.05rem;
-    }
-
+    .verdict-status { font-size: 1rem; font-weight: bold; }
+    .verdict-status.ok { color: var(--ok-fg); }
+    .verdict-status.bad { color: var(--bad-fg); }
     .verdict-detail {
-      font-size: .85em;
+      font-size: .82em;
       margin-top: .3em;
-      color: #444;
+      color: var(--muted);
       white-space: pre-wrap;
     }
 
-    .section-title {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin: 1em 0 .3em;
-      color: #555;
-      font-size: .85em;
+    /* Collapsible IR sections. `<details>` handles open/close natively;
+       we just restyle the default triangle+summary to match the muted
+       section-title look from the prior flat layout. */
+    details.section {
+      border-top: 1px solid var(--border-soft);
+      margin-top: .6em;
+      padding-top: .4em;
+    }
+    details.section > summary {
+      cursor: pointer;
+      color: var(--subtle);
+      font-size: .8em;
       text-transform: uppercase;
       letter-spacing: .05em;
+      user-select: none;
+      list-style: none;
     }
+    details.section > summary::before {
+      content: '▸';
+      display: inline-block;
+      width: 1em;
+      color: var(--subtle);
+    }
+    details.section[open] > summary::before { content: '▾'; }
+    details.section[open] > summary { margin-bottom: .3em; }
   </style>
 </head>
 
 <body>
 
-  <h1>verus-explorer</h1>
+  <header>
+    <h1><a href="https://github.com/ShawnZhong/verus-explorer" target="_blank" rel="noopener">verus-explorer</a></h1>
+    <p class="muted">Verus's full pipeline — rustc front-end, HIR → VIR
+      lowering, AIR generation, Z3 — running entirely in the browser as
+      wasm. Edit the source and press Verify (or <kbd>⌘</kbd>+<kbd>Enter</kbd>).</p>
+  </header>
 
-  <section id="parse-section">
-    <h2>rustc → VIR → AIR → Z3 (vendored, wasm32)</h2>
-    <p class="muted">Rustc front-end invoked directly through
-      <code>rustc_interface::run_compiler</code> (skipping
-      <code>rustc_driver</code>'s CLI/ICE/panic-hook glue), source fed via
-      <code>Input::Str</code>. Extern-crate resolution is served out of a
-      prebuilt wasm-libs bundle (core, alloc, compiler_builtins, vstd,
-      verus_builtin, and the Verus macro-stub rmetas) fetched from
-      <code>./wasm-libs/</code>; rustc sees them via a virtual
-      <code>--sysroot=/virtual</code> wired through
-      <code>rustc_session::filesearch::sysroot::Callbacks</code>.
-      <code>#![no_std]</code> is injected via <code>-Zcrate-attr</code> to
-      keep the std import out (only <code>core</code> is bundled). After HIR
-      lowering, Verus takes over: HIR → simplified VIR → ast_to_sst → poly
-      → AIR → Z3, with each stage exposed via the toggles below.</p>
-    <textarea id="parse-input" spellcheck="false">use vstd::prelude::*;
+  <main id="workbench">
+    <section class="pane" id="left-pane">
+      <div class="pane-header">
+        <span class="pane-label">Source</span>
+        <label class="hint muted">
+          Example:
+          <select id="example-select">
+            <option value="">— load —</option>
+            <option value="sequence">Sequence (passes)</option>
+            <option value="failure">Assertion failure</option>
+            <option value="arith">Arithmetic proof</option>
+          </select>
+        </label>
+      </div>
+      <div id="parse-input"></div>
+      <div class="controls">
+        <button id="parse-run" disabled>Loading verifier…</button>
+        <span class="muted hint"><kbd>⌘</kbd>+<kbd>Enter</kbd> to verify</span>
+      </div>
+    </section>
+
+    <section class="pane" id="right-pane">
+      <div class="pane-header">
+        <span class="pane-label">Output</span>
+        <span class="toggles" id="parse-toggles">
+          <label><input type="checkbox" data-section="AST" /> AST</label>
+          <label><input type="checkbox" data-section="HIR" /> HIR</label>
+          <label><input type="checkbox" data-section="VIR" /> VIR</label>
+          <label><input type="checkbox" data-section="AIR_INITIAL" /> AIR₁</label>
+          <label><input type="checkbox" data-section="AIR_MIDDLE" /> AIR₂</label>
+          <label><input type="checkbox" data-section="AIR_FINAL" /> AIR₃</label>
+          <label><input type="checkbox" data-section="SMT" /> SMT</label>
+        </span>
+      </div>
+      <div id="progress" class="progress-pills" aria-live="polite"></div>
+      <div id="parse-out"></div>
+    </section>
+  </main>
+
+  <!-- Example payloads. Not rendered; read by JS on dropdown change. The
+       `sequence` one doubles as the default first-load content when there's
+       no URL hash to hydrate from. Kept as `<script type="text/plain">` so
+       the source stays human-readable in the HTML. -->
+  <script id="example-sequence" type="text/plain">use vstd::prelude::*;
 
 verus! {
 
 // Seq<int> is vstd's specification-level sequence. The verifier knows
 // the semantics of empty / push / len / indexing, so every `assert`
-// below is discharged automatically via the SMT encoding. Everything
-// lives inside a `proof {}` block so integer literals default to
-// Verus's unbounded `int` — outside of spec context they'd infer as
-// `i32` and trip E0308 against the `Seq<int>` element type.
+// below is discharged automatically via the SMT encoding.
 fn main() {
     proof {
         let s: Seq<int> = Seq::empty().push(1).push(2).push(3);
@@ -192,22 +371,40 @@ fn main() {
 }
 
 } // verus!
-</textarea>
-    <div class="controls">
-      <button id="parse-run">Verify</button>
-      <span class="muted">Show:</span>
-      <span class="toggles" id="parse-toggles">
-        <label><input type="checkbox" data-section="AST" /> AST</label>
-        <label><input type="checkbox" data-section="HIR" /> HIR</label>
-        <label><input type="checkbox" data-section="VIR" /> VIR</label>
-        <label><input type="checkbox" data-section="AIR_INITIAL" /> AIR initial</label>
-        <label><input type="checkbox" data-section="AIR_MIDDLE" /> AIR middle</label>
-        <label><input type="checkbox" data-section="AIR_FINAL" /> AIR final</label>
-        <label><input type="checkbox" data-section="SMT" /> SMT</label>
-      </span>
-    </div>
-    <div id="parse-out" class="query"></div>
-  </section>
+</script>
+  <script id="example-failure" type="text/plain">use vstd::prelude::*;
+
+// Deliberate verification failure: the assertion is unconditionally
+// false, so Z3 returns `sat` and the pipeline emits a failed query.
+// Useful for seeing what the diagnostic + VERDICT paths look like.
+verus! {
+
+fn main() {
+    proof {
+        assert(false);
+    }
+}
+
+} // verus!
+</script>
+  <script id="example-arith" type="text/plain">use vstd::prelude::*;
+
+// Specification-level integer arithmetic (`int`, not `i32`). Outside of
+// spec context the literals would infer as `i32` and trip E0308.
+verus! {
+
+fn main() {
+    proof {
+        let x: int = 10;
+        assert(x * x == 100);
+        assert(x + x == 20);
+        assert(x * (x - 1) == 90);
+        assert(forall|k: int| k > 0 ==> k * x > 0);
+    }
+}
+
+} // verus!
+</script>
 
   <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config).
        Lives under ./z3/ so wasm-pack's post-build wasm-opt pass (which
@@ -216,6 +413,13 @@ fn main() {
   <script src="./z3/z3.js"></script>
 
   <script type="module">
+    // CodeMirror 6 bundle, built by `make dev` (see the `public/editor.js`
+    // Makefile target). All CM6 imports flow through this one file; the
+    // export list lives in the Makefile recipe.
+    import {
+      EditorView, basicSetup, keymap, indentWithTab, rust, oneDark,
+    } from './editor.js';
+
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
     // against rmetas laid out at `/virtual/lib/rustlib/wasm32-unknown-unknown/lib`.
     // `build.rs` stages each file gzipped as `${name}.gz` under `./wasm-libs/`;
@@ -224,9 +428,6 @@ fn main() {
     // re-install into every fresh wasm instance via `wasm_libs_add_file` +
     // `wasm_libs_finalize`. The names below are the uncompressed filenames
     // rustc's crate locator expects in memory, *not* what's on the wire.
-    // Hardcoded rather than manifest-driven because the set is defined by
-    // what the locator needs (core/alloc/compiler_builtins + verus_builtin +
-    // two macro stubs + vstd.rmeta/.vir), not by data that varies.
     const WASM_LIBS = [
       'liballoc.rmeta',
       'libcompiler_builtins.rmeta',
@@ -239,10 +440,9 @@ fn main() {
     ];
 
     // Z3 init, the verus wasm compile, and the wasm-libs fetch+decompress
-    // are independent (nothing below them needs to wait on the other two),
-    // so fire them all off at once. Critical cold-load time = max(them),
-    // not sum. Emscripten resolves z3.wasm relative to z3.js by default, so
-    // no locateFile callback is needed.
+    // are independent; fire them all off at once. Critical cold-load time
+    // = max(them), not sum. Emscripten resolves z3.wasm relative to z3.js
+    // by default, so no locateFile callback is needed.
     const ms = (t) => `${(performance.now() - t).toFixed(0)}ms`;
     const coldStart = performance.now();
     const timed = (label, p) => {
@@ -263,24 +463,16 @@ fn main() {
 
     // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
     // wasm-bindgen externs, so each must be a plain JS function on globalThis.
-    // cwrap returns a pre-bound callable that handles the emscripten ABI
-    // marshalling (malloc+UTF-8 for strings).
     globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
     globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
     globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
     globalThis.Z3_eval_smtlib2_string = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
     globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
 
-    // One wasm instance, reused for every `parse_source` call. Earlier
-    // versions dynamic-imported with a cache-busting nonce per click to
-    // force a fresh instance, under the assumption that rustc's
-    // `SESSION_GLOBALS` + CStore state would leak between calls. In
-    // practice each `run_compiler` builds its own Session+CStore, so
-    // nothing leaks — confirmed by `tests/smoke.rs`, which runs three
-    // `parse_source` calls back-to-back in a single instance and sees
-    // calls #2/#3 run at ~2× the speed of #1 (V8 JIT + rustc
-    // `LazyLock`/`OnceLock` entries survive across calls and amortize).
-    // The fresh-per-call pattern was throwing that warmup away.
+    // One wasm instance, reused for every `parse_source` call. Each
+    // `run_compiler` builds its own Session+CStore; nothing leaks across
+    // calls (confirmed by `tests/smoke.rs`). V8 JIT + rustc LazyLock entries
+    // survive across calls and amortize, so #2/#3 run at ~2× #1 speed.
     const t0 = performance.now();
     const verus = await import('./verus_explorer.js');
     const t1 = performance.now();
@@ -298,26 +490,52 @@ fn main() {
       `total=${(t4 - t0).toFixed(0)}ms`
     );
 
-    const parseInput = document.getElementById('parse-input');
+    // ------------------------------------------------------------------
+    // DOM refs + tiny state
+    // ------------------------------------------------------------------
     const parseOut = document.getElementById('parse-out');
     const parseButton = document.getElementById('parse-run');
-    // Order matches `parse_source`'s positional bool arguments — keep in sync
-    // with `src/lib.rs::parse_source`.
+    const progressEl = document.getElementById('progress');
+    const exampleSelect = document.getElementById('example-select');
     const SECTION_ORDER = ['AST', 'HIR', 'VIR', 'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL', 'SMT'];
     const SECTION_LABEL = {
       AST: 'AST', HIR: 'HIR', VIR: 'VIR',
       AIR_INITIAL: 'AIR initial', AIR_MIDDLE: 'AIR middle',
       AIR_FINAL: 'AIR final', SMT: 'SMT',
     };
+    const PILL_LABEL = {
+      AST: 'AST', HIR: 'HIR', VIR: 'VIR',
+      AIR_INITIAL: 'AIR₁', AIR_MIDDLE: 'AIR₂', AIR_FINAL: 'AIR₃',
+      SMT: 'SMT',
+    };
     const toggles = Object.fromEntries(
       [...document.querySelectorAll('#parse-toggles input[type=checkbox]')]
         .map(cb => [cb.dataset.section, cb])
     );
 
+    // `parse_source` always produces every IR; bodies are cached here so
+    // flipping a toggle just re-renders from cache instead of re-parsing.
+    const sectionCache = new Map();
+    let verdictCache = null;
+    const diagnosticCache = [];
+
+    // ------------------------------------------------------------------
+    // Renderers
+    // ------------------------------------------------------------------
+    const renderProgress = () => {
+      progressEl.textContent = '';
+      for (const name of SECTION_ORDER) {
+        const pill = document.createElement('span');
+        const done = sectionCache.has(name);
+        pill.className = 'pill' + (done ? ' done' : '');
+        pill.textContent = PILL_LABEL[name] + (done ? ' ✓' : ' …');
+        progressEl.appendChild(pill);
+      }
+    };
+
     const renderVerdict = (body) => {
-      // `body` is the VERDICT section emitted by `write_verify_output` —
-      // first line is the headline ("Valid", "N/M queries failed", "no
-      // queries"), remaining lines are per-query detail.
+      // First line is the headline ("Valid" / "N/M queries failed" / "no queries"),
+      // rest is per-query detail. Pinned to the top of parseOut via `prepend`.
       const [headline, ...rest] = body.split('\n');
       const isOk = headline === 'Valid';
       const div = document.createElement('div');
@@ -333,39 +551,81 @@ fn main() {
         d.textContent = detail;
         div.appendChild(d);
       }
-      parseOut.appendChild(div);
+      parseOut.prepend(div);
     };
 
     const renderSection = (name, body) => {
       if (!body) return;
-      const title = document.createElement('div');
-      title.className = 'section-title';
-      title.textContent = SECTION_LABEL[name] ?? name;
-      parseOut.appendChild(title);
+      const details = document.createElement('details');
+      details.className = 'section';
+      details.open = true;
+      const summary = document.createElement('summary');
+      summary.textContent = SECTION_LABEL[name] ?? name;
+      details.appendChild(summary);
       const pre = document.createElement('pre');
       pre.textContent = body;
-      parseOut.appendChild(pre);
+      details.appendChild(pre);
+      parseOut.appendChild(details);
     };
 
-    // Synchronously invoked by Rust (`src/pipeline.rs::DomWriter`) for each
-    // rustc diagnostic, and by `emit_section` for each completed pipeline
-    // section, while `parse_source` is still running. Landing text in the
-    // DOM here means it survives the `unreachable` trap that rustc's
-    // `abort_if_errors` produces on wasm32 (panic=abort) — if we instead
-    // waited for `parse_source` to return and parsed its String output, a
-    // mid-pipeline trap would discard every section produced so far.
-    globalThis.verus_diagnostic = (msg) => {
+    // Pull a `line:col` out of a rustc diagnostic so we can make it clickable.
+    // The `--> file:N:M` form is rustc's canonical span marker; fallback to
+    // any `N:M` occurrence covers formats that don't carry an arrow (e.g.,
+    // Verus-side errors). Only the first match is used.
+    const extractLoc = (msg) => {
+      const m = msg.match(/-->\s*\S*?:(\d+):(\d+)/) ?? msg.match(/:(\d+):(\d+)/);
+      return m ? { line: parseInt(m[1], 10), col: parseInt(m[2], 10) } : null;
+    };
+
+    const jumpTo = (line, col) => {
+      const doc = view.state.doc;
+      if (line < 1 || line > doc.lines) return;
+      const lineInfo = doc.line(line);
+      const anchor = Math.min(lineInfo.from + Math.max(0, col - 1), lineInfo.to);
+      view.dispatch({ selection: { anchor }, scrollIntoView: true });
+      view.focus();
+    };
+
+    const renderDiagnostic = (msg) => {
       const pre = document.createElement('pre');
       pre.className = 'diagnostic';
       pre.textContent = msg;
+      const loc = extractLoc(msg);
+      if (loc) {
+        pre.classList.add('clickable');
+        pre.title = `Jump to ${loc.line}:${loc.col}`;
+        pre.addEventListener('click', () => jumpTo(loc.line, loc.col));
+      }
       parseOut.appendChild(pre);
     };
-    globalThis.verus_dump = (section, body) => {
-      if (section === 'VERDICT') renderVerdict(body);
-      else renderSection(section, body);
+
+    // Wipe parseOut and replay from cache. Order: verdict (prepended to top
+    // regardless of arrival order), then diagnostics, then toggled IR
+    // sections in pipeline order.
+    const rerender = () => {
+      parseOut.textContent = '';
+      for (const msg of diagnosticCache) renderDiagnostic(msg);
+      for (const name of SECTION_ORDER) {
+        if (toggles[name].checked && sectionCache.has(name)) {
+          renderSection(name, sectionCache.get(name));
+        }
+      }
+      if (verdictCache !== null) renderVerdict(verdictCache);
+      renderProgress();
     };
-    // Stage-level timings from `pipeline::time`. Keep out-of-DOM (console
-    // only) so the main output stays focused on IR/verdict rendering.
+
+    // ------------------------------------------------------------------
+    // Rust → JS bridge. Synchronous during `parse_source`; JS is
+    // single-threaded, so the DOM won't actually repaint between these
+    // calls. The pills reflect which stages completed post-hoc; on a
+    // mid-pipeline trap the buffered caches survive the unwind and the
+    // `finally`-time `rerender()` flushes them.
+    // ------------------------------------------------------------------
+    globalThis.verus_diagnostic = (msg) => { diagnosticCache.push(msg); };
+    globalThis.verus_dump = (section, body) => {
+      if (section === 'VERDICT') verdictCache = body;
+      else sectionCache.set(section, body);
+    };
     globalThis.verus_bench = (label, ms) => {
       console.log(`[stage] ${label}=${ms.toFixed(0)}ms`);
     };
@@ -374,38 +634,121 @@ fn main() {
     const runParse = () => {
       const myRun = ++runId;
       parseButton.disabled = true;
-      const flags = SECTION_ORDER.map(k => toggles[k].checked);
+      parseButton.textContent = 'Verifying…';
+      sectionCache.clear();
+      verdictCache = null;
+      diagnosticCache.length = 0;
+      renderProgress();
       try {
-        // `parse_source` is synchronous wasm — no interleaving possible
-        // once we start it. Each `verus_dump` / `verus_diagnostic` call
-        // lands before the next run can clear `parseOut`. `runId` is
-        // redundant here (nothing can preempt us mid-call), but keep the
-        // check for symmetry with any future async work.
-        parseOut.textContent = '';
         const tParse = performance.now();
-        verus.parse_source(parseInput.value, ...flags);
+        verus.parse_source(view.state.doc.toString());
         console.log(`[parse] parse_source=${(performance.now() - tParse).toFixed(0)}ms`);
-        // Each section was already rendered via `verus_dump` as it was
-        // produced; the returned String is ignored on the browser side.
       } catch (e) {
         if (myRun !== runId) return;
-        // When rustc emits diagnostics, `abort_if_errors` degrades to a wasm
-        // `unreachable` trap that propagates here as `RuntimeError`. Any
-        // diagnostics and completed sections were already streamed to the
-        // DOM via `verus_diagnostic` / `verus_dump`, so treat the trap as
-        // informational rather than an opaque crash.
-        if (!parseOut.querySelector('pre.diagnostic, .section-title')) {
-          renderSection('error', 'Parse crashed: ' + (e?.message ?? e));
+        if (diagnosticCache.length === 0 && sectionCache.size === 0 && verdictCache === null) {
+          diagnosticCache.push('Parse crashed: ' + (e?.message ?? e));
           console.error(e);
         }
       } finally {
-        if (myRun === runId) parseButton.disabled = false;
+        if (myRun === runId) {
+          parseButton.disabled = false;
+          parseButton.textContent = 'Verify';
+        }
       }
+      rerender();
     };
+
+    // ------------------------------------------------------------------
+    // URL hash persistence: gzip + base64url-encode the doc into
+    // `location.hash` so a link captures the current source. Debounced at
+    // 500ms so fast typing doesn't thrash `history.replaceState`.
+    // CompressionStream is Safari 16.4+ / Chrome 80+ / Firefox 113+.
+    // ------------------------------------------------------------------
+    const b64urlEncode = (bytes) => {
+      let s = '';
+      for (const b of bytes) s += String.fromCharCode(b);
+      return btoa(s).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    };
+    const b64urlDecode = (str) => {
+      const padded = str.replaceAll('-', '+').replaceAll('_', '/')
+        + '='.repeat((4 - str.length % 4) % 4);
+      const bin = atob(padded);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    };
+    const encodeSrc = async (src) => {
+      const bytes = new TextEncoder().encode(src);
+      const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+      const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+      return b64urlEncode(compressed);
+    };
+    const decodeSrc = async (hash) => {
+      const stream = new Blob([b64urlDecode(hash)]).stream().pipeThrough(new DecompressionStream('gzip'));
+      return await new Response(stream).text();
+    };
+    let saveTimer;
+    const scheduleHashSave = () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(async () => {
+        try {
+          const encoded = await encodeSrc(view.state.doc.toString());
+          history.replaceState(null, '', '#' + encoded);
+        } catch (e) { console.warn('hash save failed:', e); }
+      }, 500);
+    };
+
+    const initialDoc = await (async () => {
+      const hash = location.hash.slice(1);
+      if (hash) {
+        try { return await decodeSrc(hash); }
+        catch (e) { console.warn('hash decode failed:', e); }
+      }
+      return document.getElementById('example-sequence').textContent;
+    })();
+
+    // ------------------------------------------------------------------
+    // CM6 editor. Mounted after runParse is defined so the Mod-Enter
+    // keymap's closure resolves cleanly. `oneDark` only applied when the
+    // user's system is in dark mode; everything else keys off CSS vars.
+    // ------------------------------------------------------------------
+    const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+    const view = new EditorView({
+      parent: document.getElementById('parse-input'),
+      doc: initialDoc,
+      extensions: [
+        basicSetup,
+        rust(),
+        ...(dark ? [oneDark] : []),
+        EditorView.updateListener.of(u => { if (u.docChanged) scheduleHashSave(); }),
+        keymap.of([
+          indentWithTab,
+          { key: 'Mod-Enter', run: () => { runParse(); return true; } },
+        ]),
+      ],
+    });
+
+    // ------------------------------------------------------------------
+    // Wiring: example dropdown, Verify button, toggle checkboxes.
+    // ------------------------------------------------------------------
+    exampleSelect.addEventListener('change', () => {
+      const val = exampleSelect.value;
+      if (!val) return;
+      const src = document.getElementById(`example-${val}`).textContent;
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
+      exampleSelect.value = '';
+      runParse();
+    });
     parseButton.addEventListener('click', runParse);
     for (const cb of Object.values(toggles)) {
-      cb.addEventListener('change', runParse);
+      cb.addEventListener('change', rerender);
     }
+
+    // Cold-load done — flip the Verify button live.
+    parseButton.textContent = 'Verify';
+    parseButton.disabled = false;
+
+    renderProgress();
     runParse();
   </script>
 

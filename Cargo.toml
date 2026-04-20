@@ -59,10 +59,11 @@ wasm-bindgen-test = "0.3"
 # Aggressive size tuning for the rustc-in-wasm bundle:
 # - `opt-level = "z"` favors size over speed (vs. "s" which still respects
 #   loop unrolling/inlining heuristics).
-# - `lto = "fat"` lets LLVM inline + dead-strip across crate boundaries; the
-#   rustc frontend has lots of monomorphized generics that only one caller
-#   actually uses, and fat LTO is what lets DCE see them.
-# - `codegen-units = 1` is required for fat LTO to be effective.
+# - `codegen-units = 1` keeps each crate in a single codegen unit so rustc's
+#   intra-crate DCE/inlining sees everything at once. Measured: combining
+#   this with the wasm-opt `-Oz` pass below makes `lto` a no-op for size
+#   (fat/thin/off within ~5 KB of each other on the 28 MB final wasm), so
+#   LTO is left at cargo's default of `false` to save ~5 min of build time.
 # - `strip = true` drops the embedded `name` section and DWARF debuginfo
 #   from the final wasm; saves a lot on a binary this large.
 # - `panic = "abort"` removes panic landing pads. wasm32 has no unwinding
@@ -70,7 +71,6 @@ wasm-bindgen-test = "0.3"
 #   explicitly lets rustc skip emitting the cleanup edges in MIR/LLVM IR.
 [profile.release]
 opt-level = "z"
-lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"

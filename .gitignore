@@ -2,3 +2,8 @@ target/
 build/
 dist/
 third_party/node/
+# CodeMirror 6 bundle is regenerated straight into `dist/editor.js` by
+# `make dev` / `make release` via esbuild (see the `$(DIST)/editor.js`
+# Makefile target). `package.json` + `package-lock.json` are committed so
+# versions resolve deterministically; `node_modules/` is ephemeral.
+node_modules/

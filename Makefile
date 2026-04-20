@@ -43,7 +43,7 @@ export RUSTC := $(CURDIR)/target/host-rust/bin/rustc
 # tags. Emscripten's MODULARIZE glue resolves z3.wasm relative to z3.js's
 # own `document.currentScript?.src`, so the subfolder move is transparent
 # as long as `public/index.html` loads `./z3/z3.js`.
-dev release: $(DIST)/index.html $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm host-verus
+dev release: $(DIST)/index.html $(DIST)/editor.js $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm host-verus
 	wasm-pack build --$@ --target web --out-dir $(DIST) --no-typescript
 	# wasm-pack always drops a bundler-flavored `package.json` + `.gitignore`
 	# next to the wasm/js (for `npm publish`). We're shipping static files
@@ -80,11 +80,28 @@ $(DIST)/z3/z3.%: $(WASM_Z3)/z3.% | $(DIST)
 $(DIST)/index.html: public/index.html | $(DIST)
 	cp $< $@
 
+# Bundle CodeMirror 6 straight into `$(DIST)/editor.js` via esbuild. The
+# entry point `public/editor-src.js` re-exports every CM6 symbol that
+# `public/index.html` imports; esbuild resolves the bare specifiers against
+# `node_modules/` (CWD is the repo root) and emits one minified ESM bundle
+# with all of CM6's transitive deps (~470KB) inlined. `node_modules/.stamp`
+# forces `npm install` on first build.
+$(DIST)/editor.js: public/editor-src.js node_modules/.stamp | $(DIST)
+	npx esbuild $< --bundle --format=esm --outfile=$@ --minify --target=es2022
+
 $(DIST):
 	git worktree add --orphan -b gh-pages $(DIST)
 
 $(WASM_Z3)/z3.js $(WASM_Z3)/z3.wasm &: scripts/build-z3.sh
 	./scripts/build-z3.sh
+
+# `npm install` gate. `node_modules/.stamp` is the Make witness so the
+# install only reruns when `package.json` bumps. `npm ci` would be stricter
+# (fails on lockfile drift) but `npm install` tolerates a missing lockfile
+# on fresh clones and refreshes it when deps bump.
+node_modules/.stamp: package.json
+	npm install --no-audit --no-fund
+	@touch $@
 
 serve:
 	python3 -m http.server --directory $(DIST) 8000

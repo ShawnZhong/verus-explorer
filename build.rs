@@ -26,7 +26,7 @@
 //      `rustc_metadata::proc_macro_registry`.
 //   3. vstd.rmeta + vstd.vir — built by host rust_verify against the
 //      staged sysroot above. The .vir blob (bincode-serialized VIR krate)
-//      is retrieved by `pipeline::build_vir` via `wasm_libs::vstd_vir()`
+//      is retrieved by `build_vir` via `wasm_libs_vstd_vir()`
 //      and handed to `Verifier::build_vir_crate` as `other_vir_crates`.
 //
 // Everything is built by `scripts/build-wasm-libs.sh` with
