@@ -58,9 +58,3 @@ rustc_type_ir = { path = "../third_party/rust/compiler/rustc_type_ir" }
 # *adds* `verus_provide`, and rust_verify calls it explicitly in verifier.rs
 # to override `thir_body` at provider-registration time.
 rustc_mir_build = { path = "../third_party/rust/compiler/rustc_mir_build" }
-
-# Force getrandom 0.3's `wasm_js` feature on so its wasm32 backend compiles —
-# pulled in transitively via `rand` from `rustc_abi`. See `.cargo/config.toml`
-# for the companion `--cfg=getrandom_backend="wasm_js"` rustflag.
-[target.wasm32-unknown-unknown.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }

@@ -26,12 +26,6 @@ RUSTC_INSTALL_BINDIR = "bin"
 # rustc_session::config::host_tuple() panics if this is missing.
 CFG_COMPILER_HOST_TRIPLE = "wasm32-unknown-unknown"
 
-# getrandom 0.3 refuses to compile on wasm32-unknown-unknown without an explicit
-# backend cfg (it doesn't assume `Math.random` / `crypto.getRandomValues`).
-# `wasm_js` routes to `crypto.getRandomValues` via wasm-bindgen; we also need
-# `getrandom = { features = ["wasm_js"] }` as a direct dep in Cargo.toml so the
-# crate is built with the backend's JS bindings compiled in.
-#
 # `-z stack-size=8MiB` matches rustc's own 8 MiB thread stack — our wasm
 # `run_in_thread_with_globals` patch runs `run_compiler` inline on the main
 # thread, so we need the linker to reserve the stack at module level. With
@@ -60,7 +54,6 @@ rustflags = ["--allow=unexpected_cfgs"]
 
 [target.wasm32-unknown-unknown]
 rustflags = [
-    "--cfg=getrandom_backend=\"wasm_js\"",
     "--allow=unexpected_cfgs",
     "-C", "link-arg=-zstack-size=8388608",
 ]

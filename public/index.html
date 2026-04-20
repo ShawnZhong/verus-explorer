@@ -239,8 +239,14 @@ fn main() {
     const verusModule = await WebAssembly.compileStreaming(
       fetch('./verus_explorer_bg.wasm')
     );
+    // Monotonic nonce — `Date.now()` collides at sub-ms granularity, and
+    // dynamic import is keyed by URL: a collision returns the cached module
+    // instance, defeating the fresh-state guarantee. Two `parse_source`
+    // calls sharing one module trip rustc's CStore freeze invariant
+    // (creader.rs panics with "data should not be frozen…").
+    let freshNonce = 0;
     const freshVerus = async () => {
-      const mod = await import(`./verus_explorer.js?nonce=${Date.now()}`);
+      const mod = await import(`./verus_explorer.js?nonce=${++freshNonce}`);
       await mod.default({ module_or_path: verusModule });
       return mod;
     };

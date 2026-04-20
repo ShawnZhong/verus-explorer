@@ -31,7 +31,6 @@ air = { path = "third_party/verus/source/air" }
 rust_verify = { path = "third_party/verus/source/rust_verify" }
 verus_builtin_macros = { path = "third_party/verus/source/builtin_macros" }
 verus_state_machines_macros = { path = "third_party/verus/source/state_machines_macros" }
-proc-macro2 = "1.0.39"
 wasm-bindgen = "0.2"
 # Match the version `rust_verify` uses (source/rust_verify/Cargo.toml) so cargo
 # resolves a single copy. Used in `src/pipeline.rs` to deserialize the embedded
@@ -42,10 +41,6 @@ bincode = "1.0.1"
 # `-L dependency=...` (set in `.cargo/config.toml`). See `src/lib.rs` for
 # the corresponding `extern crate rustc_*;` declarations.
 
-# Force getrandom 0.3's `wasm_js` feature on so its wasm32 backend compiles —
-# see the companion `.cargo/config.toml` rustflag. `rand` (pulled in by
-# rustc_abi) transitively depends on this.
-#
 # `rustc-rlibs` is listed here (not at the top-level `[dependencies]` above)
 # so pulling it into the explorer's dep graph only happens on wasm32 — it's
 # purely a vehicle for forcing Cargo to build wasm32 rlibs of every rustc_*
@@ -56,7 +51,6 @@ bincode = "1.0.1"
 # duplicate rlibs (e.g. `wasm_bindgen` with `[]` vs `[default, std]`) in the
 # shared `deps/` dir, which surfaces as rust-lld "duplicate symbol" errors.
 [target.wasm32-unknown-unknown.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
 rustc-rlibs = { path = "rustc-rlibs" }
 
 [target.wasm32-unknown-unknown.dev-dependencies]
