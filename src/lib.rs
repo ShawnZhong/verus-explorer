@@ -22,7 +22,11 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
-mod pipeline;
+// `pub` (not `pub(crate)`) so integration tests in `tests/` — which link this
+// crate as a plain rlib — can drive the pipeline with SMT turned off, since
+// `wasm-bindgen-test`'s harness doesn't install the `Z3_*` JS shims that
+// `public/index.html` installs for the browser build.
+pub mod pipeline;
 mod proc_macros;
 mod sysroot;
 
@@ -48,8 +52,22 @@ extern "C" {
 #[wasm_bindgen(start)]
 pub fn init() {
     std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
-    sysroot::install();
     proc_macros::install();
+}
+
+/// Register one virtual-sysroot file (rmeta or `vstd.vir`) fetched by the
+/// JS loader from `./sysroot/<name>`. Call once per manifest entry, then
+/// call `sysroot_finalize` before the first `parse_source` invocation.
+#[wasm_bindgen]
+pub fn sysroot_add_file(name: String, bytes: Vec<u8>) {
+    sysroot::add_file(name, bytes);
+}
+
+/// Freeze the registered files and wire up rustc's filesearch callbacks.
+/// Must be called after all `sysroot_add_file` calls for this wasm instance.
+#[wasm_bindgen]
+pub fn sysroot_finalize() {
+    sysroot::finalize();
 }
 
 /// Run the rustc front-end on `src`, lower HIR → simplified VIR, then drive
@@ -78,5 +96,6 @@ pub fn parse_source(
             air_final: dump_air_final,
             smt: dump_smt,
         },
+        /* verify */ true,
     )
 }

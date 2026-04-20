@@ -43,6 +43,12 @@ dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm host-verus
 	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
 	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
 	rm -rf $(PKG)
+	# Copy the virtual-sysroot files (one rmeta per extern crate, plus
+	# vstd.vir and manifest.json) that `build.rs` emitted into OUT_DIR.
+	# `OUT_DIR` isn't exported by cargo, so reach under target/ directly —
+	# the location is stable across cargo versions for this crate layout.
+	rm -rf $(DIST)/sysroot
+	cp -r target/cargo/wasm32-unknown-unknown/$(if $(filter release,$@),release,debug)/build/verus-explorer-*/out/sysroot $(DIST)/sysroot
 
 # Build the patched stage1 rustc. Slow (~10 min) and rarely needed (only
 # when third_party/rust source changes). Phony so each invocation re-runs
@@ -71,10 +77,14 @@ $(WASM_Z3)/z3.js $(WASM_Z3)/z3.wasm &: scripts/build-z3.sh
 serve:
 	python3 -m http.server --directory $(DIST) 8000
 
-# Headless-browser run of `tests/smoke.rs`. Tests call `parse_source` with
+# Node-hosted run of `tests/smoke.rs`. Tests call `parse_source` with
 # `verify = false` so the AIR → Z3 stage is skipped — no Z3 shims needed.
+# We run under Node (not headless Chrome) because `wasm-bindgen-test-runner`'s
+# web server only serves the test bundle, so the browser path can't fetch
+# the ~60 MB of staged rmetas + `vstd.vir`. Under Node, the test reads them
+# straight off disk from `SYSROOT_DIR` (emitted by `build.rs`).
 test: host-verus
-	wasm-pack test --chrome --headless
+	wasm-pack test --node
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
 # and force-pushes, so there's no history either locally or remotely.

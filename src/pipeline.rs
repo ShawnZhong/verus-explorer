@@ -136,16 +136,15 @@ fn build_vir<'tcx>(
 ) -> Result<(Krate, GlobalCtx, Arc<String>, SpanContext), Vec<VirErr>> {
     let mut args = ArgsX::new();
     // `Vstd::Imported` is the default and matches the user's
-    // `extern crate vstd;` injection. The vstd VIR is embedded at compile
-    // time (see `crate::sysroot::bundle::VSTD_VIR`) and passed straight in
-    // as `other_vir_crates` — `args.import` is path-based and doesn't work
-    // on wasm32, so we bypass the filesystem loader.
+    // `extern crate vstd;` injection. The vstd VIR is served out of the
+    // fetched sysroot bundle (`crate::sysroot::vstd_vir()`) and passed
+    // straight in as `other_vir_crates` — `args.import` is path-based and
+    // doesn't work on wasm32, so we bypass the filesystem loader.
     args.no_lifetime = true;
-    args.no_verify = true;
     args.no_external_by_default = true;
     let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
     let CrateWithMetadata { krate: vstd_krate, .. } =
-        bincode::deserialize(crate::sysroot::bundle::VSTD_VIR)
+        bincode::deserialize(crate::sysroot::vstd_vir())
             .map_err(|_| vec![vir::messages::error_bare(
                 "failed to deserialize embedded VIR crate — version mismatch?",
             )])?;
@@ -533,7 +532,13 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         "--crate-type=lib",
         "--crate-name=v",
         "--sysroot=/virtual",
+        // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck) but
+        // the `verus!` proc-macro's `cfg_erase()` strips ghost bodies unless
+        // `verus_keep_ghost_body` is also on — see builtin_macros/src/lib.rs.
+        // Without this, every `proof { ... }` in user code shows up as an
+        // empty block in VIR and the verifier "proves" a trivially-empty body.
         "--cfg=verus_keep_ghost",
+        "--cfg=verus_keep_ghost_body",
         "-Zcrate-attr=no_std",
         "-Zcrate-attr=feature(register_tool)",
         // `verus!` expansion emits `#[...]` attributes on expressions
@@ -579,7 +584,7 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     }
 }
 
-fn run_pipeline(compiler: &Compiler, stages: DumpStages) -> String {
+fn run_pipeline(compiler: &Compiler, stages: DumpStages, verify: bool) -> String {
     let krate = rustc_interface::passes::parse(&compiler.sess);
     let mut out = String::new();
     if stages.ast {
@@ -600,7 +605,7 @@ fn run_pipeline(compiler: &Compiler, stages: DumpStages) -> String {
         if stages.hir {
             dump_hir(&mut out, tcx);
         }
-        dump_vir_and_verify(&mut out, compiler, tcx, stages);
+        dump_vir_and_verify(&mut out, compiler, tcx, stages, verify);
     });
     out
 }
@@ -622,7 +627,13 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
     writeln!(out).unwrap();
 }
 
-fn dump_vir_and_verify(out: &mut String, compiler: &Compiler, tcx: TyCtxt<'_>, stages: DumpStages) {
+fn dump_vir_and_verify(
+    out: &mut String,
+    compiler: &Compiler,
+    tcx: TyCtxt<'_>,
+    stages: DumpStages,
+    verify: bool,
+) {
     let (krate, global_ctx, crate_name, spans) = match build_vir(compiler, tcx) {
         Ok(v) => v,
         Err(errs) => {
@@ -638,6 +649,9 @@ fn dump_vir_and_verify(out: &mut String, compiler: &Compiler, tcx: TyCtxt<'_>, s
         vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
         out.push_str(&String::from_utf8_lossy(&buf));
         writeln!(out).unwrap();
+    }
+    if !verify {
+        return;
     }
     match verify_simplified_krate(krate, global_ctx, crate_name, stages, compiler, &spans) {
         Ok(output) => write_verify_output(out, &output),
@@ -669,7 +683,12 @@ fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> Str
 /// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
 /// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
 /// the UI splits on.
-pub fn parse_source(src: &str, stages: DumpStages) -> String {
+///
+/// `verify` gates the AIR→Z3 stage. The wasm-bindgen wrapper always passes
+/// `true`; integration tests in `tests/` pass `false` so the pipeline stops
+/// after VIR and doesn't call into the `Z3_*` shims (which only
+/// `public/index.html` installs — not the wasm-bindgen-test harness).
+pub fn parse_source(src: &str, stages: DumpStages, verify: bool) -> String {
     // `vstd` isn't in rustc's extern prelude (only `core`/`std` are), so user
     // code has to be told to link it. vstd's own prelude transitively
     // re-exports `verus_builtin` items and the `verus_builtin_macros`
@@ -679,7 +698,7 @@ pub fn parse_source(src: &str, stages: DumpStages) -> String {
     let dump_clone = dump.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages);
+            *dump_clone.lock().unwrap() = run_pipeline(compiler, stages, verify);
         });
     }));
     let partial = dump.lock().unwrap().clone();
