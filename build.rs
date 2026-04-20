@@ -1,16 +1,18 @@
 // Stages wasm32 rmetas + vstd.vir as a virtual sysroot under
 // `target/wasm-libs/lib/rustlib/wasm32-unknown-unknown/lib/` (the exact
 // path rustc's wasm32 crate locator expects when passed `--sysroot=<root>`).
-// Also writes a `manifest.json` alongside them listing the names the
-// browser loader should fetch. The Makefile copies the directory contents
-// into `dist/wasm-libs/`; the browser fetches `manifest.json` and then each
-// rmeta/.vir in parallel, then hands the bytes back to wasm via
-// `wasm_libs_add_file` / `wasm_libs_finalize`. rustc-in-wasm consumes them
-// through `rustc_session::filesearch::sysroot::Callbacks` (installed in
-// `src/wasm_libs.rs`). Keeping them out of the wasm shrinks the binary from
-// ~83 MB to ~23 MB, and HTTP/2 multiplexes the per-file fetches so the
-// one-roundtrip-per-file cost is negligible compared to what we save by
-// letting the browser gzip + cache each artifact independently.
+// Each file also gets a `.gz` sibling (gzip -9); the Makefile ships only
+// the `.gz` copies to `dist/wasm-libs/`, and `public/index.html` fetches
+// `${name}.gz` and decompresses via the native `DecompressionStream('gzip')`
+// before handing the bytes back to wasm via `wasm_libs_add_file` /
+// `wasm_libs_finalize`. The originals stay on disk so `tests/smoke.rs` can
+// read them directly from `WASM_LIBS_DIR`. rustc-in-wasm consumes the
+// in-memory bytes through `rustc_session::filesearch::sysroot::Callbacks`
+// (installed in `src/wasm_libs.rs`). Keeping them out of the wasm shrinks
+// the binary from ~83 MB to ~23 MB, and gzip cuts the remaining ~60 MB of
+// rmeta/.vir transfer down to ~13 MB. HTTP/2 multiplexes the per-file
+// fetches so the one-roundtrip-per-file cost is negligible compared to
+// what we save by letting the browser cache each artifact independently.
 //
 // The bundled crates:
 //   1. core / compiler_builtins / alloc — self-built from `rust-src`.
@@ -33,13 +35,13 @@
 // `tests/smoke.rs` (run under `wasm-pack test --node`) locates this directory
 // through the `WASM_LIBS_DIR` env var emitted below and reads the files via
 // Node's `fs` module at runtime — no `include_bytes!` embedding needed.
-//
-// On non-wasm targets we only seed an empty `manifest.json` (if missing) so
-// host builds don't clobber wasm output that may already live here.
+// `public/index.html` hardcodes the file names since they're defined by
+// structure (core/alloc/compiler_builtins + verus_builtin + two macro stubs
+// + vstd.rmeta/.vir), not by data that varies.
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 const VERUS_BUILTIN_SRC: &str = "third_party/verus/source/builtin/src/lib.rs";
@@ -48,12 +50,6 @@ const VSTD_RMETA: &str = "libvstd.rmeta";
 const VSTD_VIR: &str = "vstd.vir";
 
 const BUILD_SCRIPT: &str = "scripts/build-wasm-libs.sh";
-
-fn write_manifest(lib_dir: &Path, names: &[String]) {
-    let body = names.iter().map(|n| format!("  {n:?}")).collect::<Vec<_>>().join(",\n");
-    let json = format!("[\n{body}\n]\n");
-    fs::write(lib_dir.join("manifest.json"), json).expect("write manifest.json");
-}
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
@@ -79,18 +75,11 @@ fn main() {
 
     let target = env::var("TARGET").unwrap_or_default();
     if target != "wasm32-unknown-unknown" {
-        // Host build — don't touch existing content (a prior wasm build may
-        // have populated it). Only seed an empty manifest if nothing's there.
-        fs::create_dir_all(&lib_dir).expect("mkdir lib dir");
-        if !lib_dir.join("manifest.json").exists() {
-            write_manifest(&lib_dir, &[]);
-        }
         return;
     }
 
-    // Wipe any stale rmetas from a previous run — the manifest is built from
-    // whatever's in the dir, so a stale entry would surface as a duplicate
-    // (or SVH-mismatched) crate in the bundle.
+    // Wipe any stale artifacts from a previous run — otherwise a renamed or
+    // removed crate would linger as a duplicate (or SVH-mismatched) rmeta.
     let _ = fs::remove_dir_all(&wasm_libs);
     fs::create_dir_all(&lib_dir).expect("mkdir lib dir");
 
@@ -109,15 +98,24 @@ fn main() {
         "expected {VSTD_VIR} in lib dir after rust_verify --export"
     );
 
-    // Collect every .rmeta in lib_dir, plus vstd.vir, sorted for stable order.
-    let mut names: Vec<String> = fs::read_dir(&lib_dir)
+    // Gzip each artifact in-place so the Makefile can ship the `.gz` copies
+    // to `dist/wasm-libs/`. `-k` keeps the original (needed by smoke.rs +
+    // in case of a manual script re-run); `-f` overwrites any stale .gz.
+    let names = fs::read_dir(&lib_dir)
         .expect("read lib dir")
         .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".rmeta"))
-        .collect();
-    names.push(VSTD_VIR.to_string());
-    names.sort();
-
-    write_manifest(&lib_dir, &names);
+        .map(|e| e.file_name())
+        .filter(|n| {
+            let s = n.to_string_lossy();
+            s.ends_with(".rmeta") || s == VSTD_VIR
+        });
+    for name in names {
+        let src = lib_dir.join(&name);
+        let status = Command::new("gzip")
+            .args(["-kf9"])
+            .arg(&src)
+            .status()
+            .unwrap_or_else(|e| panic!("spawn gzip: {e}"));
+        assert!(status.success(), "gzip {} failed", src.display());
+    }
 }

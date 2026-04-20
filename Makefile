@@ -43,14 +43,16 @@ dev release: $(DIST)/index.html $(DIST)/z3.js $(DIST)/z3.wasm host-verus
 	wasm-pack build --$@ --target web --out-dir $(PKG) --no-typescript
 	mv $(PKG)/verus_explorer_bg.wasm $(PKG)/verus_explorer.js $(DIST)/
 	rm -rf $(PKG)
-	# Copy the wasm-libs files (one rmeta per extern crate, plus vstd.vir
-	# and manifest.json) that `build.rs` emitted. The nested lib dir only
-	# ever contains these files, so `*` is safe and flattens them for the
-	# browser. Stable profile-independent path, so no glob/mtime sort
-	# needed and debug + release share the same build.
+	# Copy the wasm-libs bundle `build.rs` emitted: the pre-gzipped rmetas
+	# + vstd.vir. The browser fetches `${name}.gz` from here and
+	# decompresses via `DecompressionStream('gzip')` before handing the
+	# bytes to `wasm_libs_add_file`; the file list is hardcoded in
+	# `public/index.html`. Originals stay in `target/wasm-libs/` for
+	# `tests/smoke.rs` + manual script re-runs. Stable profile-independent
+	# source path, so debug + release share it.
 	rm -rf $(DIST)/wasm-libs
 	mkdir -p $(DIST)/wasm-libs
-	cp target/wasm-libs/lib/rustlib/wasm32-unknown-unknown/lib/* $(DIST)/wasm-libs/
+	cp target/wasm-libs/lib/rustlib/wasm32-unknown-unknown/lib/*.gz $(DIST)/wasm-libs/
 
 # Build the patched stage1 rustc. Slow (~10 min) and rarely needed (only
 # when third_party/rust source changes). Phony so each invocation re-runs

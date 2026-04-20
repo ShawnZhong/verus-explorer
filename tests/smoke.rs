@@ -37,12 +37,12 @@ fn pipeline_preserves_ghost_proof_block() {
     verus_explorer::init();
 
     // Stream every rmeta + `vstd.vir` staged by `build.rs` into the
-    // wasm-libs bundle. `manifest.json` lives alongside them but isn't an
-    // rmeta, so skip it.
+    // wasm-libs bundle. The `.gz` siblings are for the browser loader;
+    // here we read the originals directly.
     let dir = env!("WASM_LIBS_DIR");
     for entry in readdir_sync(dir) {
         let name = entry.as_string().expect("readdirSync returns strings");
-        if name == "manifest.json" {
+        if !(name.ends_with(".rmeta") || name == "vstd.vir") {
             continue;
         }
         let bytes = read_file_sync(&format!("{dir}/{name}"));
