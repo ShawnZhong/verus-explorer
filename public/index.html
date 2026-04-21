@@ -765,10 +765,12 @@
         if (body.length > 0 && !body.endsWith('\n')) body += '\n';
         const start = body.length;
         body += contents[i];
+        // Fold from end-of-first-line (the natural `;;` label) to
+        // end-of-block. Rust-side only flags bulky blocks as `fold`,
+        // so every folded block is known to be multi-line.
         if (folds[i]) {
           const firstNl = contents[i].indexOf('\n');
-          const labelEnd = firstNl < 0 ? body.length : start + firstNl;
-          ranges.push({ from: labelEnd, to: body.length });
+          ranges.push({ from: start + firstNl, to: body.length });
         }
       }
       if (section === 'VERDICT') {

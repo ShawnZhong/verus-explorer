@@ -848,17 +848,6 @@ fn is_local_dt(dt: &Dt) -> bool {
     }
 }
 
-fn pretty_print_krate(krate: &Krate) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    vir::printer::write_krate(&mut buf, krate, &vir::printer::COMPACT_TONODEOPTS);
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-fn pretty_print_krate_sst(krate: &KrateSst) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    vir::printer::write_krate_sst(&mut buf, krate, &vir::printer::COMPACT_TONODEOPTS);
-    String::from_utf8_lossy(&buf).into_owned()
-}
 
 fn dump_vir_and_verify(
     compiler: &Compiler,
@@ -882,8 +871,31 @@ fn dump_vir_and_verify(
     };
     time("dump.vir", || {
         let (uk, vk) = partition_krate(&krate);
-        let mut blocks = Vec::with_capacity(2);
-        push_user_vstd(&mut blocks, pretty_print_krate(&uk), pretty_print_krate(&vk));
+        let pp = |k: &Krate| {
+            let mut buf: Vec<u8> = Vec::new();
+            vir::printer::write_krate(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        let mut blocks = Vec::new();
+        // Vstd: one folded block, labeled with a natural `;; vstd`
+        // comment (matches AIR's `;; AIR prelude` convention).
+        let vstd = pp(&vk);
+        if !vstd.trim().is_empty() {
+            blocks.push(Block {
+                content: format!(";; vstd\n{}", vstd.trim_end()),
+                fold: true,
+            });
+        }
+        // User: one block per top-level item. `write_krate` ends every
+        // item with a trailing `\n\n`, so splitting on that boundary
+        // gives per-function / datatype / trait / … blocks without
+        // having to iterate each item kind by hand.
+        for chunk in pp(&uk).split("\n\n") {
+            let chunk = chunk.trim();
+            if !chunk.is_empty() {
+                blocks.push(Block { content: chunk.to_string(), fold: false });
+            }
+        }
         emit_section(Section { name: "VIR", blocks });
     });
     if !verify {
@@ -977,7 +989,7 @@ struct VerifyOutput {
     /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
     /// (still polymorphic; function bodies as SST expressions/statements).
     /// One pair of (vstd, user) `Block`s per module — appended via
-    /// `append_sst_dump` / `push_user_vstd` as each module is verified.
+    /// `push_user_vstd` as each module is verified.
     sst_ast_blocks: Vec<Block>,
     /// After `poly::poly_krate_for_module` — monomorphized SST
     /// (polymorphism erased; the form the AIR lowerer consumes). Same
@@ -1087,15 +1099,13 @@ impl AirBufs {
 
     // Drain the four log buffers as one atomic snapshot and push one
     // block into each of `blocks` (indexed [initial, middle, final,
-    // smt]). Called at every pipeline boundary — per-module prelude,
-    // per-op, plus a trailing drain for error paths — so the first
-    // line of each block is the natural `;;` comment Verus / AIR
-    // emitted right before. AIR tabs always fold (every block is a
-    // ToC entry); SMT folds only non-queries so the reader can scroll
-    // through actual solver queries without a click per query. Skips
-    // the push when the snapshot is empty — typical for the trailing
-    // drain after a successful run.
-    fn drain_block(&self, blocks: &mut [Vec<Block>; 4], is_query: bool) {
+    // smt]). Called at every pipeline boundary — per-module prelude
+    // and per-op — so the first line of each block is the natural
+    // `;;` comment Verus / AIR emitted right before. Only the prelude
+    // folds (bulky boilerplate); every other block renders expanded
+    // so the reader can scroll through them linearly. Skips the push
+    // when the snapshot is empty.
+    fn drain_block(&self, blocks: &mut [Vec<Block>; 4], fold: bool) {
         let texts: [String; 4] = [
             self.air_initial.drain_string(),
             self.air_middle.drain_string(),
@@ -1105,9 +1115,8 @@ impl AirBufs {
         if texts.iter().all(|t| t.trim().is_empty()) {
             return;
         }
-        let folds = [true, true, true, !is_query];
         for (i, content) in texts.into_iter().enumerate() {
-            blocks[i].push(Block { content, fold: folds[i] });
+            blocks[i].push(Block { content, fold });
         }
     }
 }
@@ -1235,22 +1244,25 @@ fn verify_module(
         .map(|f| f.x.name.clone())
         .collect();
 
+    let pp_sst = |k: &KrateSst| {
+        let mut buf: Vec<u8> = Vec::new();
+        vir::printer::write_krate_sst(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    let dump_sst = |blocks: &mut Vec<Block>, k: &KrateSst| {
+        let (user, vstd) = partition_krate_sst(k);
+        push_user_vstd(blocks, pp_sst(&user), pp_sst(&vstd));
+    };
+
     let krate_sst = time("verify.ast_to_sst", || vir::ast_to_sst_crate::ast_to_sst_krate(
         &mut ctx,
         mctx.reporter,
         &bucket_funs,
         &pruned,
     ))?;
-    time("dump.sst_ast", || append_sst_dump(&mut output.sst_ast_blocks, &krate_sst));
+    time("dump.sst_ast", || dump_sst(&mut output.sst_ast_blocks, &krate_sst));
     let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
-    time("dump.sst_poly", || append_sst_dump(&mut output.sst_poly_blocks, &krate_sst));
-
-    let visible_dts: Vec<Datatype> = krate_sst
-        .datatypes
-        .iter()
-        .filter(|d| is_visible_to(&d.x.visibility, &module_path))
-        .cloned()
-        .collect();
+    time("dump.sst_poly", || dump_sst(&mut output.sst_poly_blocks, &krate_sst));
 
     // `Context::new` calls `SmtProcess::launch` → `Z3_mk_config`+`Z3_mk_context`,
     // which on wasm hops into the Emscripten Z3 runtime and spins up a fresh
@@ -1269,30 +1281,10 @@ fn verify_module(
         c
     });
     let bufs = AirBufs::attach(&mut air_ctx);
-
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
-    // Drain AIR/SMT buffers regardless of pass/fail: if `run_queries` errors
-    // partway through, every block drained before that point still ships
-    // to the UI. Final trailing drain after the `try` block covers anything
-    // emitted between the last per-op drain and the error / completion.
-    let result: Result<(), VirErr> = (|| {
-        time("verify.feed_decls", || {
-            feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)
-        })?;
-        // Prelude drain: captures `;; AIR prelude` (emitted lazily by
-        // `Context::ensure_started` on first command — air/context.rs:412)
-        // plus every decl `feed_module_decls` pushed into the log writers.
-        bufs.drain_block(&mut output.air_blocks, /* is_query */ false);
-        time("verify.queries", || {
-            run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, mctx.expand_errors)
-        })?;
-        Ok(())
-    })();
-    // Trailing drain — usually empty, but defensive in case a later
-    // teardown step (or an early-exit path we didn't anticipate) leaves
-    // content in the buffers.
-    bufs.drain_block(&mut output.air_blocks, /* is_query */ false);
-    result?;
+    time("verify.queries", || {
+        run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, &module_path, mctx)
+    })?;
     // `ctx.free()` drops the AirBufs-attached Z3 context → `Z3_del_context`.
     // Any deferred solver teardown shows up here.
     Ok(time("verify.ctx_free", || ctx.free()))
@@ -1343,8 +1335,24 @@ fn run_queries(
     krate_sst: &KrateSst,
     bucket_funs: HashSet<Fun>,
     output: &mut VerifyOutput,
-    expand_errors: bool,
+    module_path: &VirPath,
+    mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
+    // Prelude: feed module-scoped AIR setup (axioms, fuel, datatype /
+    // trait / assoc / function-name decls) that every query depends on,
+    // then drain as the first block. `;; AIR prelude` lands in the
+    // drain from `Context::ensure_started` firing on the first command
+    // (air/context.rs:412), serving as the block's natural fold label.
+    let visible_dts: Vec<Datatype> = krate_sst.datatypes.iter()
+        .filter(|d| is_visible_to(&d.x.visibility, module_path))
+        .cloned()
+        .collect();
+    time("verify.feed_decls", || feed_module_decls(feeder, ctx, krate_sst, &visible_dts, mctx))?;
+    // Only the prelude folds — it's bulky boilerplate. Every op below
+    // renders expanded so the reader can scroll through queries /
+    // context ops linearly.
+    bufs.drain_block(&mut output.air_blocks, /* fold */ true);
+
     let bucket = Bucket { funs: bucket_funs };
     let mut opgen = OpGenerator::new(ctx, krate_sst, bucket);
     while let Some(mut function_opgen) = opgen.next()? {
@@ -1372,11 +1380,10 @@ fn run_queries(
             // every log gets a `;; <OpKind> <func-path>` line right
             // before the op's commands. That line becomes the natural
             // first-line label of the drain block below — no
-            // text-parsing needed downstream.
-            feeder.air_ctx.blank_line();
+            // text-parsing needed downstream. No leading blank line:
+            // block boundaries in the rendered output already separate
+            // consecutive ops visually.
             feeder.air_ctx.comment(&op.to_air_comment());
-
-            let is_query = matches!(op.kind, OpKind::Query { .. });
 
             // The explorer always compiles an anonymous crate, so every user
             // function's friendly name starts with `crate::`. Strip it so the
@@ -1548,7 +1555,7 @@ fn run_queries(
             // `expand_errors_next` at the top. Gated by the user-facing
             // "Expand errors" toggle — skipping the sub-queries shaves a
             // couple hundred ms per failed query in the browser.
-            if expand_errors
+            if mctx.expand_errors
                 && matches!(retry_kind, Some(QueryOp::Body(Style::Normal)))
                 && any_invalid
                 && !default_prover_failed_assert_ids.is_empty()
@@ -1574,19 +1581,10 @@ fn run_queries(
             // Drain this op's text into its own block — first line is
             // the `;; <OpKind> <func-path>` we emitted above, which
             // serves as the visible fold label on the tab.
-            bufs.drain_block(&mut output.air_blocks, is_query);
+            bufs.drain_block(&mut output.air_blocks, /* fold */ false);
         }
     }
     Ok(())
-}
-
-// `krate_sst` is per-module (SST lowering happens inside `verify_module`).
-// Each call appends one pair of (vstd, user) `Block`s for the module
-// onto `out`. Verify still runs on the full krate; these partitions
-// are display-only.
-fn append_sst_dump(out: &mut Vec<Block>, krate_sst: &KrateSst) {
-    let (user, vstd) = partition_krate_sst(krate_sst);
-    push_user_vstd(out, pretty_print_krate_sst(&user), pretty_print_krate_sst(&vstd));
 }
 
 fn partition_krate_sst(krate: &KrateSst) -> (KrateSst, KrateSst) {
