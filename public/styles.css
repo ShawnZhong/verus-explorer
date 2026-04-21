@@ -441,3 +441,15 @@ pre.diagnostic.clickable:hover { filter: brightness(0.97); }
   border-left: 3px solid var(--focus-ring);
   font-weight: 600;
 }
+
+/* Clickable `input.rs:L:C` span links in the output view (applied by
+   the `spanLinks` CM6 plugin). */
+.cm-span-link {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+.cm-span-link:hover {
+  color: var(--focus-ring);
+  text-decoration-style: solid;
+}

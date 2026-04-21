@@ -729,6 +729,56 @@
       }
     }, { decorations: v => v.decorations });
 
+    // Mark `input.rs:L:C` occurrences as clickable links
+    // (`.cm-span-link`). Mousedown dispatches `jumpToLoc` — the same
+    // path the diagnostic list uses — turning output-view spans into
+    // a second hand-off surface for navigating back to the source.
+    // `FileName::Custom("input.rs")` formats as `<input.rs>` in rustc span
+    // Debug output, so the match must accept the surrounding angle brackets.
+    // Covers the full `<input.rs>:L:C: L2:C2 (#N)` form so the whole
+    // reference becomes one clickable mark; line/col come from the start.
+    const SPAN_LINK_RE = /<?input\.rs>?:(\d+):(\d+)(?:: \d+:\d+)?(?: \(#\d+\))?/g;
+    const spanLinks = ViewPlugin.fromClass(class {
+      constructor(view) { this.decorations = this.compute(view); }
+      update(u) {
+        if (u.docChanged || u.viewportChanged) this.decorations = this.compute(u.view);
+      }
+      compute(view) {
+        const b = new RangeSetBuilder();
+        for (const { from, to } of view.visibleRanges) {
+          const text = view.state.doc.sliceString(from, to);
+          SPAN_LINK_RE.lastIndex = 0;
+          let m;
+          while ((m = SPAN_LINK_RE.exec(text))) {
+            const start = from + m.index;
+            b.add(start, start + m[0].length, Decoration.mark({
+              class: 'cm-span-link',
+              attributes: { 'data-line': m[1], 'data-col': m[2], title: 'Jump to source' },
+            }));
+          }
+        }
+        return b.finish();
+      }
+    }, {
+      decorations: v => v.decorations,
+      eventHandlers: {
+        mousedown(e) {
+          // CM6's stream-language tokenizer wraps sub-spans inside the
+          // mark decoration, so `e.target` is usually an inner token
+          // element. Walk up to the `.cm-span-link` ancestor to read the
+          // data-line / data-col attributes placed on the mark itself.
+          const el = e.target instanceof Element ? e.target.closest('.cm-span-link') : null;
+          if (!el) return;
+          const line = parseInt(el.dataset.line, 10);
+          const col = parseInt(el.dataset.col, 10);
+          if (Number.isFinite(line) && Number.isFinite(col)) {
+            jumpToLoc({ line, col });
+            e.preventDefault();
+          }
+        },
+      },
+    });
+
     // Replace the read-only CM6 viewer's doc with the selected section body,
     // then restore the user's last scroll position for that tab (0 on first
     // visit). One long-lived view is cheaper than N-per-tab; the scroll map
@@ -1232,6 +1282,7 @@
         outputLanguage.of([]),
         sectionFold,
         bannerLines,
+        spanLinks,
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         ...(dark ? [oneDark] : []),
