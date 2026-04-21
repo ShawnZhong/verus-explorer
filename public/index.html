@@ -420,6 +420,7 @@
           currentTab = chosen;
           lastVariantInGroup.set(g.id, chosen);
           rerender();
+          writeTabToUrl();
         });
         parseTabsEl.insertBefore(button, tabActions);
       }
@@ -454,6 +455,7 @@
             currentTab = v;
             lastVariantInGroup.set(currentGroup, v);
             rerender();
+            writeTabToUrl();
           });
           parseSubtabsEl.appendChild(button);
         }
@@ -869,6 +871,10 @@
       rerender();
       updateErrorDecorations();
       buildInlineDiagnostics();
+      // Keep `&t=<TAB>` in sync when the default-pick logic above swapped
+      // the tab (e.g. the shared link named a tab that isn't produced by
+      // this source). Cheap — just rewrites the suffix.
+      writeTabToUrl();
     };
 
     // ------------------------------------------------------------------
@@ -914,11 +920,21 @@
     // one when saves overlap.
     let hashSaveTimer = null;
     let hashSaveGen = 0;
+    // Hash layout: `#<src>&t=<TAB>`. Src is b64url (no `&`), so splitting
+    // on `&` is unambiguous. `buildHash` assembles the current pieces;
+    // `writeTabToUrl` swaps only the `&t=` suffix without re-encoding the
+    // source — cheap enough to call synchronously on every tab click.
+    const buildHashTabSuffix = () => currentTab ? `&t=${currentTab}` : '';
     const saveHashNow = async () => {
       const myGen = ++hashSaveGen;
       const encoded = await encodeSrc(view.state.doc.toString());
       if (myGen !== hashSaveGen) return;
-      history.replaceState(null, '', '#' + encoded);
+      history.replaceState(null, '', '#' + encoded + buildHashTabSuffix());
+    };
+    const writeTabToUrl = () => {
+      const src = location.hash.slice(1).split('&')[0];
+      if (!src) return;
+      history.replaceState(null, '', '#' + src + buildHashTabSuffix());
     };
     const scheduleHashSave = () => {
       if (hashSaveTimer) clearTimeout(hashSaveTimer);
@@ -988,8 +1004,20 @@
       const hash = location.hash.slice(1);
       if (hash) {
         try {
-          const src = await decodeSrc(hash);
+          // Hash layout: `<src>&t=<TAB>`. Split before decoding so a
+          // malformed tab suffix can't break src decode.
+          const [srcPart, ...rest] = hash.split('&');
+          const src = await decodeSrc(srcPart);
           loadedFromHash = true;
+          // Restore the tab (if valid) before `runParse` picks its
+          // default — the default-pick logic treats a pre-set
+          // `currentTab` as "keep this" when its section is cached.
+          for (const kv of rest) {
+            if (kv.startsWith('t=')) {
+              const t = kv.slice(2);
+              if (SECTION_ORDER.includes(t)) currentTab = t;
+            }
+          }
           return src;
         } catch (e) { console.warn('hash decode failed:', e); }
       }

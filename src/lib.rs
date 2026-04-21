@@ -42,7 +42,7 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -73,13 +73,13 @@ use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::FileLoader;
 use rustc_span::{FileName, Symbol};
-use vir::ast::{ArchWordBits, Datatype, Dt, Fun, Krate, KrateX, Path as VirPath, VirErr};
+use vir::ast::{ArchWordBits, Datatype, Dt, Fun, Krate, Path as VirPath, VirErr};
 use vir::ast_util::{fun_as_friendly_rust_name, is_visible_to};
 use vir::context::{Ctx, GlobalCtx};
 use vir::messages::{ToAny, VirMessageInterface};
 use vir::prelude::PreludeConfig;
 use vir::def::ProverChoice;
-use vir::sst::{AssertId, KrateSst, KrateSstX};
+use vir::sst::{AssertId, KrateSst};
 use wasm_bindgen::prelude::*;
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -790,155 +790,42 @@ impl<'tcx> rustc_hir_pretty::PpAnn for HirTypedAnn<'tcx> {
 // 8. Stage 3: HIR → VIR
 // ═══════════════════════════════════════════════════════════════════════
 
-// Dump-only grouping: partition items by `PathX::krate` so each crate
-// (`None` = local / user, `Some(ident)` = external — vstd, core,
-// alloc, …) lands in its own mini-krate that JS can fold independently.
-// Returned as a Vec sorted by key so iteration yields `None` first,
-// then external crates alphabetically. Verify still runs on the full
-// krate; this split is display-only, stable against repo renames
-// because `PathX::krate` is rustc / Verus's canonical crate identifier.
-fn split_krate_by_crate(krate: &Krate) -> Vec<(Option<Arc<String>>, Krate)> {
-    // Tuples are structural, not per-crate — lump under the local crate.
-    let dt_key = |dt: &Dt| match dt {
-        Dt::Path(p) => p.krate.clone(),
-        Dt::Tuple(_) => None,
-    };
-    #[derive(Default)]
-    struct Bucket {
-        functions: Vec<vir::ast::Function>,
-        reveal_groups: Vec<vir::ast::RevealGroup>,
-        datatypes: Vec<Datatype>,
-        traits: Vec<vir::ast::Trait>,
-        trait_impls: Vec<vir::ast::TraitImpl>,
-        assoc_type_impls: Vec<vir::ast::AssocTypeImpl>,
-        modules: Vec<vir::ast::Module>,
-    }
-    let mut buckets: HashMap<Option<Arc<String>>, Bucket> = HashMap::new();
-    for f in krate.functions.iter() {
-        buckets.entry(f.x.name.path.krate.clone()).or_default().functions.push(f.clone());
-    }
-    for r in krate.reveal_groups.iter() {
-        buckets.entry(r.x.name.path.krate.clone()).or_default().reveal_groups.push(r.clone());
-    }
-    for d in krate.datatypes.iter() {
-        buckets.entry(dt_key(&d.x.name)).or_default().datatypes.push(d.clone());
-    }
-    for t in krate.traits.iter() {
-        buckets.entry(t.x.name.krate.clone()).or_default().traits.push(t.clone());
-    }
-    for t in krate.trait_impls.iter() {
-        buckets.entry(t.x.impl_path.krate.clone()).or_default().trait_impls.push(t.clone());
-    }
-    for a in krate.assoc_type_impls.iter() {
-        buckets.entry(a.x.impl_path.krate.clone()).or_default().assoc_type_impls.push(a.clone());
-    }
-    for m in krate.modules.iter() {
-        buckets.entry(m.x.path.krate.clone()).or_default().modules.push(m.clone());
-    }
-    buckets.into_iter().map(|(k, b)| {
-        let local = k.is_none();
-        let kk = Arc::new(KrateX {
-            functions: b.functions,
-            reveal_groups: b.reveal_groups,
-            datatypes: b.datatypes,
-            traits: b.traits,
-            trait_impls: b.trait_impls,
-            assoc_type_impls: b.assoc_type_impls,
-            modules: b.modules,
-            // External-item metadata is local-crate-scoped (user `#[external]`
-            // annotations) — keep it only on the local mini-krate.
-            external_fns: if local { krate.external_fns.clone() } else { vec![] },
-            external_types: if local { krate.external_types.clone() } else { vec![] },
-            path_as_rust_names: if local { krate.path_as_rust_names.clone() } else { vec![] },
-            arch: krate.arch.clone(),
-            opaque_types: if local { krate.opaque_types.clone() } else { vec![] },
-        });
-        (k, kk)
-    }).collect()
-}
-
-// SST counterpart of `split_krate_by_crate`. Same partitioning by
-// `PathX::krate`, but on `KrateSst` (which has a smaller field set —
-// no modules / external_* / path_as_rust_names / arch).
-fn split_krate_sst_by_crate(krate: &KrateSst) -> Vec<(Option<Arc<String>>, KrateSst)> {
-    let dt_key = |dt: &Dt| match dt {
-        Dt::Path(p) => p.krate.clone(),
-        Dt::Tuple(_) => None,
-    };
-    #[derive(Default)]
-    struct Bucket {
-        functions: Vec<vir::sst::FunctionSst>,
-        datatypes: Vec<Datatype>,
-        traits: Vec<vir::ast::Trait>,
-        trait_impls: Vec<vir::sst::TraitImplSst>,
-        assoc_type_impls: Vec<vir::ast::AssocTypeImpl>,
-        reveal_groups: Vec<vir::ast::RevealGroup>,
-    }
-    let mut buckets: HashMap<Option<Arc<String>>, Bucket> = HashMap::new();
-    for f in krate.functions.iter() {
-        buckets.entry(f.x.name.path.krate.clone()).or_default().functions.push(f.clone());
-    }
-    for d in krate.datatypes.iter() {
-        buckets.entry(dt_key(&d.x.name)).or_default().datatypes.push(d.clone());
-    }
-    for t in krate.traits.iter() {
-        buckets.entry(t.x.name.krate.clone()).or_default().traits.push(t.clone());
-    }
-    for t in krate.trait_impls.iter() {
-        buckets.entry(t.x.impl_path.krate.clone()).or_default().trait_impls.push(t.clone());
-    }
-    for a in krate.assoc_type_impls.iter() {
-        buckets.entry(a.x.impl_path.krate.clone()).or_default().assoc_type_impls.push(a.clone());
-    }
-    for r in krate.reveal_groups.iter() {
-        buckets.entry(r.x.name.path.krate.clone()).or_default().reveal_groups.push(r.clone());
-    }
-    buckets.into_iter().map(|(k, b)| {
-        let local = k.is_none();
-        let kk = Arc::new(KrateSstX {
-            functions: b.functions,
-            datatypes: b.datatypes,
-            traits: b.traits,
-            trait_impls: b.trait_impls,
-            assoc_type_impls: b.assoc_type_impls,
-            reveal_groups: b.reveal_groups,
-            opaque_types: if local { krate.opaque_types.clone() } else { vec![] },
-        });
-        (k, kk)
-    }).collect()
-}
-
-// Turn a per-crate grouping into blocks: local items split per-item
-// (unfolded), external crates collapsed into one folded block each
-// labeled `;; <crate>`. Shared by the VIR and SST dumps.
-fn push_by_crate<K>(
-    out: &mut Vec<Block>,
-    groups: Vec<(Option<Arc<String>>, K)>,
-    pp: impl Fn(&K) -> String,
-) {
-    for (key, k) in groups {
-        let text = pp(&k);
-        let text = text.trim_end();
-        if text.is_empty() { continue; }
-        match key {
-            None => {
-                // `write_krate` / `write_krate_sst` delimit items with
-                // `\n\n`, so splitting gives per-function / datatype /
-                // trait / … blocks without hand-iterating each kind.
-                for chunk in text.split("\n\n") {
-                    let chunk = chunk.trim();
-                    if !chunk.is_empty() {
-                        out.push(Block { content: chunk.to_string(), fold: false });
-                    }
-                }
-            }
-            Some(name) => {
-                out.push(Block {
-                    content: format!(";; {}\n{}", name, text),
-                    fold: true,
-                });
+// Turn a printed krate dump into blocks: split by `\n\n` (every
+// `write_krate{,_sst}` item ends with a trailing blank line) and pair
+// each chunk with the `PathX::krate` key of the item that produced
+// it — `None` for local / user, `Some(_)` for external (vstd, core,
+// alloc, …). Locals render unfolded, one block per item. Adjacent
+// folded chunks merge into a single folded block, so the external
+// tail of a dump (hundreds of `(module_id …)`, `(trait …)`,
+// `(group_id …)`, … rows from vstd + core) collapses to one row.
+// Callers pass `keys` in the exact order the printer visits items;
+// `zip` drops the trailing `(arch_word_bits …)` footer once keys run
+// out.
+fn items_to_blocks(text: &str, keys: Vec<Option<Arc<String>>>) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    for (chunk, key) in text.split("\n\n")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .zip(keys)
+    {
+        let fold = key.is_some();
+        if let Some(prev) = out.last_mut() {
+            if fold && prev.fold {
+                prev.content.push('\n');
+                prev.content.push_str(chunk);
+                continue;
             }
         }
+        out.push(Block { content: chunk.to_string(), fold });
+    }
+    out
+}
+
+fn dt_crate(dt: &Dt) -> Option<Arc<String>> {
+    match dt {
+        Dt::Path(p) => p.krate.clone(),
+        // Tuples are structural, not per-crate — treat as local.
+        Dt::Tuple(_) => None,
     }
 }
 
@@ -964,13 +851,23 @@ fn dump_vir_and_verify(
         return;
     };
     time("dump.vir", || {
-        let mut blocks = Vec::new();
-        push_by_crate(&mut blocks, split_krate_by_crate(&krate), |k: &Krate| {
-            let mut buf: Vec<u8> = Vec::new();
-            vir::printer::write_krate(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
-            String::from_utf8_lossy(&buf).into_owned()
-        });
-        emit_section(Section { name: "VIR", blocks });
+        let mut buf: Vec<u8> = Vec::new();
+        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        // Keys in the exact order `write_krate` visits items; trailing
+        // `(arch_word_bits …)` and any `path_as_rust_names` / banner
+        // chunks with no paired key get dropped by `items_to_blocks`.
+        let mut keys = Vec::new();
+        for d in krate.datatypes.iter() { keys.push(dt_crate(&d.x.name)); }
+        for f in krate.functions.iter() { keys.push(f.x.name.path.krate.clone()); }
+        for r in krate.reveal_groups.iter() { keys.push(r.x.name.path.krate.clone()); }
+        for t in krate.traits.iter() { keys.push(t.x.name.krate.clone()); }
+        for t in krate.trait_impls.iter() { keys.push(t.x.impl_path.krate.clone()); }
+        for a in krate.assoc_type_impls.iter() { keys.push(a.x.impl_path.krate.clone()); }
+        for m in krate.modules.iter() { keys.push(m.x.path.krate.clone()); }
+        for ef in krate.external_fns.iter() { keys.push(ef.path.krate.clone()); }
+        for et in krate.external_types.iter() { keys.push(et.krate.clone()); }
+        emit_section(Section { name: "VIR", blocks: items_to_blocks(&text, keys) });
     });
     if !verify {
         return;
@@ -1062,23 +959,23 @@ fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
 struct VerifyOutput {
     /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
     /// (still polymorphic; function bodies as SST expressions/statements).
-    /// One block per top-level user item plus one folded block per
-    /// external crate, per module — appended via `push_by_crate`.
+    /// One block per top-level item (function / datatype / trait / …),
+    /// with `fold: true` on items from external crates so the reader
+    /// can collapse them individually. Appended per module by
+    /// `dump_sst` in `verify_module`.
     sst_ast_blocks: Vec<Block>,
     /// After `poly::poly_krate_for_module` — monomorphized SST
     /// (polymorphism erased; the form the AIR lowerer consumes). Same
-    /// per-module per-crate block shape as `sst_ast_blocks`.
+    /// per-item block shape as `sst_ast_blocks`.
     sst_poly_blocks: Vec<Block>,
     /// Block stream per AIR/SMT tab in `[AIR_INITIAL, AIR_MIDDLE,
-    /// AIR_FINAL, SMT]` order. `AirBufs::drain_block` pushes one
-    /// block into each at every pipeline boundary (per-module prelude
-    /// and per-`OpGenerator` op), with the fold flag baked in at push
-    /// time: AIR tabs always fold (ToC-style navigation), SMT folds
-    /// only non-query chrome so the reader can scroll through actual
-    /// solver queries linearly. The block's first line is a natural
-    /// `;;` comment — AIR's `;; AIR prelude` or the
-    /// `op.to_air_comment()` we feed before each op — which serves as
-    /// the visible fold label.
+    /// AIR_FINAL, SMT]` order. `LogBufs::drain_block` pushes one
+    /// block per pipeline boundary (prelude, each op), with
+    /// `fold: true` for prelude and all Context ops, `fold: false`
+    /// for Query ops. Adjacent folded blocks merge into one so the
+    /// prelude + axiom / spec / broadcast / trait-impl setup
+    /// collapses to a single row with the user's query blocks
+    /// expanded beneath.
     air_blocks: [Vec<Block>; 4],
     verdicts: Vec<Verdict>,
 }
@@ -1144,7 +1041,7 @@ impl io::Write for SharedBuf {
 
 // Holds the four shared buffers attached to an AIR `Context` for log capture.
 // `attach` creates them and wires them into the context in one step.
-struct AirBufs {
+struct LogBufs {
     air_initial: SharedBuf,
     air_middle: SharedBuf,
     air_final: SharedBuf,
@@ -1156,7 +1053,7 @@ struct AirBufs {
 // so we always attach all four; the browser caches the text on the JS side
 // and toggles rendering from the cache instead of re-parsing on every
 // checkbox change.
-impl AirBufs {
+impl LogBufs {
     fn attach(ctx: &mut Context) -> Self {
         let bufs = Self {
             air_initial: SharedBuf::new(),
@@ -1171,14 +1068,11 @@ impl AirBufs {
         bufs
     }
 
-    // Drain the four log buffers as one atomic snapshot and push one
-    // block into each of `blocks` (indexed [initial, middle, final,
-    // smt]). Called at every pipeline boundary — per-module prelude
-    // and per-op — so the first line of each block is the natural
-    // `;;` comment Verus / AIR emitted right before. Only the prelude
-    // folds (bulky boilerplate); every other block renders expanded
-    // so the reader can scroll through them linearly. Skips the push
-    // when the snapshot is empty.
+    // Drain all four log buffers as one atomic snapshot and push one
+    // block per tab onto `blocks` (indexed [initial, middle, final,
+    // smt]). Adjacent folded blocks merge, so consecutive Context
+    // ops collapse into the prelude's fold row. Skips the push when
+    // the snapshot is empty.
     fn drain_block(&self, blocks: &mut [Vec<Block>; 4], fold: bool) {
         let texts: [String; 4] = [
             self.air_initial.drain_string(),
@@ -1190,6 +1084,15 @@ impl AirBufs {
             return;
         }
         for (i, content) in texts.into_iter().enumerate() {
+            if let Some(prev) = blocks[i].last_mut() {
+                if fold && prev.fold {
+                    if !prev.content.ends_with('\n') {
+                        prev.content.push('\n');
+                    }
+                    prev.content.push_str(&content);
+                    continue;
+                }
+            }
             blocks[i].push(Block { content, fold });
         }
     }
@@ -1319,11 +1222,17 @@ fn verify_module(
         .collect();
 
     let dump_sst = |blocks: &mut Vec<Block>, k: &KrateSst| {
-        push_by_crate(blocks, split_krate_sst_by_crate(k), |k: &KrateSst| {
-            let mut buf: Vec<u8> = Vec::new();
-            vir::printer::write_krate_sst(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
-            String::from_utf8_lossy(&buf).into_owned()
-        });
+        let mut buf: Vec<u8> = Vec::new();
+        vir::printer::write_krate_sst(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let mut keys = Vec::new();
+        for d in k.datatypes.iter() { keys.push(dt_crate(&d.x.name)); }
+        for f in k.functions.iter() { keys.push(f.x.name.path.krate.clone()); }
+        for t in k.traits.iter() { keys.push(t.x.name.krate.clone()); }
+        for t in k.trait_impls.iter() { keys.push(t.x.impl_path.krate.clone()); }
+        for a in k.assoc_type_impls.iter() { keys.push(a.x.impl_path.krate.clone()); }
+        for r in k.reveal_groups.iter() { keys.push(r.x.name.path.krate.clone()); }
+        blocks.extend(items_to_blocks(&text, keys));
     };
 
     let krate_sst = time("verify.ast_to_sst", || vir::ast_to_sst_crate::ast_to_sst_krate(
@@ -1352,12 +1261,12 @@ fn verify_module(
         c.set_rlimit(10 * 3_000_000);
         c
     });
-    let bufs = AirBufs::attach(&mut air_ctx);
+    let bufs = LogBufs::attach(&mut air_ctx);
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
     time("verify.queries", || {
         run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, &module_path, mctx)
     })?;
-    // `ctx.free()` drops the AirBufs-attached Z3 context → `Z3_del_context`.
+    // `ctx.free()` drops the LogBufs-attached Z3 context → `Z3_del_context`.
     // Any deferred solver teardown shows up here.
     Ok(time("verify.ctx_free", || ctx.free()))
 }
@@ -1402,7 +1311,7 @@ fn feed_module_decls(
 // the pieces the explorer needs (no spinoff, profiler, or progress bars).
 fn run_queries(
     feeder: &mut Feeder,
-    bufs: &AirBufs,
+    bufs: &LogBufs,
     ctx: &mut Ctx,
     krate_sst: &KrateSst,
     bucket_funs: HashSet<Fun>,
@@ -1410,19 +1319,17 @@ fn run_queries(
     module_path: &VirPath,
     mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
-    // Prelude: feed module-scoped AIR setup (axioms, fuel, datatype /
-    // trait / assoc / function-name decls) that every query depends on,
-    // then drain as the first block. `;; AIR prelude` lands in the
-    // drain from `Context::ensure_started` firing on the first command
-    // (air/context.rs:412), serving as the block's natural fold label.
+    // Feed the module-scoped AIR prelude (axioms, fuel, datatype /
+    // trait / assoc / function-name decls) that every query depends
+    // on, then drain it as a single folded block — it's bulky
+    // boilerplate the reader rarely wants expanded. Each op below
+    // drains into its own expanded block so queries / context ops
+    // read linearly beneath the collapsed prelude.
     let visible_dts: Vec<Datatype> = krate_sst.datatypes.iter()
         .filter(|d| is_visible_to(&d.x.visibility, module_path))
         .cloned()
         .collect();
     time("verify.feed_decls", || feed_module_decls(feeder, ctx, krate_sst, &visible_dts, mctx))?;
-    // Only the prelude folds — it's bulky boilerplate. Every op below
-    // renders expanded so the reader can scroll through queries /
-    // context ops linearly.
     bufs.drain_block(&mut output.air_blocks, /* fold */ true);
 
     let bucket = Bucket { funs: bucket_funs };
@@ -1450,11 +1357,8 @@ fn run_queries(
 
             // Emit the op's label comment via `air_ctx.comment(...)` so
             // every log gets a `;; <OpKind> <func-path>` line right
-            // before the op's commands. That line becomes the natural
-            // first-line label of the drain block below — no
-            // text-parsing needed downstream. No leading blank line:
-            // block boundaries in the rendered output already separate
-            // consecutive ops visually.
+            // before the op's commands. That becomes the natural
+            // first-line label of the drain block below.
             feeder.air_ctx.comment(&op.to_air_comment());
 
             // The explorer always compiles an anonymous crate, so every user
@@ -1650,10 +1554,14 @@ fn run_queries(
                 };
                 function_opgen.report_expand_error_result(res);
             }
-            // Drain this op's text into its own block — first line is
-            // the `;; <OpKind> <func-path>` we emitted above, which
-            // serves as the visible fold label on the tab.
-            bufs.drain_block(&mut output.air_blocks, /* fold */ false);
+            // Drain this op's text. Context ops (axioms, specs,
+            // broadcast, trait-impl axioms) fold — they're setup for
+            // the Query ops that follow. Query ops stay expanded so
+            // the reader can see the actual check-sat bodies.
+            // `drain_block` merges adjacent folded blocks, so the
+            // prelude + Context-op setup collapses into one row.
+            let fold = !matches!(op.kind, OpKind::Query { .. });
+            bufs.drain_block(&mut output.air_blocks, fold);
         }
     }
     Ok(())
@@ -1663,13 +1571,13 @@ fn write_verify_output(output: VerifyOutput) {
     let VerifyOutput {
         sst_ast_blocks, sst_poly_blocks, air_blocks, verdicts,
     } = output;
-    let [air_initial, air_middle, air_final, smt] = air_blocks;
+    let [ai, am, af, smt] = air_blocks;
     for (name, blocks) in [
         ("SST_AST", sst_ast_blocks),
         ("SST_POLY", sst_poly_blocks),
-        ("AIR_INITIAL", air_initial),
-        ("AIR_MIDDLE", air_middle),
-        ("AIR_FINAL", air_final),
+        ("AIR_INITIAL", ai),
+        ("AIR_MIDDLE", am),
+        ("AIR_FINAL", af),
         ("SMT", smt),
     ] {
         if blocks.iter().all(|b| b.content.trim().is_empty()) {

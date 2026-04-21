@@ -60,8 +60,13 @@ html, body {
 body {
   font: 14px/1.45 ui-monospace, Menlo, Consolas, monospace;
   max-width: 1200px;
-  margin: 1.5rem auto;
-  padding: 0 1rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 h1 {
@@ -132,7 +137,7 @@ pre {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 1rem;
-  height: calc(100vh - 9rem);
+  flex: 1;
   min-height: 420px;
 }
 .pane {
@@ -194,9 +199,13 @@ pre {
 .cm-error-line { background-color: var(--bad-bg); }
 .cm-warning-line { background-color: var(--warn-bg); }
 @media (max-width: 900px) {
+  body {
+    height: auto;
+    overflow: visible;
+  }
   #workbench {
     grid-template-columns: minmax(0, 1fr);
-    height: auto;
+    flex: 0 0 auto;
     min-height: 0;
   }
   .pane { overflow: visible; }
