@@ -28,14 +28,6 @@ doctest = false
 [dependencies]
 vir = { path = "third_party/verus/source/vir" }
 air = { path = "third_party/verus/source/air" }
-# Pulled in only because `src/lib.rs`'s VIR / SST dumps construct
-# `sise::Node`s for the handful of kinds (`reveal_groups`, `traits`,
-# `trait_impls`, `modules`, `external_fns`, `external_types`) that
-# wrap their `to_node` output in a parenthesized prefix form.
-# Version pinned to match `vir`'s direct dep so cargo resolves one
-# copy — otherwise calls like `nw.node_to_string(&Node::List(…))`
-# fail with a type mismatch between the two Node types.
-sise = "0.6.0"
 rust_verify = { path = "third_party/verus/source/rust_verify" }
 verus_builtin_macros = { path = "third_party/verus/source/builtin_macros" }
 verus_state_machines_macros = { path = "third_party/verus/source/state_machines_macros" }

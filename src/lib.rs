@@ -73,7 +73,7 @@ use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::FileLoader;
 use rustc_span::{FileName, Symbol};
-use vir::ast::{ArchWordBits, Datatype, Dt, Fun, Krate, Path as VirPath, VirErr};
+use vir::ast::{ArchWordBits, Datatype, Fun, Krate, Path as VirPath, VirErr};
 use vir::ast_util::{fun_as_friendly_rust_name, is_visible_to};
 use vir::context::{Ctx, GlobalCtx};
 use vir::messages::{ToAny, VirMessageInterface};
@@ -806,6 +806,15 @@ fn push_item(blocks: &mut Vec<Block>, crate_key: Option<Arc<String>>, span: &str
     blocks.push(Block { content: text, fold });
 }
 
+// Push a `;; <name>` section header that starts a fresh folded block.
+// Subsequent `push_item` calls with `fold: true` merge into it so the
+// banner sits at the top of the fold region and becomes the visible
+// label when collapsed. Unlike `push_item`, never merges with the
+// previous block — keeps each section's fold self-contained.
+fn push_banner(blocks: &mut Vec<Block>, name: &str) {
+    blocks.push(Block { content: format!(";; {}", name), fold: true });
+}
+
 fn dump_vir_and_verify(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
@@ -827,43 +836,11 @@ fn dump_vir_and_verify(
         return;
     };
     time("dump.vir", || {
-        use vir::printer::{path_to_node, visit_each, ToDebugSNode};
-        use sise::Node;
+        use vir::printer::WalkEvent;
         let mut blocks = Vec::new();
-        let opts = &vir::printer::COMPACT_TONODEOPTS;
-        visit_each(&krate.datatypes, |d, nw| {
-            let key = match &d.x.name { Dt::Path(p) => p.krate.clone(), Dt::Tuple(_) => None };
-            push_item(&mut blocks, key, &d.span.as_string, nw.node_to_string(&d.to_node(opts)));
-        });
-        visit_each(&krate.functions, |f, nw| {
-            push_item(&mut blocks, f.x.name.path.krate.clone(), &f.span.as_string, nw.node_to_string(&f.to_node(opts)));
-        });
-        visit_each(&krate.reveal_groups, |g, nw| {
-            let node = Node::List(vec![Node::Atom("group_id".into()), path_to_node(&g.x.name.path)]);
-            push_item(&mut blocks, g.x.name.path.krate.clone(), "", nw.node_to_string(&node));
-        });
-        visit_each(&krate.traits, |t, nw| {
-            let node = Node::List(vec![Node::Atom("trait".into()), path_to_node(&t.x.name)]);
-            push_item(&mut blocks, t.x.name.krate.clone(), "", nw.node_to_string(&node));
-        });
-        visit_each(&krate.trait_impls, |t, nw| {
-            let node = Node::List(vec![Node::Atom("trait_impl".into()), path_to_node(&t.x.impl_path), path_to_node(&t.x.trait_path)]);
-            push_item(&mut blocks, t.x.impl_path.krate.clone(), "", nw.node_to_string(&node));
-        });
-        visit_each(&krate.assoc_type_impls, |a, nw| {
-            push_item(&mut blocks, a.x.impl_path.krate.clone(), &a.span.as_string, nw.node_to_string(&a.to_node(opts)));
-        });
-        visit_each(&krate.modules, |m, nw| {
-            let node = Node::List(vec![Node::Atom("module_id".into()), path_to_node(&m.x.path)]);
-            push_item(&mut blocks, m.x.path.krate.clone(), "", nw.node_to_string(&node));
-        });
-        visit_each(&krate.external_fns, |ef, nw| {
-            let node = Node::List(vec![Node::Atom("external_fn".into()), ef.to_node(opts)]);
-            push_item(&mut blocks, ef.path.krate.clone(), "", nw.node_to_string(&node));
-        });
-        visit_each(&krate.external_types, |et, nw| {
-            let node = Node::List(vec![Node::Atom("external_type".into()), path_to_node(et)]);
-            push_item(&mut blocks, et.krate.clone(), "", nw.node_to_string(&node));
+        vir::printer::walk_krate(&krate, &vir::printer::COMPACT_TONODEOPTS, |event| match event {
+            WalkEvent::Section(name) => push_banner(&mut blocks, name),
+            WalkEvent::Item { krate, span, text } => push_item(&mut blocks, krate, span, text),
         });
         emit_section(Section { name: "VIR", blocks });
     });
@@ -1220,31 +1197,10 @@ fn verify_module(
         .collect();
 
     let dump_sst = |blocks: &mut Vec<Block>, k: &KrateSst| {
-        use vir::printer::{visit_each, ToDebugSNode};
-        use sise::Node;
-        let opts = &vir::printer::COMPACT_TONODEOPTS;
-        visit_each(&k.datatypes, |d, nw| {
-            let key = match &d.x.name { Dt::Path(p) => p.krate.clone(), Dt::Tuple(_) => None };
-            push_item(blocks, key, &d.span.as_string, nw.node_to_string(&d.to_node(opts)));
-        });
-        visit_each(&k.functions, |f, nw| {
-            push_item(blocks, f.x.name.path.krate.clone(), &f.span.as_string, nw.node_to_string(&f.to_node(opts)));
-        });
-        visit_each(&k.traits, |t, nw| {
-            let node = Node::List(vec![Node::Atom("trait".into()), t.to_node(opts)]);
-            push_item(blocks, t.x.name.krate.clone(), &t.span.as_string, nw.node_to_string(&node));
-        });
-        visit_each(&k.trait_impls, |ti, nw| {
-            let node = Node::List(vec![Node::Atom("trait_impl".into()), ti.to_node(opts)]);
-            push_item(blocks, ti.x.impl_path.krate.clone(), &ti.span.as_string, nw.node_to_string(&node));
-        });
-        visit_each(&k.assoc_type_impls, |a, nw| {
-            let node = Node::List(vec![Node::Atom("assoc_type_impl".into()), a.to_node(opts)]);
-            push_item(blocks, a.x.impl_path.krate.clone(), &a.span.as_string, nw.node_to_string(&node));
-        });
-        visit_each(&k.reveal_groups, |g, nw| {
-            let node = Node::List(vec![Node::Atom("group".into()), g.to_node(opts)]);
-            push_item(blocks, g.x.name.path.krate.clone(), "", nw.node_to_string(&node));
+        use vir::printer::WalkEvent;
+        vir::printer::walk_krate_sst(k, &vir::printer::COMPACT_TONODEOPTS, |event| match event {
+            WalkEvent::Section(name) => push_banner(blocks, name),
+            WalkEvent::Item { krate, span, text } => push_item(blocks, krate, span, text),
         });
     };
 

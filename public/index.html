@@ -112,6 +112,14 @@
     // captures the *variable*, not the initial array, so the push keeps
     // targeting the live buffer.
     let z3ResponseBuffer = [];
+    // Progress counter for cold-load. Each `wasm-libs/*.gz` fetch bumps
+    // this when it resolves and updates the Verify button label, so the
+    // user sees "Loading 3/8 libs…" instead of a static "Loading verifier…"
+    // while the multi-MB download stream in. Safe to reference
+    // `parseButtonLabel` from the async callback even though the DOM ref
+    // is grabbed later in the script — the callback fires after the first
+    // microtask, by which point all const declarations have executed.
+    let wasmLibsLoaded = 0;
     const wasmReady = (async () => {
       const [Z3, verusModule, wasmLibs] = await Promise.all([
         globalThis.initZ3(),
@@ -120,6 +128,8 @@
           const res = await fetch(`./wasm-libs/${name}.gz`);
           const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
           const buf = await new Response(stream).arrayBuffer();
+          wasmLibsLoaded++;
+          parseButtonLabel.textContent = `Loading ${wasmLibsLoaded}/${WASM_LIBS.length} libs…`;
           return [name, new Uint8Array(buf)];
         })),
       ]);
@@ -401,7 +411,17 @@
         div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
         const status = document.createElement('div');
         status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
-        status.textContent = isOk ? '✓ verified' : `✗ ${headline}`;
+        // Count errors / warnings straight off the unified diagnostic list
+        // so the verdict headline carries a scan-friendly severity tally.
+        // `note` / `help` entries are ignored — they're additive context,
+        // not distinct findings.
+        const errN = diagnostics.filter(d => d.severity === 'error').length;
+        const warnN = diagnostics.filter(d => d.severity === 'warning').length;
+        const counts = [];
+        if (errN) counts.push(`${errN} ${errN === 1 ? 'error' : 'errors'}`);
+        if (warnN) counts.push(`${warnN} ${warnN === 1 ? 'warning' : 'warnings'}`);
+        const countSuffix = counts.length ? ` · ${counts.join(' · ')}` : '';
+        status.textContent = (isOk ? '✓ verified' : `✗ ${headline}`) + countSuffix;
         div.appendChild(status);
         const detail = rest.join('\n').trim();
         if (detail) {
@@ -894,6 +914,11 @@
       // set of diagnostics, so mixing would double-count.
       if (_jsonDiags.length > 0) {
         for (const j of _jsonDiags) {
+          // Skip rustc's "aborting due to N previous errors" footer. It's
+          // a summary of the preceding errors, not a distinct finding —
+          // the text channel filters it in `emit_block` but the JSON
+          // channel emits it, so it shows up here without this guard.
+          if ((j.message ?? '').startsWith('aborting due to')) continue;
           const primary = j.spans?.find(s => s.is_primary) ?? j.spans?.[0];
           const loc = primary ? {
             line: primary.line_start, col: primary.column_start,
@@ -1159,6 +1184,9 @@
         ]),
       ],
     });
+    // Focus the source editor right after mount so Cmd+Enter / typing
+    // works from keystroke one — no pre-click into the editor required.
+    view.focus();
 
     // Second CM6 instance, read-only, hosts the selected IR stage's
     // output. `basicSetup` gets us line numbers + folding + search for
