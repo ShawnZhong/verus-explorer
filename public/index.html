@@ -31,7 +31,7 @@
           <span id="parse-run-label">Loading verifier…</span>
           <kbd class="shortcut">⌘↵</kbd>
         </button>
-        <label class="hint muted" title="Re-verify 800ms after each edit">
+        <label class="hint muted" title="Re-verify 500ms after each edit">
           <input type="checkbox" id="auto-verify" /> Rerun on edit
         </label>
         <label class="hint muted" title="Run expand-errors after a failed query to pinpoint which sub-conjunct breaks (slower)">
@@ -950,7 +950,7 @@
     // Declared here (before `runParse`) so `runParse` can cancel any
     // pending auto-verify at its top — otherwise an explicit verify
     // (Verify click, Mod-Enter, example load) races with a pending
-    // 800ms auto-verify timer from a just-prior doc change and we end
+    // 500ms auto-verify timer from a just-prior doc change and we end
     // up double-verifying. The timer itself is armed by
     // `scheduleAutoVerify` further down.
     let autoVerifyTimer;
@@ -1193,7 +1193,7 @@
     // ------------------------------------------------------------------
     // Auto-verify: debounced re-run on edits when the checkbox is on.
     // Setting is persisted in localStorage so the preference survives a
-    // reload. 800ms feels long enough that fast typing doesn't burn
+    // reload. 500ms feels long enough that fast typing doesn't burn
     // verifier cycles but short enough that a brief pause fires a check.
     // ------------------------------------------------------------------
     const AUTO_VERIFY_KEY = 've-auto-verify';
@@ -1223,7 +1223,7 @@
     const scheduleAutoVerify = () => {
       clearTimeout(autoVerifyTimer);
       if (!autoVerifyCheckbox.checked) return;
-      autoVerifyTimer = setTimeout(runParse, 800);
+      autoVerifyTimer = setTimeout(runParse, 500);
     };
 
     // ------------------------------------------------------------------
