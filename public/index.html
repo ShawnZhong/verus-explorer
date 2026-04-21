@@ -25,6 +25,7 @@
         </label>
       </div>
       <div id="parse-input"></div>
+      <div id="left-resizer" title="Drag to resize"></div>
       <div id="parse-meta"></div>
       <div class="controls">
         <button id="parse-run" disabled>
@@ -39,6 +40,8 @@
         </label>
       </div>
     </section>
+
+    <div id="col-resizer" title="Drag to resize"></div>
 
     <section class="pane" id="right-pane">
       <!-- Stage tab buttons are appended into `#parse-tabs` by `renderTabs`;
@@ -170,6 +173,65 @@
     const parseButton = document.getElementById('parse-run');
     const parseButtonLabel = document.getElementById('parse-run-label');
     const parseMeta = document.getElementById('parse-meta');
+    // Drag the splitter above the diagnostics pane to reshape the left
+    // column. Adjusts `#parse-meta`'s flex-basis; the editor (flex: 1)
+    // absorbs the rest. Bounded below by 40px so the pane can't vanish
+    // behind the handle, and above by 90% of the column so the editor
+    // always has a usable strip.
+    {
+      const resizer = document.getElementById('left-resizer');
+      const leftPane = document.getElementById('left-pane');
+      let startY, startH;
+      const onMove = (e) => {
+        const dy = startY - e.clientY;
+        const maxH = leftPane.getBoundingClientRect().height * 0.9;
+        parseMeta.style.flex = `0 0 ${Math.min(maxH, Math.max(40, startH + dy))}px`;
+      };
+      const onUp = () => {
+        resizer.classList.remove('dragging');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      resizer.addEventListener('mousedown', (e) => {
+        startY = e.clientY;
+        startH = parseMeta.getBoundingClientRect().height;
+        resizer.classList.add('dragging');
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        e.preventDefault();
+      });
+    }
+    // Drag the splitter between the source pane and the output pane to
+    // reshape the workbench. Same shape as the vertical splitter above:
+    // rewrite `grid-template-columns` so the left column becomes an
+    // explicit px width and the right stays `1fr`. The middle column is
+    // the resizer itself (5px). Clamped so each side keeps a usable
+    // minimum strip.
+    {
+      const resizer = document.getElementById('col-resizer');
+      const workbench = document.getElementById('workbench');
+      let startX, startLeftW;
+      const onMove = (e) => {
+        const totalW = workbench.getBoundingClientRect().width;
+        const minW = 120;
+        const dx = e.clientX - startX;
+        const newLeftW = Math.min(totalW - minW, Math.max(minW, startLeftW + dx));
+        workbench.style.gridTemplateColumns = `${newLeftW}px 10px minmax(0, 1fr)`;
+      };
+      const onUp = () => {
+        resizer.classList.remove('dragging');
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      resizer.addEventListener('mousedown', (e) => {
+        startX = e.clientX;
+        startLeftW = document.getElementById('left-pane').getBoundingClientRect().width;
+        resizer.classList.add('dragging');
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        e.preventDefault();
+      });
+    }
     const parseTabsEl = document.getElementById('parse-tabs');
     const parseSubtabsEl = document.getElementById('parse-subtabs');
     const parseOutputViewEl = document.getElementById('parse-output-view');
@@ -436,7 +498,10 @@
       for (const d of diagnostics) {
         const pre = document.createElement('pre');
         pre.className = `diagnostic ${d.severity}`;
-        pre.textContent = d.rendered;
+        // Rustc's JSON `rendered` always ends in `\n` (stdout-streaming
+        // convention). Inside a `<pre>` that shows as a trailing blank
+        // row, so strip before rendering.
+        pre.textContent = d.rendered.replace(/\n+$/, '');
         if (d.loc && d.loc.line >= 1 && d.loc.line <= view.state.doc.lines) {
           pre.classList.add('clickable');
           pre.addEventListener('click', () => jumpToLoc(d.loc));

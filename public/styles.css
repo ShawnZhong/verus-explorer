@@ -135,10 +135,27 @@ pre {
    single column under ~900px. */
 #workbench {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) 10px minmax(0, 1fr);
   flex: 1;
   min-height: 420px;
+}
+
+/* Splitter between the source pane and the output pane. The 14px middle
+   column IS the entire visible gap between panes — the draggable zone
+   matches the whitespace width 1:1 so the cursor-change aligns with
+   what the eye reads as "the gap". Same shape as `#left-resizer`
+   (transparent strip, turns blue on hover / drag). Drag logic in
+   index.html rewrites `grid-template-columns` so the left column gets
+   an explicit px width and the right stays `1fr`. Hidden in the
+   mobile single-column layout below. */
+#col-resizer {
+  cursor: col-resize;
+  background: transparent;
+  border-radius: 3px;
+  transition: background 120ms;
+}
+#col-resizer:hover, #col-resizer.dragging {
+  background: var(--focus-ring);
 }
 .pane {
   display: flex;
@@ -208,6 +225,7 @@ pre {
     flex: 0 0 auto;
     min-height: 0;
   }
+  #col-resizer { display: none; }
   .pane { overflow: visible; }
   #parse-input .cm-editor { min-height: 14em; }
   #parse-output-view { min-height: 20em; }
@@ -368,10 +386,28 @@ kbd {
    doesn't squeeze the editor; collapses to zero when no run has
    produced a verdict yet (so the source fills the whole pane). */
 #parse-meta {
-  max-height: 10em;
+  flex: 1 1 0;
   overflow-y: auto;
+  min-height: 0;
 }
-#parse-meta:not(:empty) { margin-top: .6em; }
+
+/* Draggable splitter between the source editor and the diagnostics pane.
+   `left-resizer` becomes visible only when there's diagnostic content to
+   resize against — otherwise it renders as a dead band above an empty
+   pane. Drag logic lives in index.html. */
+#left-resizer {
+  flex: 0 0 10px;
+  cursor: row-resize;
+  background: transparent;
+  border-radius: 3px;
+  transition: background 120ms;
+}
+#left-resizer:hover, #left-resizer.dragging {
+  background: var(--focus-ring);
+}
+#left-pane:has(#parse-meta:empty) #left-resizer {
+  display: none;
+}
 
 .verdict {
   padding: .5em .8em;
