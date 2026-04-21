@@ -1182,15 +1182,22 @@
       AIR_INITIAL: 'smt2', AIR_MIDDLE: 'smt2', AIR_FINAL: 'smt2',
       SMT: 'smt2', Z3: 'smt2',
     };
+    // `rust-ir-expanded-ast.rs` reads better than `verus-AST.rs`. Joins
+    // the group label and the variant label (both user-facing) as
+    // lowercase hyphen-separated slugs. Group prefix disambiguates
+    // collisions like VIR's "AST" subtab vs. Rust IR's "AST" subtab.
+    const slug = s => s.toLowerCase().replace(/\s+/g, '-');
     const downloadCurrentTab = () => {
       if (!currentTab || !sectionCache.has(currentTab)) return;
       const body = sectionCache.get(currentTab);
       const ext = EXT_FOR_TAB[currentTab] ?? 'txt';
+      const group = TAB_GROUPS.find(g => g.variants.includes(currentTab));
+      const name = `${slug(group.label)}-${slug(VARIANT_LABEL[currentTab] ?? currentTab)}`;
       const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `verus-${currentTab}.${ext}`;
+      a.download = `${name}.${ext}`;
       document.body.appendChild(a);
       a.click();
       a.remove();
