@@ -26,7 +26,7 @@ WASM_Z3 := target/wasm-z3
 # `public/` holds only browser-servable files — HTML, CSS, examples. The
 # whole tree copies into `dist/` verbatim (the `$(DIST)/public.stamp`
 # recipe). JS tooling (esbuild entry + npm manifest + node_modules) lives
-# in `editor/` so it doesn't need to be hand-excluded from that copy.
+# in `scripts/editor/` so it doesn't need to be hand-excluded from that copy.
 PUBLIC_FILES := $(shell find public -type f)
 
 # Patched rustc staged at target/host-rust/ by build-host-rust.sh. Injected
@@ -88,13 +88,13 @@ $(DIST)/public.stamp: $(PUBLIC_FILES) | $(DIST)
 	@touch $@
 
 # Bundle CodeMirror 6 straight into `$(DIST)/editor.js` via esbuild. The
-# entry point `editor/editor-src.js` re-exports every CM6 symbol that
-# `public/index.html` imports; esbuild resolves the bare specifiers against
-# `editor/node_modules/` and emits one minified ESM bundle with all of
-# CM6's transitive deps (~470KB) inlined. `editor/node_modules/.stamp`
-# forces `npm install` on first build.
-$(DIST)/editor.js: editor/editor-src.js editor/node_modules/.stamp | $(DIST)
-	editor/node_modules/.bin/esbuild $< --bundle --format=esm --outfile=$@ --minify --target=es2022
+# entry point `scripts/editor/editor-src.js` re-exports every CM6 symbol
+# that `public/index.html` imports; esbuild resolves the bare specifiers
+# against `scripts/editor/node_modules/` and emits one minified ESM bundle
+# with all of CM6's transitive deps (~470KB) inlined.
+# `scripts/editor/node_modules/.stamp` forces `npm install` on first build.
+$(DIST)/editor.js: scripts/editor/editor-src.js scripts/editor/node_modules/.stamp | $(DIST)
+	scripts/editor/node_modules/.bin/esbuild $< --bundle --format=esm --outfile=$@ --minify --target=es2022
 
 $(DIST):
 	git worktree add --orphan -b gh-pages $(DIST)
@@ -102,12 +102,13 @@ $(DIST):
 $(WASM_Z3)/z3.js $(WASM_Z3)/z3.wasm &: scripts/build-z3.sh
 	./scripts/build-z3.sh
 
-# `npm install` gate. `editor/node_modules/.stamp` is the Make witness so
-# the install only reruns when `editor/package.json` bumps. `npm ci` would
-# be stricter (fails on lockfile drift) but `npm install` tolerates a
-# missing lockfile on fresh clones and refreshes it when deps bump.
-editor/node_modules/.stamp: editor/package.json
-	npm install --prefix editor --no-audit --no-fund
+# `npm install` gate. `scripts/editor/node_modules/.stamp` is the Make
+# witness so the install only reruns when `scripts/editor/package.json`
+# bumps. `npm ci` would be stricter (fails on lockfile drift) but
+# `npm install` tolerates a missing lockfile on fresh clones and
+# refreshes it when deps bump.
+scripts/editor/node_modules/.stamp: scripts/editor/package.json
+	npm install --prefix scripts/editor --no-audit --no-fund
 	@touch $@
 
 serve:
@@ -122,13 +123,13 @@ serve:
 #
 # `wasm-bindgen-test-runner` invokes `node` via plain `Command::new("node")`
 # (pure PATH lookup — no override env var), so prepending the vendored
-# `editor/node/bin` here pins the Node version regardless of what's in
-# the user's PATH. The directory is gitignored; populate it by extracting
-# an official node tarball, e.g. on Apple Silicon:
+# `scripts/editor/node/bin` here pins the Node version regardless of what's
+# in the user's PATH. The directory is gitignored; populate it by
+# extracting an official node tarball, e.g. on Apple Silicon:
 #   curl -sL https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz \
-#     | tar xz -C editor && mv editor/node-v24.15.0-darwin-arm64 editor/node
+#     | tar xz -C scripts/editor && mv scripts/editor/node-v24.15.0-darwin-arm64 scripts/editor/node
 test: host-verus
-	PATH="$(CURDIR)/editor/node/bin:$$PATH" wasm-pack test --node
+	PATH="$(CURDIR)/scripts/editor/node/bin:$$PATH" wasm-pack test --node
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
 # and force-pushes, so there's no history either locally or remotely.

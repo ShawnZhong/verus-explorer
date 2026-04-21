@@ -16,8 +16,8 @@ import { chromium } from 'playwright';
 import { mkdirSync } from 'fs';
 
 const SERVE_URL = process.env.URL || 'http://localhost:8000';
-// Script runs from scripts/; write into the sibling docs/.
-const outDir = new URL('../docs/', import.meta.url).pathname;
+// Script runs from scripts/screenshot/; write into project-root docs/.
+const outDir = new URL('../../docs/', import.meta.url).pathname;
 
 mkdirSync(outDir, { recursive: true });
 

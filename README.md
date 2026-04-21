@@ -40,8 +40,9 @@ Every item in VIR / SST / AIR / SMT carries a `;; <input.rs>:L:C` comment; click
 
 ```
 src/                    Explorer crate (wasm-bindgen entry, pipeline driver)
-editor/                 CodeMirror 6 bundle entry (esbuild input)
 public/                 Static assets (HTML, CSS, example snippets)
+scripts/editor/         CodeMirror 6 bundle entry (esbuild input)
+scripts/screenshot/     Playwright hero-image generator
 third_party/verus/      Verus source tree, patched for in-browser use
 third_party/rust/       Patched rustc (built once via `make host-rust`)
 rustc-rlibs/            Forces wasm32 rlibs for every rustc_* crate we link

@@ -185,6 +185,10 @@
       const onMove = (e) => {
         const dy = startY - e.clientY;
         const maxH = leftPane.getBoundingClientRect().height * 0.9;
+        // Strip the CSS `max-height: 30%` cap once the user drags —
+        // otherwise the stylesheet rule beats the inline flex-basis
+        // and the pane refuses to grow past 30% of the column.
+        parseMeta.style.maxHeight = 'none';
         parseMeta.style.flex = `0 0 ${Math.min(maxH, Math.max(40, startH + dy))}px`;
       };
       const onUp = () => {
