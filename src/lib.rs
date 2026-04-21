@@ -134,6 +134,13 @@ extern "C" {
 
     #[wasm_bindgen(js_name = verus_bench)]
     fn verus_bench(label: &str, ms: f64);
+
+    // Stamp a `;; <label>` banner into the Z3 response buffer. Called from
+    // `run_queries` right before each op's commands are fed to Z3 so the
+    // replies (sat / unsat / empty / errors) read as per-op stanzas in the
+    // Z3 tab instead of a flat positional stream.
+    #[wasm_bindgen(js_name = verus_z3_annotate)]
+    fn verus_z3_annotate(label: &str);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1302,6 +1309,7 @@ fn run_queries(
         .filter(|d| is_visible_to(&d.x.visibility, module_path))
         .cloned()
         .collect();
+    verus_z3_annotate("AIR prelude");
     time("verify.feed_decls", || feed_module_decls(feeder, ctx, krate_sst, &visible_dts, mctx))?;
     bufs.drain_block(&mut output.air_blocks, /* fold */ true);
 
@@ -1331,8 +1339,13 @@ fn run_queries(
             // Emit the op's label comment via `air_ctx.comment(...)` so
             // every log gets a `;; <OpKind> <func-path>` line right
             // before the op's commands. That becomes the natural
-            // first-line label of the drain block below.
-            feeder.air_ctx.comment(&op.to_air_comment());
+            // first-line label of the drain block below. Also stamp the
+            // same label into the Z3 response buffer so the Z3 tab
+            // (which otherwise is a flat stream of sat/unsat/empty
+            // replies) reads as per-op stanzas.
+            let air_comment = op.to_air_comment();
+            feeder.air_ctx.comment(&air_comment);
+            verus_z3_annotate(&air_comment);
 
             // The explorer always compiles an anonymous crate, so every user
             // function's friendly name starts with `crate::`. Strip it so the

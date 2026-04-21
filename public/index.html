@@ -937,6 +937,15 @@
     globalThis.verus_bench = (label, ms) => {
       benchCache.set(label, (benchCache.get(label) ?? 0) + ms);
     };
+    // `run_queries` calls this once per op (and once for the prelude) so
+    // the Z3 tab — which otherwise concatenates Z3's raw replies into a
+    // positional stream — carries the same `;; Function-Def ...` banner
+    // headers as the SMT tab. A banner with no reply beneath it means
+    // the op only sent declarations / axioms (no `(check-sat)`), which
+    // is the common case for Context ops.
+    globalThis.verus_z3_annotate = (label) => {
+      z3ResponseBuffer.push(`;; ${label}`);
+    };
 
     // Declared here (before `runParse`) so `runParse` can cancel any
     // pending auto-verify at its top — otherwise an explicit verify
