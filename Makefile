@@ -50,7 +50,10 @@ export RUSTC := $(CURDIR)/target/host-rust/bin/rustc
 # own `document.currentScript?.src`, so the subfolder move is transparent
 # as long as `public/index.html` loads `./z3/z3.js`.
 dev release: $(DIST)/public.stamp $(DIST)/editor.js $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm host-verus
-	wasm-pack build --$@ --target web --out-dir $(DIST) --no-typescript
+	# wasm-pack resolves `--out-dir` relative to the crate it's building,
+	# so pass an absolute path — otherwise the bundle lands in
+	# `verus-explorer/dist/` instead of the top-level `dist/`.
+	wasm-pack build verus-explorer --$@ --target web --out-dir $(CURDIR)/$(DIST) --no-typescript
 	# wasm-pack always drops a bundler-flavored `package.json` + `.gitignore`
 	# next to the wasm/js (for `npm publish`). We're shipping static files
 	# to GitHub Pages, so both are noise — remove them so `dist/` stays a
@@ -129,7 +132,7 @@ serve:
 #   curl -sL https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz \
 #     | tar xz -C scripts/editor && mv scripts/editor/node-v24.15.0-darwin-arm64 scripts/editor/node
 test: host-verus
-	PATH="$(CURDIR)/scripts/editor/node/bin:$$PATH" wasm-pack test --node
+	PATH="$(CURDIR)/scripts/editor/node/bin:$$PATH" wasm-pack test verus-explorer --node
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
 # and force-pushes, so there's no history either locally or remotely.

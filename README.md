@@ -39,15 +39,15 @@ Every item in VIR / SST / AIR / SMT carries a `;; <input.rs>:L:C` comment; click
 ## Project layout
 
 ```
-src/                    Explorer crate (wasm-bindgen entry, pipeline driver)
+verus-explorer/         Main crate (wasm-bindgen entry, pipeline driver)
+rustc-rlibs/            Helper crate — forces wasm32 rlibs of every rustc_* crate
 public/                 Static assets (HTML, CSS, example snippets)
 scripts/editor/         CodeMirror 6 bundle entry (esbuild input)
 scripts/screenshot/     Playwright hero-image generator
 third_party/verus/      Verus source tree, patched for in-browser use
 third_party/rust/       Patched rustc (built once via `make host-rust`)
-rustc-rlibs/            Forces wasm32 rlibs for every rustc_* crate we link
-tests/smoke.rs          Node-hosted pipeline smoke test
 docs/                   architecture.md, overview.md, roadmap.md
+Cargo.toml              Workspace manifest (members + shared profiles)
 Makefile                All build/serve/deploy targets
 ```
 

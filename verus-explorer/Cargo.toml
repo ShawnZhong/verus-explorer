@@ -1,0 +1,61 @@
+[package]
+name = "verus-explorer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+# Doctests would spawn `rustdoc --test` with its own compiler invocation that
+# doesn't pick up `.cargo/config.toml`'s `-L dependency=...` rustflag for
+# `extern crate rustc_*;` resolution — it would fail with E0463. We have no
+# real doctests anyway.
+doctest = false
+
+[dependencies]
+vir = { path = "../third_party/verus/source/vir" }
+air = { path = "../third_party/verus/source/air" }
+rust_verify = { path = "../third_party/verus/source/rust_verify" }
+verus_builtin_macros = { path = "../third_party/verus/source/builtin_macros" }
+verus_state_machines_macros = { path = "../third_party/verus/source/state_machines_macros" }
+wasm-bindgen = "0.2"
+# Match the version `rust_verify` uses (source/rust_verify/Cargo.toml) so cargo
+# resolves a single copy. Used in `src/pipeline.rs` to deserialize the embedded
+# vstd.vir bytes into `rust_verify::import_export::CrateWithMetadata`.
+bincode = "1.0.1"
+# rustc_* crates that this crate uses directly are not declared here — they
+# are produced as rlibs by `rustc-rlibs/` and resolved at link time via
+# `-L dependency=...` (set in `.cargo/config.toml`). See `src/lib.rs` for
+# the corresponding `extern crate rustc_*;` declarations.
+
+# `rustc-rlibs` is listed here (not at the top-level `[dependencies]` above)
+# so pulling it into the explorer's dep graph only happens on wasm32 — it's
+# purely a vehicle for forcing Cargo to build wasm32 rlibs of every rustc_*
+# crate the explorer/rust_verify/mir_build fork `extern crate`. Declaring it
+# here (rather than building it via a separate `cargo build -p rustc-rlibs`
+# step in the Makefile) keeps feature resolution in one pass across both
+# trees — otherwise each invocation computes its own union and leaves
+# duplicate rlibs (e.g. `wasm_bindgen` with `[]` vs `[default, std]`) in the
+# shared `deps/` dir, which surfaces as rust-lld "duplicate symbol" errors.
+[target.wasm32-unknown-unknown.dependencies]
+rustc-rlibs = { path = "../rustc-rlibs" }
+
+[target.wasm32-unknown-unknown.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# `-Oz` is wasm-opt's most aggressive size pass — much slower than the `-O1`
+# we used to run, but it deduplicates functions, shrinks locals, and runs
+# more passes than -O3 specifically targeted at code size.
+#
+# `--enable-bulk-memory` (and friends) tells wasm-opt to accept the modern
+# wasm features rustc/LLVM emit by default for `wasm32-unknown-unknown` —
+# without these flags wasm-opt's validator rejects the input with
+# "Bulk memory operations require bulk memory [--enable-bulk-memory]".
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    '-Oz',
+    '--enable-bulk-memory',
+    '--enable-nontrapping-float-to-int',
+    '--enable-sign-ext',
+    '--enable-mutable-globals',
+    '--enable-reference-types',
+]

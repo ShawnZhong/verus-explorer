@@ -1,69 +1,29 @@
-# Single workspace shared with rustc-rlibs so Cargo resolves deps *once*
-# across both crates: shared Cargo.lock → identical dep versions, shared
-# feature unions → identical crate hashes, shared target/ → rustc-rlibs'
-# wasm32 rlibs land in the deps dir the explorer (and Verus's
-# `mir_build_verus` fork) look in for `extern crate rustc_*;` lookups.
-# Two independent workspaces would resolve features differently and surface
-# as E0460 "possibly newer version of crate" mismatches at link time.
+# Single workspace shared across `verus-explorer` (main crate) and
+# `rustc-rlibs` (helper that forces cargo to build wasm32 rlibs for every
+# rustc_* crate the explorer links at runtime). One workspace → shared
+# Cargo.lock → identical dep versions, shared feature unions → identical
+# crate hashes, shared target/ → rustc-rlibs' wasm32 rlibs land in the
+# deps dir the explorer (and Verus's `mir_build_verus` fork) look in for
+# `extern crate rustc_*;` lookups. Two independent workspaces would
+# resolve features differently and surface as E0460 "possibly newer
+# version of crate" mismatches at link time.
+#
 # `exclude = ["third_party"]` keeps Verus's inner workspace from being
 # absorbed (its members rely on `lints = { workspace = true }` from
 # Verus's own `source/Cargo.toml`).
 [workspace]
-members = ["rustc-rlibs"]
+members = ["verus-explorer", "rustc-rlibs"]
 exclude = ["third_party"]
-
-[package]
-name = "verus-explorer"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-# Doctests would spawn `rustdoc --test` with its own compiler invocation that
-# doesn't pick up `.cargo/config.toml`'s `-L dependency=...` rustflag for
-# `extern crate rustc_*;` resolution — it would fail with E0463. We have no
-# real doctests anyway.
-doctest = false
-
-[dependencies]
-vir = { path = "third_party/verus/source/vir" }
-air = { path = "third_party/verus/source/air" }
-rust_verify = { path = "third_party/verus/source/rust_verify" }
-verus_builtin_macros = { path = "third_party/verus/source/builtin_macros" }
-verus_state_machines_macros = { path = "third_party/verus/source/state_machines_macros" }
-wasm-bindgen = "0.2"
-# Match the version `rust_verify` uses (source/rust_verify/Cargo.toml) so cargo
-# resolves a single copy. Used in `src/pipeline.rs` to deserialize the embedded
-# vstd.vir bytes into `rust_verify::import_export::CrateWithMetadata`.
-bincode = "1.0.1"
-# rustc_* crates that this crate uses directly are not declared here — they
-# are produced as rlibs by `rustc-rlibs/` and resolved at link time via
-# `-L dependency=...` (set in `.cargo/config.toml`). See `src/lib.rs` for
-# the corresponding `extern crate rustc_*;` declarations.
-
-# `rustc-rlibs` is listed here (not at the top-level `[dependencies]` above)
-# so pulling it into the explorer's dep graph only happens on wasm32 — it's
-# purely a vehicle for forcing Cargo to build wasm32 rlibs of every rustc_*
-# crate the explorer/rust_verify/mir_build fork `extern crate`. Declaring it
-# here (rather than building it via a separate `cargo build -p rustc-rlibs`
-# step in the Makefile) keeps feature resolution in one pass across both
-# trees — otherwise each invocation computes its own union and leaves
-# duplicate rlibs (e.g. `wasm_bindgen` with `[]` vs `[default, std]`) in the
-# shared `deps/` dir, which surfaces as rust-lld "duplicate symbol" errors.
-[target.wasm32-unknown-unknown.dependencies]
-rustc-rlibs = { path = "rustc-rlibs" }
-
-[target.wasm32-unknown-unknown.dev-dependencies]
-wasm-bindgen-test = "0.3"
 
 # Aggressive size tuning for the rustc-in-wasm bundle:
 # - `opt-level = "z"` favors size over speed (vs. "s" which still respects
 #   loop unrolling/inlining heuristics).
 # - `codegen-units = 1` keeps each crate in a single codegen unit so rustc's
 #   intra-crate DCE/inlining sees everything at once. Measured: combining
-#   this with the wasm-opt `-Oz` pass below makes `lto` a no-op for size
-#   (fat/thin/off within ~5 KB of each other on the 28 MB final wasm), so
-#   LTO is left at cargo's default of `false` to save ~5 min of build time.
+#   this with the wasm-opt `-Oz` pass in verus-explorer/Cargo.toml makes
+#   `lto` a no-op for size (fat/thin/off within ~5 KB of each other on the
+#   28 MB final wasm), so LTO is left at cargo's default of `false` to save
+#   ~5 min of build time.
 # - `strip = true` drops the embedded `name` section and DWARF debuginfo
 #   from the final wasm; saves a lot on a binary this large.
 # - `panic = "abort"` removes panic landing pads. wasm32 has no unwinding
@@ -80,21 +40,3 @@ panic = "abort"
 # debuginfo keeps the linker happy without giving up dev-build speed.
 [profile.dev]
 debug = 0
-
-# `-Oz` is wasm-opt's most aggressive size pass — much slower than the `-O1`
-# we used to run, but it deduplicates functions, shrinks locals, and runs
-# more passes than -O3 specifically targeted at code size.
-#
-# `--enable-bulk-memory` (and friends) tells wasm-opt to accept the modern
-# wasm features rustc/LLVM emit by default for `wasm32-unknown-unknown` —
-# without these flags wasm-opt's validator rejects the input with
-# "Bulk memory operations require bulk memory [--enable-bulk-memory]".
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = [
-    '-Oz',
-    '--enable-bulk-memory',
-    '--enable-nontrapping-float-to-int',
-    '--enable-sign-ext',
-    '--enable-mutable-globals',
-    '--enable-reference-types',
-]

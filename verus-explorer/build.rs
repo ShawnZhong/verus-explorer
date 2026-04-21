@@ -44,12 +44,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-const VERUS_BUILTIN_SRC: &str = "third_party/verus/source/builtin/src/lib.rs";
-const VSTD_SRC_DIR: &str = "third_party/verus/source/vstd";
+// Paths are relative to this crate's manifest dir (`verus-explorer/`).
+// `../` steps up to the workspace root where `third_party/` and
+// `scripts/` live.
+const VERUS_BUILTIN_SRC: &str = "../third_party/verus/source/builtin/src/lib.rs";
+const VSTD_SRC_DIR: &str = "../third_party/verus/source/vstd";
 const VSTD_RMETA: &str = "libvstd.rmeta";
 const VSTD_VIR: &str = "vstd.vir";
 
-const BUILD_SCRIPT: &str = "scripts/build-wasm-libs.sh";
+const BUILD_SCRIPT: &str = "../scripts/build-wasm-libs.sh";
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
@@ -62,7 +65,10 @@ fn main() {
     // reference it directly, avoids duplicate builds across debug/release,
     // and keeps the script runnable by hand against the same location.
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let wasm_libs = manifest_dir.join("target/wasm-libs");
+    // `target/wasm-libs/` sits at the workspace root (one level up from
+    // this crate), next to `target/cargo/`, `target/host-rust/`, etc.
+    let workspace_root = manifest_dir.parent().expect("workspace root");
+    let wasm_libs = workspace_root.join("target/wasm-libs");
     // rustc's wasm32 crate locator looks for `<sysroot>/lib/rustlib/
     // wasm32-unknown-unknown/lib/lib<name>.rmeta`, so the script builds
     // every rmeta into exactly that path. Subsequent `--sysroot=<wasm_libs>`
