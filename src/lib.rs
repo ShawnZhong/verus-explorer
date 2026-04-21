@@ -382,16 +382,16 @@ fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) {
     // before/after pair against the expanded AST so the reader can see
     // what the `verus!` macro actually rewrites into.
     dump_ast_pre_expansion(&krate);
-    // `create_and_enter_global_ctxt` itself is cheap — the expensive work
-    // (name resolution, HIR lowering, type-check) happens lazily inside the
-    // closure via `tcx` queries fired by `build_vir`. We time the enter call
-    // anyway in case global_ctxt setup becomes a hot spot later.
-    time("global_ctxt", || {
-        rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            dump_ast(tcx);
-            dump_hir(tcx);
-            dump_vir_and_verify(compiler, tcx, verify, expand_errors);
-        })
+    // `create_and_enter_global_ctxt` itself is cheap (~1ms); the expensive
+    // work runs lazily via `tcx` queries inside the closure. `dump_ast` is
+    // the first thing to call `tcx.resolver_for_lowering()`, which drives
+    // `passes::resolver_for_lowering_raw` → `configure_and_expand` —
+    // i.e., the `verus!` / `requires!` / `ensures!` / `proof!` proc-macros.
+    // That cost is attributed to `dump.ast` (no separate timer needed).
+    rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+        dump_ast(tcx);
+        dump_hir(tcx);
+        dump_vir_and_verify(compiler, tcx, verify, expand_errors);
     });
 }
 
@@ -790,20 +790,24 @@ impl<'tcx> rustc_hir_pretty::PpAnn for HirTypedAnn<'tcx> {
 // 8. Stage 3: HIR → VIR
 // ═══════════════════════════════════════════════════════════════════════
 
-// Feed one per-item (crate, span, text) tuple from `write_krate*_items`
-// into `blocks`, folding externals (has a crate) and synthetics
-// (Verus-generated, span == "no location") and merging adjacent
-// folded entries so vstd runs collapse into one row.
-fn push_item(blocks: &mut Vec<Block>, crate_key: Option<Arc<String>>, span: &str, text: String) {
-    let fold = crate_key.is_some() || span == "no location";
+// Feed one per-item (crate, span, text) tuple from `walk_krate*` into
+// `blocks`. Fold iff the item isn't local user code — external-crate
+// items (`krate.is_some()`) and Verus-generated synthetics (`span ==
+// "no location"`) collapse; items in the default crate stay expanded.
+// Parallels the AIR/SMT drain rule in `run_queries`. Adjacent folded
+// entries merge so vstd runs collapse into one row.
+fn push_item(blocks: &mut Vec<Block>, krate: Option<Arc<String>>, span: &str, text: String) {
+    let fold = krate.is_some() || span == "no location";
+    let content =
+        if span.is_empty() { text } else { format!(";; {}\n{}", span, text) };
     if let Some(prev) = blocks.last_mut() {
         if fold && prev.fold {
             prev.content.push('\n');
-            prev.content.push_str(&text);
+            prev.content.push_str(&content);
             return;
         }
     }
-    blocks.push(Block { content: text, fold });
+    blocks.push(Block { content, fold });
 }
 
 // Push a `;; <name>` section header that starts a fresh folded block.
@@ -1523,13 +1527,16 @@ fn run_queries(
                 };
                 function_opgen.report_expand_error_result(res);
             }
-            // Drain this op's text. Context ops (axioms, specs,
-            // broadcast, trait-impl axioms) fold — they're setup for
-            // the Query ops that follow. Query ops stay expanded so
-            // the reader can see the actual check-sat bodies.
-            // `drain_block` merges adjacent folded blocks, so the
-            // prelude + Context-op setup collapses into one row.
-            let fold = !matches!(op.kind, OpKind::Query { .. });
+            // Drain this op's text. Mirrors `push_item`'s VIR/SST rule:
+            // fold iff the op isn't local user code — context ops for
+            // external crates (vstd function-axioms / specs) and
+            // no-function setup ops (broadcasts, trait-impl axioms)
+            // collapse into the prelude row; context ops for local
+            // functions and queries (always tied to a local function)
+            // stay expanded so the reader sees the actual check-sat
+            // bodies and their immediate setup. `drain_block` merges
+            // adjacent folded blocks so vstd runs stay as one row.
+            let fold = op.function.as_ref().is_none_or(|f| f.x.name.path.krate.is_some());
             bufs.drain_block(&mut output.air_blocks, fold);
         }
     }

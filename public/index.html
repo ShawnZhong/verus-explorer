@@ -74,6 +74,7 @@
       linter, setDiagnostics,
       search,
       Compartment, StreamLanguage, foldService, foldEffect,
+      ViewPlugin, RangeSetBuilder,
     } from './editor.js';
 
     // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
@@ -293,10 +294,10 @@
     // `dump.hir_typed`, …) into a handful of user-facing buckets that
     // match the tab groups. Unknown labels fall through (ignored) so new
     // Rust-side timers don't surprise the user until we classify them.
-    // Wrapper labels (`verify`, `verify.module`) are skipped explicitly
-    // to avoid double-counting.
+    // `verify` / `verify.module` are wrapper labels (skipped here to
+    // avoid double-counting their downstream `verify.*` children).
     const BENCH_GROUP = {
-      rustc_parse: 'Parse', global_ctxt: 'Parse',
+      rustc_parse: 'Parse',
       'dump.ast_pre': 'Parse', 'dump.ast': 'Parse',
       'dump.hir': 'HIR', 'dump.hir_typed': 'HIR',
       build_vir: 'VIR', 'build_vir.vstd_deserialize': 'VIR',
@@ -703,6 +704,31 @@
       return null;
     });
 
+    // Style `;; …` comment lines as section banners (`.cm-banner-line`).
+    // Scans only the visible range each update; stream-lang already colors
+    // the tokens, this just paints the whole line as a header strip.
+    const bannerLines = ViewPlugin.fromClass(class {
+      constructor(view) { this.decorations = this.compute(view); }
+      update(u) {
+        if (u.docChanged || u.viewportChanged) this.decorations = this.compute(u.view);
+      }
+      compute(view) {
+        const b = new RangeSetBuilder();
+        for (const { from, to } of view.visibleRanges) {
+          let pos = from;
+          while (pos <= to) {
+            const line = view.state.doc.lineAt(pos);
+            if (line.text.startsWith(';;')) {
+              b.add(line.from, line.from, Decoration.line({ class: 'cm-banner-line' }));
+            }
+            if (line.to >= to) break;
+            pos = line.to + 1;
+          }
+        }
+        return b.finish();
+      }
+    }, { decorations: v => v.decorations });
+
     // Replace the read-only CM6 viewer's doc with the selected section body,
     // then restore the user's last scroll position for that tab (0 on first
     // visit). One long-lived view is cheaper than N-per-tab; the scroll map
@@ -838,8 +864,12 @@
         // end-of-block. Rust-side only flags bulky blocks as `fold`,
         // so every folded block is known to be multi-line.
         if (folds[i]) {
+          // Banner-only blocks (e.g. empty-section `;; traits`) have no
+          // newline and nothing to hide — skip the fold range, otherwise
+          // `firstNl === -1` creates a negative-offset fold that CM6
+          // renders as nested placeholders over adjacent banners.
           const firstNl = contents[i].indexOf('\n');
-          ranges.push({ from: start + firstNl, to: body.length });
+          if (firstNl >= 0) ranges.push({ from: start + firstNl, to: body.length });
         }
       }
       if (section === 'VERDICT') {
@@ -1201,6 +1231,7 @@
         search({ top: true }),
         outputLanguage.of([]),
         sectionFold,
+        bannerLines,
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         ...(dark ? [oneDark] : []),
