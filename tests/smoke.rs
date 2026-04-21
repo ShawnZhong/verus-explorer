@@ -34,20 +34,43 @@ extern "C" {
 // externs there). The browser installs them on `globalThis`; under
 // `wasm-pack test --node` nothing does, so every call site would
 // ReferenceError. Stub them before `parse_source` reaches any diagnostic,
-// `emit_section`, or `time` call site. `verus_bench` routes
-// through `process.stderr.write` so stage timings show up in `make test`
-// output alongside the per-call bench line — see `bench_log` above.
+// `emit_section`, or `time` call site.
+//
+// The `verus_dump` stub accumulates each section's joined block content
+// into `globalThis._sections` so test assertions can look up specific
+// sections by name — `parse_and_verify` no longer returns a dumped
+// String, all pipeline output flows through this callback.
+// `reset_sections` clears the accumulator between parse calls so each
+// run's assertions see only its own output.
+// `verus_bench` routes through `process.stderr.write` so stage timings
+// show up in `make test` output alongside the per-call bench line —
+// see `bench_log` above.
 #[wasm_bindgen(inline_js = "\
     export function install_pipeline_stubs() {\n\
+      globalThis._sections = new Map();\n\
       globalThis.verus_diagnostic = () => {};\n\
       globalThis.verus_diagnostic_json = () => {};\n\
-      globalThis.verus_dump = () => {};\n\
+      globalThis.verus_dump = (section, headers, contents, _folds) => {\n\
+        let body = '';\n\
+        for (let i = 0; i < headers.length; i++) {\n\
+          if (i > 0 && !body.endsWith('\\n')) body += '\\n';\n\
+          if (headers[i]) body += `;; -- ${headers[i]} --\\n`;\n\
+          body += contents[i];\n\
+        }\n\
+        globalThis._sections.set(section, body);\n\
+      };\n\
       globalThis.verus_bench = (label, ms) => {\n\
         process.stderr.write(`[stage] ${label}=${ms.toFixed(0)}ms\\n`);\n\
       };\n\
+    }\n\
+    export function reset_sections() { globalThis._sections = new Map(); }\n\
+    export function section_body(name) {\n\
+      return globalThis._sections.get(name) ?? '';\n\
     }")]
 extern "C" {
     fn install_pipeline_stubs();
+    fn reset_sections();
+    fn section_body(name: &str) -> String;
 }
 
 // `console.log` is captured by wasm-bindgen-test (only surfaces on
@@ -133,37 +156,37 @@ fn pipeline_preserves_ghost_proof_block() {
     let src = "use vstd::prelude::*;\n\
                verus! { fn main() { proof { assert(false); } } }";
 
-    let t1 = perf_now();
-    let out1 = verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
-    let t2 = perf_now();
-
-    // Second and third parse_source in the *same* wasm instance. The JS
-    // `freshVerus` pattern (public/index.html) spins up a new instance per
-    // click specifically to avoid this; if they succeed here, the pattern
-    // is wasted engineering. If they panic, panic=abort on wasm32 aborts
-    // the whole test and the panic-hook-captured message (installed by
-    // `verus_explorer::init`) surfaces via wasm-pack's output — telling
-    // us exactly which global-state invariant trips. #3 confirms whether
-    // #2 was a one-shot warmup or whether subsequent calls are steady-state.
-    let out2 = verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
-    let t3 = perf_now();
-    let out3 = verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
-    let t4 = perf_now();
+    // Three calls in the *same* wasm instance. The JS `freshVerus` pattern
+    // (public/index.html) spins up a new instance per click specifically to
+    // avoid reusing one; if they succeed here, the pattern is wasted
+    // engineering. If they panic, panic=abort on wasm32 aborts the whole
+    // test and the panic-hook-captured message (installed by
+    // `verus_explorer::init`) surfaces via wasm-pack's output — telling us
+    // exactly which global-state invariant trips. #3 confirms whether #2
+    // was a one-shot warmup or whether subsequent calls are steady-state.
+    //
+    // Pipeline output flows through the `verus_dump` stub installed above,
+    // not through a return value — `reset_sections()` clears the map so
+    // each run's assertions see only its own emissions.
+    let mut stage_times = Vec::new();
+    for label in ["#1", "#2", "#3"] {
+        reset_sections();
+        let t = perf_now();
+        verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
+        stage_times.push(perf_now() - t);
+        let vir = section_body("VIR");
+        assert!(!vir.is_empty(), "missing VIR section on {label}");
+        assert!(
+            vir.contains("AssertAssume"),
+            "VIR missing AssertAssume on {label} — proof block was erased before VIR:\n{vir}"
+        );
+    }
 
     bench_log(&format!(
         "[bench] wasm_libs_setup={:.0}ms parse#1={:.0}ms parse#2={:.0}ms parse#3={:.0}ms",
         t_libs - t0,
-        t2 - t1,
-        t3 - t2,
-        t4 - t3,
+        stage_times[0],
+        stage_times[1],
+        stage_times[2],
     ));
-
-    for (label, out) in [("#1", &out1), ("#2", &out2), ("#3", &out3)] {
-        assert!(!out.contains("panicked:"), "pipeline panicked on {label}:\n{out}");
-        assert!(out.contains("=== VIR ==="), "missing VIR section on {label}:\n{out}");
-        assert!(
-            out.contains("AssertAssume"),
-            "VIR missing AssertAssume on {label} — proof block was erased before VIR:\n{out}"
-        );
-    }
 }

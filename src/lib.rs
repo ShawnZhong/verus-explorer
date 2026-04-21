@@ -18,8 +18,7 @@
 //   3. Wasm-libs implementation      — in-memory filesystem for rustc's
 //                                      crate locator; backs the wasm_libs_*
 //                                      entry points directly above.
-//   4. Small utilities               — `time`, `emit_section`,
-//                                      `unwrap_dump_or_panic`.
+//   4. Small utilities               — `time`, `emit_section`.
 //   5. Pipeline driver               — `parse_and_verify` → `run_pipeline`
 //                                      orchestrates the four stages below.
 //   6. Stage 1: rustc invocation     — config + `VirtualFileLoader` +
@@ -112,8 +111,17 @@ extern "C" {
     // `verus_diagnostic`: a later stage that traps the wasm instance
     // (rustc's `abort_if_errors` → `unreachable`) would otherwise discard
     // the whole returned String, hiding every section we'd already built.
+    //
+    // Content is passed as a parallel-array triple describing ordered
+    // blocks: `headers[i]` is an optional label (empty string = no
+    // header), `contents[i]` is the block's text, `folds[i]` is 1 if the
+    // block should be auto-folded on render. Rust stays out of rendering
+    // decisions (how headers display, whether folds use a placeholder,
+    // etc.) — JS concatenates the blocks and applies the declared folds.
+    // Used today to mark the vstd half of VIR / SST_AST / SST_POLY as a
+    // foldable appendix below the user-owned items.
     #[wasm_bindgen(js_name = verus_dump)]
-    fn verus_dump(section: &str, body: &str);
+    fn verus_dump(section: &str, headers: Vec<String>, contents: Vec<String>, folds: Vec<u8>);
 
     // Stage-level timing. `time()` emits one call per stage with the elapsed
     // ms. `public/index.html` and `tests/smoke.rs` both install a stub on
@@ -188,11 +196,10 @@ pub fn wasm_libs_finalize() {
 /// Run the rustc front-end on `src`, lower HIR → simplified VIR, then drive
 /// the krate through the AIR generation + Z3 pipeline. Streams each IR
 /// section (AST / HIR / VIR / AIR_INITIAL / AIR_MIDDLE / AIR_FINAL / SMT /
-/// VERDICT) to the browser via `verus_dump`; the JS side caches the bodies
-/// and toggles rendering without re-parsing. Returned String mirrors the
-/// dumps for non-browser callers (smoke test).
+/// VERDICT) to the host via the `verus_dump` JS extern; the browser caches
+/// the bodies and toggles rendering without re-parsing.
 #[wasm_bindgen]
-pub fn parse_source(src: &str, expand_errors: bool) -> String {
+pub fn parse_source(src: &str, expand_errors: bool) {
     parse_and_verify(src, /* verify */ true, expand_errors)
 }
 
@@ -289,40 +296,52 @@ fn time<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
     result
 }
 
-// Streams a completed section to the browser and appends it to `out` in the
-// same `=== NAME ===\n<body>\n` shape the String-side consumers expect.
-// Emitting via `verus_dump` synchronously at each stage boundary means the
-// section lands in the DOM before a later stage could trap the wasm instance
-// and discard everything we'd built up in `out`. `out` is still populated in
-// parallel so the returned String stays usable for `tests/smoke.rs` and for
-// the `unwrap_dump_or_panic` fallback.
-fn emit_section(out: &mut String, name: &str, body: &str) {
-    let body = body.trim_end();
-    verus_dump(name, body);
-    writeln!(out, "=== {} ===", name).unwrap();
-    out.push_str(body);
-    out.push('\n');
+// A labeled chunk of content within a `Section`. The optional `header`
+// is a human-readable label JS renders as a `;; -- <header> --` line
+// above the content; `fold: true` asks JS to auto-collapse the block on
+// render. No string marker is baked into `content` — keeping the
+// rendering decision (header style, fold placeholder) on the JS side.
+struct Block<'a> {
+    header: Option<&'a str>,
+    content: &'a str,
+    fold: bool,
 }
 
-// Always return whatever the closure managed to dump. `run_compiler`
-// post-processing can panic via `abort_if_errors` after our closure writes the
-// dump, which would otherwise shadow a valid dump with "panicked: …".
-fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> String {
-    match result {
-        Ok(()) => partial,
-        Err(e) => {
-            let msg = e
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| e.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<opaque>");
-            if partial.is_empty() {
-                format!("panicked: {msg}")
-            } else {
-                format!("{partial}\n(post-dump panic: {msg})")
-            }
+// An ordered list of `Block`s that together form one logical output tab.
+// Most sections are a single `Block` with no header; VIR / SST_AST /
+// SST_POLY use two (user + vstd) so the vstd half can be folded away.
+struct Section<'a> {
+    name: &'a str,
+    blocks: Vec<Block<'a>>,
+}
+
+impl<'a> Section<'a> {
+    // Shorthand for the common single-block, no-header, no-fold case.
+    fn single(name: &'a str, content: &'a str) -> Self {
+        Section {
+            name,
+            blocks: vec![Block { header: None, content, fold: false }],
         }
     }
+}
+
+// Streams a completed section to the browser via the `verus_dump` JS
+// extern. Synchronous by design: a later stage that traps the wasm
+// instance (rustc's `abort_if_errors` → `unreachable`) can't discard
+// sections already handed off to JS. Callers of this crate (the browser
+// and `tests/smoke.rs`) observe pipeline output exclusively through the
+// JS callbacks — no String accumulator is threaded through.
+fn emit_section(section: Section) {
+    let headers: Vec<String> = section.blocks.iter()
+        .map(|b| b.header.unwrap_or("").to_string())
+        .collect();
+    let contents: Vec<String> = section.blocks.iter()
+        .map(|b| b.content.trim_end().to_string())
+        .collect();
+    let folds: Vec<u8> = section.blocks.iter()
+        .map(|b| b.fold as u8)
+        .collect();
+    verus_dump(section.name, headers, contents, folds);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -330,58 +349,57 @@ fn unwrap_dump_or_panic(result: std::thread::Result<()>, partial: String) -> Str
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Parse `src` via rustc_interface, force HIR lowering, build VIR, then drive
-/// the krate through AIR + Z3. Returns a multi-section `=== NAME ===` string
-/// the UI splits on.
+/// the krate through the AIR + Z3 pipeline. Pipeline output is streamed out
+/// to the host (browser / test runner) section-by-section via the
+/// `verus_dump` / `verus_diagnostic*` / `verus_bench` JS externs — no
+/// return value is threaded through.
 ///
 /// `verify` gates the AIR→Z3 stage. The wasm-bindgen `parse_source` always
 /// passes `true`; integration tests in `tests/` can pass `false` so the
 /// pipeline stops after VIR and doesn't call into the `Z3_*` shims (which
 /// only `public/index.html` installs — not the wasm-bindgen-test harness).
-pub fn parse_and_verify(src: &str, verify: bool, expand_errors: bool) -> String {
+pub fn parse_and_verify(src: &str, verify: bool, expand_errors: bool) {
     // vstd is wired into the extern prelude via `--extern=vstd` in
     // `build_rustc_config`, so the user's source is passed through unmodified.
     // Keeping the source 1:1 with what the editor shows is what lets
     // diagnostic line numbers land on the right editor line.
     let src = src.to_string();
-    let dump: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let dump_clone = dump.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-            *dump_clone.lock().unwrap() = run_pipeline(compiler, verify, expand_errors);
-        });
-    }));
-    let partial = dump.lock().unwrap().clone();
-    unwrap_dump_or_panic(result, partial)
+    // wasm32 has no unwinding (panic = abort), so `catch_unwind` would be a
+    // no-op here — any panic aborts the instance before this returns.
+    // Partial state the pipeline already handed off via `verus_dump` /
+    // `verus_diagnostic` stays in the host, which is the whole survivability
+    // story.
+    rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
+        run_pipeline(compiler, verify, expand_errors);
+    });
 }
 
-fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) -> String {
+fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) {
     let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
-    let mut out = String::new();
     // Parser output — pretty-prints essentially verbatim source wrapped in
     // `verus! { ... }` (plus the implicit `no_std` / register_tool
     // attributes we injected via `-Zcrate-attr`). Dumping it here, before
     // `create_and_enter_global_ctxt` moves `krate`, gives the UI a
     // before/after pair against the expanded AST so the reader can see
     // what the `verus!` macro actually rewrites into.
-    dump_ast_pre_expansion(&mut out, &krate);
+    dump_ast_pre_expansion(&krate);
     // `create_and_enter_global_ctxt` itself is cheap — the expensive work
     // (name resolution, HIR lowering, type-check) happens lazily inside the
     // closure via `tcx` queries fired by `build_vir`. We time the enter call
     // anyway in case global_ctxt setup becomes a hot spot later.
     time("global_ctxt", || {
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            dump_ast(&mut out, tcx);
-            dump_hir(&mut out, tcx);
-            dump_vir_and_verify(&mut out, compiler, tcx, verify, expand_errors);
+            dump_ast(tcx);
+            dump_hir(tcx);
+            dump_vir_and_verify(compiler, tcx, verify, expand_errors);
         })
     });
-    out
 }
 
-fn dump_ast_pre_expansion(out: &mut String, krate: &rustc_ast::Crate) {
+fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
     time("dump.ast_pre", || {
         let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
-        emit_section(out, "AST_PRE", &body);
+        emit_section(Section::single("AST_PRE", &body));
     });
 }
 
@@ -665,16 +683,16 @@ impl Emitter for MultiEmitter {
 // the AST via `Steal`. We only dump the expanded form — the pre-expansion AST
 // is just `verus! { <token tree> }` wrapping source the user can already see
 // in the editor, so it wouldn't add anything for the reader.
-fn dump_ast(out: &mut String, tcx: TyCtxt<'_>) {
+fn dump_ast(tcx: TyCtxt<'_>) {
     time("dump.ast", || {
         let borrow = tcx.resolver_for_lowering().borrow();
         let (_, krate) = &*borrow;
         let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
-        emit_section(out, "AST", &body);
+        emit_section(Section::single("AST", &body));
     });
 }
 
-fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
+fn dump_hir(tcx: TyCtxt<'_>) {
     // Forces macro expansion + name resolution + HIR lowering. Shared setup
     // between the plain dump and the typed variant below; `typeck_body`
     // downstream implicitly depends on it.
@@ -698,7 +716,7 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
             body.push_str(&rustc_hir_pretty::item_to_string(&tcx, item));
             body.push('\n');
         }
-        emit_section(out, "HIR", &body);
+        emit_section(Section::single("HIR", &body));
     });
 
     // Typed variant: mirror rustc's `-Zunpretty=hir-typed`
@@ -716,7 +734,7 @@ fn dump_hir(out: &mut String, tcx: TyCtxt<'_>) {
                 body.push('\n');
             }
         });
-        emit_section(out, "HIR_TYPED", &body);
+        emit_section(Section::single("HIR_TYPED", &body));
     });
 }
 
@@ -773,29 +791,51 @@ impl<'tcx> rustc_hir_pretty::PpAnn for HirTypedAnn<'tcx> {
 // 8. Stage 3: HIR → VIR
 // ═══════════════════════════════════════════════════════════════════════
 
-// Dump-only filter: the full krate (which still contains every vstd item
-// that was pulled in through `extern crate vstd`) is passed to `verify`,
-// but for the VIR section we strip everything not owned by the local crate
-// so the dump shows only what the user wrote. The structural marker is
-// `PathX::krate` — `None` for the local crate, `Some(ident)` for every
-// external crate (vstd, core, alloc, …). That's rustc/Verus' own
-// distinction, so it's stable against remappings, repo renames, or the
-// source path layout on any given machine.
-fn prune_krate_to_user(krate: &Krate) -> Krate {
-    Arc::new(KrateX {
-        functions: krate.functions.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
-        reveal_groups: krate.reveal_groups.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
-        datatypes: krate.datatypes.iter().filter(|x| is_local_dt(&x.x.name)).cloned().collect(),
-        traits: krate.traits.iter().filter(|x| is_local_path(&x.x.name)).cloned().collect(),
-        trait_impls: krate.trait_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
-        assoc_type_impls: krate.assoc_type_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
-        modules: krate.modules.iter().filter(|x| is_local_path(&x.x.path)).cloned().collect(),
-        external_fns: vec![],
-        external_types: vec![],
-        path_as_rust_names: vec![],
+// Dump-only partition: `verify` always sees the full krate, but the VIR
+// section splits items into two halves — user-owned (local crate) in
+// `.0` and everything else (vstd, core, alloc, …) in `.1`. JS joins
+// them back with a `;; -- vstd --` header and folds the vstd half by
+// default so the dump reads as user-code-first with vstd as an
+// expandable appendix. The structural marker is `PathX::krate` —
+// `None` for the local crate, `Some(ident)` for every external crate.
+// That's rustc / Verus's own distinction, so it's stable against
+// remappings, repo renames, or the source path layout on any given
+// machine.
+fn partition_krate(krate: &Krate) -> (Krate, Krate) {
+    let (user_fns, vstd_fns) = krate.functions.iter().cloned()
+        .partition(|x| is_local_path(&x.x.name.path));
+    let (user_reveal, vstd_reveal) = krate.reveal_groups.iter().cloned()
+        .partition(|x| is_local_path(&x.x.name.path));
+    let (user_dts, vstd_dts) = krate.datatypes.iter().cloned()
+        .partition(|x| is_local_dt(&x.x.name));
+    let (user_traits, vstd_traits) = krate.traits.iter().cloned()
+        .partition(|x| is_local_path(&x.x.name));
+    let (user_trait_impls, vstd_trait_impls) = krate.trait_impls.iter().cloned()
+        .partition(|x| is_local_path(&x.x.impl_path));
+    let (user_assoc, vstd_assoc) = krate.assoc_type_impls.iter().cloned()
+        .partition(|x| is_local_path(&x.x.impl_path));
+    let (user_mods, vstd_mods) = krate.modules.iter().cloned()
+        .partition(|x| is_local_path(&x.x.path));
+    let user = Arc::new(KrateX {
+        functions: user_fns, reveal_groups: user_reveal, datatypes: user_dts,
+        traits: user_traits, trait_impls: user_trait_impls,
+        assoc_type_impls: user_assoc, modules: user_mods,
+        // External-item metadata only makes sense on the vstd half.
+        external_fns: vec![], external_types: vec![], path_as_rust_names: vec![],
         arch: krate.arch.clone(),
         opaque_types: krate.opaque_types.clone(),
-    })
+    });
+    let vstd = Arc::new(KrateX {
+        functions: vstd_fns, reveal_groups: vstd_reveal, datatypes: vstd_dts,
+        traits: vstd_traits, trait_impls: vstd_trait_impls,
+        assoc_type_impls: vstd_assoc, modules: vstd_mods,
+        external_fns: krate.external_fns.clone(),
+        external_types: krate.external_types.clone(),
+        path_as_rust_names: krate.path_as_rust_names.clone(),
+        arch: krate.arch.clone(),
+        opaque_types: vec![],
+    });
+    (user, vstd)
 }
 
 fn is_local_path(p: &VirPath) -> bool {
@@ -809,8 +849,19 @@ fn is_local_dt(dt: &Dt) -> bool {
     }
 }
 
+fn pretty_print_krate(krate: &Krate) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    vir::printer::write_krate(&mut buf, krate, &vir::printer::COMPACT_TONODEOPTS);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn pretty_print_krate_sst(krate: &KrateSst) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    vir::printer::write_krate_sst(&mut buf, krate, &vir::printer::COMPACT_TONODEOPTS);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn dump_vir_and_verify(
-    out: &mut String,
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     verify: bool,
@@ -831,21 +882,16 @@ fn dump_vir_and_verify(
         return;
     };
     time("dump.vir", || {
-        let mut buf: Vec<u8> = Vec::new();
-        let pruned = prune_krate_to_user(&krate);
-        vir::printer::write_krate(&mut buf, &pruned, &vir::printer::COMPACT_TONODEOPTS);
-        emit_section(out, "VIR", &String::from_utf8_lossy(&buf));
-    });
-    // Unfiltered version alongside, for the UI's "Show vstd" checkbox.
-    // Pretty-printing runs over vstd (~150 modules), so this doubles the
-    // VIR dump cost and ~10×s the byte count — acceptable because the
-    // user already opted in to seeing wasm-bindgen calls back every
-    // queued section, and a hidden tab variant shouldn't spend extra
-    // round-trips to refetch it.
-    time("dump.vir_full", || {
-        let mut buf: Vec<u8> = Vec::new();
-        vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
-        emit_section(out, "VIR_FULL", &String::from_utf8_lossy(&buf));
+        let (user_krate, vstd_krate) = partition_krate(&krate);
+        let user = pretty_print_krate(&user_krate);
+        let vstd = pretty_print_krate(&vstd_krate);
+        emit_section(Section {
+            name: "VIR",
+            blocks: vec![
+                Block { header: None, content: &user, fold: false },
+                Block { header: Some("vstd"), content: &vstd, fold: true },
+            ],
+        });
     });
     if !verify {
         return;
@@ -864,7 +910,7 @@ fn dump_vir_and_verify(
     let _ = time("verify", || {
         verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans, expand_errors, &mut output)
     });
-    write_verify_output(out, &output);
+    write_verify_output(&output);
 }
 
 // Drives Verus's HIR→VIR pipeline. `Verifier::build_vir_crate` (vendored
@@ -937,15 +983,16 @@ fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
 struct VerifyOutput {
     /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
     /// (still polymorphic; function bodies as SST expressions/statements).
-    sst_ast: String,
-    /// `sst_ast` but with the `prune_krate_sst_to_user` filter lifted —
-    /// includes vstd items. UI's "Show vstd" checkbox swaps to this.
-    sst_ast_full: String,
+    /// Split per-module into user-owned vs vstd items; emitted as two
+    /// blocks under one `SST_AST` section so the vstd half renders as a
+    /// foldable appendix.
+    sst_ast_user: String,
+    sst_ast_vstd: String,
     /// After `poly::poly_krate_for_module` — monomorphized SST
-    /// (polymorphism erased; the form the AIR lowerer consumes).
-    sst_poly: String,
-    /// Unfiltered companion to `sst_poly`.
-    sst_poly_full: String,
+    /// (polymorphism erased; the form the AIR lowerer consumes). Same
+    /// user/vstd split as `sst_ast_*`.
+    sst_poly_user: String,
+    sst_poly_vstd: String,
     /// Raw AIR (Block/Switch/Assert tree, AIR syntax).
     air_initial: String,
     /// After `var_to_const::lower_query` (SSA-style versioning of mutable vars).
@@ -1183,11 +1230,11 @@ fn verify_module(
         &bucket_funs,
         &pruned,
     ))?;
-    time("dump.sst_ast", || append_sst_dump(&mut output.sst_ast, &krate_sst, true));
-    time("dump.sst_ast_full", || append_sst_dump(&mut output.sst_ast_full, &krate_sst, false));
+    time("dump.sst_ast", || append_sst_dump(
+        &mut output.sst_ast_user, &mut output.sst_ast_vstd, &krate_sst));
     let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
-    time("dump.sst_poly", || append_sst_dump(&mut output.sst_poly, &krate_sst, true));
-    time("dump.sst_poly_full", || append_sst_dump(&mut output.sst_poly_full, &krate_sst, false));
+    time("dump.sst_poly", || append_sst_dump(
+        &mut output.sst_poly_user, &mut output.sst_poly_vstd, &krate_sst));
 
     let visible_dts: Vec<Datatype> = krate_sst
         .datatypes
@@ -1503,31 +1550,43 @@ fn run_queries(
 }
 
 // `krate_sst` is per-module (SST lowering happens inside `verify_module`).
-// Each call appends a module's SST dump to the running buffer so the final
-// section contains every module's SSTs in order. Same local-crate filter as
-// VIR — vstd items don't drown out the user's functions. Verify still runs
-// on the full krate; this pruned copy is display-only.
-fn append_sst_dump(buf: &mut String, krate_sst: &KrateSst, prune: bool) {
-    let mut bytes: Vec<u8> = Vec::new();
-    if prune {
-        let pruned = prune_krate_sst_to_user(krate_sst);
-        vir::printer::write_krate_sst(&mut bytes, &pruned, &vir::printer::COMPACT_TONODEOPTS);
-    } else {
-        vir::printer::write_krate_sst(&mut bytes, krate_sst, &vir::printer::COMPACT_TONODEOPTS);
-    }
-    buf.push_str(&String::from_utf8_lossy(&bytes));
+// Each call appends a module's SST dump to both buffers — user-owned
+// items to `user_buf`, vstd items to `vstd_buf` — so the final section
+// contains every module's SSTs in order, split into two blocks the UI
+// can fold independently. Verify still runs on the full krate; these
+// partitions are display-only.
+fn append_sst_dump(user_buf: &mut String, vstd_buf: &mut String, krate_sst: &KrateSst) {
+    let (user, vstd) = partition_krate_sst(krate_sst);
+    user_buf.push_str(&pretty_print_krate_sst(&user));
+    vstd_buf.push_str(&pretty_print_krate_sst(&vstd));
 }
 
-fn prune_krate_sst_to_user(krate: &KrateSst) -> KrateSst {
-    Arc::new(KrateSstX {
-        functions: krate.functions.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
-        datatypes: krate.datatypes.iter().filter(|x| is_local_dt(&x.x.name)).cloned().collect(),
+fn partition_krate_sst(krate: &KrateSst) -> (KrateSst, KrateSst) {
+    let (user_fns, vstd_fns) = krate.functions.iter().cloned()
+        .partition(|x| is_local_path(&x.x.name.path));
+    let (user_dts, vstd_dts) = krate.datatypes.iter().cloned()
+        .partition(|x| is_local_dt(&x.x.name));
+    let (user_traits, vstd_traits) = krate.traits.iter().cloned()
+        .partition(|x| is_local_path(&x.x.name));
+    let (user_trait_impls, vstd_trait_impls) = krate.trait_impls.iter().cloned()
+        .partition(|x| is_local_path(&x.x.impl_path));
+    let (user_assoc, vstd_assoc) = krate.assoc_type_impls.iter().cloned()
+        .partition(|x| is_local_path(&x.x.impl_path));
+    let (user_reveal, vstd_reveal) = krate.reveal_groups.iter().cloned()
+        .partition(|x| is_local_path(&x.x.name.path));
+    let user = Arc::new(KrateSstX {
+        functions: user_fns, datatypes: user_dts, traits: user_traits,
+        trait_impls: user_trait_impls, assoc_type_impls: user_assoc,
+        reveal_groups: user_reveal,
         opaque_types: krate.opaque_types.clone(),
-        traits: krate.traits.iter().filter(|x| is_local_path(&x.x.name)).cloned().collect(),
-        trait_impls: krate.trait_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
-        assoc_type_impls: krate.assoc_type_impls.iter().filter(|x| is_local_path(&x.x.impl_path)).cloned().collect(),
-        reveal_groups: krate.reveal_groups.iter().filter(|x| is_local_path(&x.x.name.path)).cloned().collect(),
-    })
+    });
+    let vstd = Arc::new(KrateSstX {
+        functions: vstd_fns, datatypes: vstd_dts, traits: vstd_traits,
+        trait_impls: vstd_trait_impls, assoc_type_impls: vstd_assoc,
+        reveal_groups: vstd_reveal,
+        opaque_types: vec![],
+    });
+    (user, vstd)
 }
 
 // Each AIR/SMT dump begins with the global axiom/datatype preamble and then
@@ -1586,17 +1645,19 @@ fn label_before(preceding: &str) -> Option<String> {
     comments.last().copied().filter(|s| !s.is_empty()).map(str::to_string)
 }
 
-fn write_verify_output(out: &mut String, output: &VerifyOutput) {
-    for (name, body) in [
-        ("SST_AST", &output.sst_ast),
-        ("SST_AST_FULL", &output.sst_ast_full),
-        ("SST_POLY", &output.sst_poly),
-        ("SST_POLY_FULL", &output.sst_poly_full),
+fn write_verify_output(output: &VerifyOutput) {
+    for (name, user, vstd) in [
+        ("SST_AST", &output.sst_ast_user, &output.sst_ast_vstd),
+        ("SST_POLY", &output.sst_poly_user, &output.sst_poly_vstd),
     ] {
-        if body.is_empty() {
+        if user.is_empty() && vstd.is_empty() {
             continue;
         }
-        emit_section(out, name, body);
+        let mut blocks = vec![Block { header: None, content: user, fold: false }];
+        if !vstd.trim().is_empty() {
+            blocks.push(Block { header: Some("vstd"), content: vstd, fold: true });
+        }
+        emit_section(Section { name, blocks });
     }
     for (name, body) in [
         ("AIR_INITIAL", &output.air_initial),
@@ -1607,7 +1668,7 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
         if body.is_empty() {
             continue;
         }
-        emit_section(out, name, &split_setup_queries(body));
+        emit_section(Section::single(name, &split_setup_queries(body)));
     }
     let mut verdict = String::new();
     if output.verdicts.is_empty() {
@@ -1621,5 +1682,5 @@ fn write_verify_output(out: &mut String, output: &VerifyOutput) {
     for v in &output.verdicts {
         writeln!(verdict, "{}: {} → {}", v.function, v.kind, v.outcome).unwrap();
     }
-    emit_section(out, "VERDICT", &verdict);
+    emit_section(Section::single("VERDICT", &verdict));
 }

@@ -5,8 +5,8 @@
 :root {
   --bg: #fff;
   --fg: #111;
-  --muted: #666;
-  --subtle: #888;
+  --fg-muted: #666;
+  --tab-fg: #333;
   --pre-bg: #f5f5f5;
   --border: #ddd;
   --border-soft: #e5e5e5;
@@ -30,8 +30,8 @@
   :root {
     --bg: #1a1a1a;
     --fg: #e0e0e0;
-    --muted: #999;
-    --subtle: #777;
+    --fg-muted: #999;
+    --tab-fg: #c8c8c8;
     --pre-bg: #242424;
     --border: #333;
     --border-soft: #2a2a2a;
@@ -110,7 +110,7 @@ select {
   border-radius: 4px;
 }
 
-.muted { color: var(--muted); }
+.muted { color: var(--fg-muted); }
 
 pre {
   background: var(--pre-bg);
@@ -262,7 +262,11 @@ kbd {
   background: none;
   border: 1px solid transparent;
   border-bottom: none;
-  color: var(--muted);
+  /* Dedicated `--tab-fg` (not `--fg-muted`) because tab labels sit on
+     the body background with no chrome around them — `--fg-muted`
+     reads legibly on pills/borders but feels washed out here. Both
+     palettes tune this one level closer to `--fg`. */
+  color: var(--tab-fg);
   font: inherit;
   font-size: .8em;
   padding: .3em .7em;
@@ -277,6 +281,32 @@ kbd {
   margin-bottom: -1px;
 }
 .tab:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Right-aligned actions group — Download (current IR tab) and Share
+   link. Wrapped in `.tab-actions` with `margin-left: auto` so they pin
+   to the far edge regardless of how many stage buttons are present or
+   whether `.output-tabs` wraps. Using a wrapper (rather than a sibling
+   selector on `.tab-action`) keeps the CSS unambiguous: no selector
+   coincidence with `.tab` (which is also a `<button>`). */
+.tab-actions {
+  display: flex;
+  gap: .2em;
+  align-items: center;
+  margin-left: auto;
+}
+.tab-action {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--tab-fg);
+  font: inherit;
+  font-size: .8em;
+  padding: .2em .7em;
+  margin-bottom: .15em;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.tab-action:hover:not(:disabled) { color: var(--fg); border-color: var(--focus-ring); }
+.tab-action:disabled { opacity: .4; cursor: not-allowed; }
 
 /* Subtab row: sits right under the top tab bar, above the CM6 view.
    Holds two kinds of children — variant pills (e.g. raw / SSA / flat
@@ -297,7 +327,7 @@ kbd {
 .subtab {
   background: none;
   border: 1px solid var(--border);
-  color: var(--muted);
+  color: var(--fg-muted);
   font: inherit;
   font-size: .75em;
   padding: .15em .6em;
@@ -353,7 +383,7 @@ kbd {
 .verdict-detail {
   font-size: .82em;
   margin-top: .3em;
-  color: var(--muted);
+  color: var(--fg-muted);
   white-space: pre-wrap;
 }
 

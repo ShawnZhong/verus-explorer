@@ -41,7 +41,18 @@
     </section>
 
     <section class="pane" id="right-pane">
-      <div class="output-tabs" id="parse-tabs" role="tablist"></div>
+      <!-- Stage tab buttons are appended into `#parse-tabs` by `renderTabs`;
+           the static `.tab-actions` block lives in markup so its buttons
+           aren't torn down on every tab switch, only their disabled state
+           changes. `margin-left: auto` (CSS) pins it right. -->
+      <div class="output-tabs" id="parse-tabs" role="tablist">
+        <div class="tab-actions">
+          <button class="tab-action" id="download-btn" type="button"
+                  title="Download the current IR tab" disabled>Download</button>
+          <button class="tab-action" id="share-btn" type="button"
+                  title="Copy the current URL to clipboard">Copy link</button>
+        </div>
+      </div>
       <div class="output-subtabs" id="parse-subtabs" role="tablist"></div>
       <div id="parse-output-view"></div>
     </section>
@@ -84,48 +95,63 @@
       'vstd.vir',
     ];
 
-    // Z3 init, the verus wasm compile, and the wasm-libs fetch+decompress
-    // are independent; fire them all off at once. Critical cold-load time
-    // = max(them), not sum. Emscripten resolves z3.wasm relative to z3.js
-    // by default, so no locateFile callback is needed.
-    const [Z3, verusModule, wasmLibs] = await Promise.all([
-      globalThis.initZ3(),
-      WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm')),
-      Promise.all(WASM_LIBS.map(async name => {
-        const res = await fetch(`./wasm-libs/${name}.gz`);
-        const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
-        const buf = await new Response(stream).arrayBuffer();
-        return [name, new Uint8Array(buf)];
-      })),
-    ]);
-
-    // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
-    // wasm-bindgen externs, so each must be a plain JS function on globalThis.
-    globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
-    globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
-    globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
-    globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
-    // `Z3_eval_smtlib2_string` returns the solver's textual reply (`sat` /
-    // `unsat` / errors / model output) for each batch of SMT commands sent
-    // from the AIR driver. The AIR log writers capture *input* SMT-LIB2 but
-    // the replies are otherwise opaque; tee them into `z3ResponseBuffer`
-    // here so `runParse` can stash the transcript as a 'Z3' section.
-    const z3Eval = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
+    // Kick off wasm loading in the background (Z3 init, Verus wasm compile,
+    // wasm-libs fetch+decompress — all independent, so fire as one
+    // Promise.all; critical path = max, not sum). We deliberately do NOT
+    // await here: the editor, tab strip, and example dropdown are cheap to
+    // mount and should appear immediately so the user can start reading /
+    // editing during the multi-MB cold-load. `verus` stays `null` until the
+    // chain resolves; the Verify button is disabled and `runParse` is a
+    // no-op until then. The bottom of this script `await`s `wasmReady` to
+    // flip the button live and kick off the first verify.
+    let verus = null;
+    // z3 transcript buffer — hoisted out of the IIFE so `runParse` (which
+    // clears it at the top of each run and reads it at the bottom) sees the
+    // same binding the Z3 eval wrapper pushes into. Reassigned (not just
+    // cleared) by `runParse` to `[]` each run; the wrapper's closure
+    // captures the *variable*, not the initial array, so the push keeps
+    // targeting the live buffer.
     let z3ResponseBuffer = [];
-    globalThis.Z3_eval_smtlib2_string = (ctx, query) => {
-      const reply = z3Eval(ctx, query);
-      z3ResponseBuffer.push(reply);
-      return reply;
-    };
+    const wasmReady = (async () => {
+      const [Z3, verusModule, wasmLibs] = await Promise.all([
+        globalThis.initZ3(),
+        WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm')),
+        Promise.all(WASM_LIBS.map(async name => {
+          const res = await fetch(`./wasm-libs/${name}.gz`);
+          const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
+          const buf = await new Response(stream).arrayBuffer();
+          return [name, new Uint8Array(buf)];
+        })),
+      ]);
 
-    // One wasm instance, reused for every `parse_source` call. Each
-    // `run_compiler` builds its own Session+CStore; nothing leaks across
-    // calls (confirmed by `tests/smoke.rs`). V8 JIT + rustc LazyLock entries
-    // survive across calls and amortize, so #2/#3 run at ~2× #1 speed.
-    const verus = await import('./verus_explorer.js');
-    await verus.default({ module_or_path: verusModule });
-    for (const [name, bytes] of wasmLibs) verus.wasm_libs_add_file(name, bytes);
-    verus.wasm_libs_finalize();
+      // Bridge Rust <-> emscripten Z3: air/src/smt_process.rs declares these as
+      // wasm-bindgen externs, so each must be a plain JS function on globalThis.
+      globalThis.Z3_mk_config = Z3.cwrap('Z3_mk_config', 'number', []);
+      globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
+      globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
+      globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
+      // `Z3_eval_smtlib2_string` returns the solver's textual reply (`sat` /
+      // `unsat` / errors / model output) for each batch of SMT commands sent
+      // from the AIR driver. The AIR log writers capture *input* SMT-LIB2 but
+      // the replies are otherwise opaque; tee them into `z3ResponseBuffer`
+      // here so `runParse` can stash the transcript as a 'Z3' section.
+      const z3Eval = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
+      globalThis.Z3_eval_smtlib2_string = (ctx, query) => {
+        const reply = z3Eval(ctx, query);
+        z3ResponseBuffer.push(reply);
+        return reply;
+      };
+
+      // One wasm instance, reused for every `parse_source` call. Each
+      // `run_compiler` builds its own Session+CStore; nothing leaks across
+      // calls (confirmed by `tests/smoke.rs`). V8 JIT + rustc LazyLock entries
+      // survive across calls and amortize, so #2/#3 run at ~2× #1 speed.
+      const v = await import('./verus_explorer.js');
+      await v.default({ module_or_path: verusModule });
+      for (const [name, bytes] of wasmLibs) v.wasm_libs_add_file(name, bytes);
+      v.wasm_libs_finalize();
+      verus = v;
+    })();
 
     // ------------------------------------------------------------------
     // DOM refs + tiny state
@@ -139,6 +165,8 @@
     const exampleSelect = document.getElementById('example-select');
     const autoVerifyCheckbox = document.getElementById('auto-verify');
     const expandErrorsCheckbox = document.getElementById('expand-errors');
+    const downloadBtn = document.getElementById('download-btn');
+    const shareBtn = document.getElementById('share-btn');
 
     // Example manifest: grouped by topic so the dropdown reads as a mini
     // table of contents. Each `items` entry drives one `<option>`; the
@@ -209,32 +237,35 @@
     // they left it rather than snapping back to the first variant.
     const lastVariantInGroup = new Map();
 
-    // "Show vstd" toggle: by default the VIR tab's three variants show
-    // only user-owned items (Rust side runs `prune_krate_to_user` /
-    // `prune_krate_sst_to_user` at dump time — verification itself still
-    // sees everything). When the checkbox is on, we swap the section
-    // lookup to the `_FULL` twin that Rust emits alongside, which pretty-
-    // prints the whole krate including vstd. Pure dump filter — no
-    // re-verify needed. Map declares the variants that have a twin.
-    const VIR_FULL_SECTION = {
-      VIR: 'VIR_FULL', SST_AST: 'SST_AST_FULL', SST_POLY: 'SST_POLY_FULL',
-    };
-    let showVstd = false;
-    const sectionFor = (tab) =>
-      (showVstd && VIR_FULL_SECTION[tab]) ? VIR_FULL_SECTION[tab] : tab;
+    // Rust-declared fold ranges per section — populated by `verus_dump`
+    // when it receives a block flagged `fold: 1` (e.g. the vstd appendix
+    // on VIR / SST_AST / SST_POLY). Each entry is `[{from, to}, …]` with
+    // absolute offsets into the rendered body. `renderOutputView` auto-
+    // applies them on cold render; `sectionFold` below re-offers them
+    // to the fold gutter so the user can refold after expanding.
+    const sectionFolds = new Map();
 
     // `parse_source` always produces every IR; bodies are cached here so
     // flipping a tab just swaps the output-view's doc instead of re-parsing.
     const sectionCache = new Map();
     let verdictCache = null;
-    const diagnosticCache = [];
-    // Structured mirror of `diagnosticCache`, populated from the wasm
-    // `verus_diagnostic_json` callback. Each entry is the parsed output of
-    // rustc's JsonEmitter (one object per diagnostic, with `spans[]`
-    // carrying `byte_start`/`byte_end` + `line_start`/`column_start` etc.).
-    // Used by `buildInlineDiagnostics` to drive CM6 squiggle ranges with
-    // rustc-exact widths instead of "column → end-of-line".
-    const diagnosticJsonCache = [];
+    // Raw buffers the wasm callbacks push into during `parse_source`.
+    // `_textDiags` holds `HumanEmitter` output (colorized terminal form);
+    // `_jsonDiags` holds parsed `JsonEmitter` objects (with `spans[]`
+    // carrying rustc-exact line/col ranges). `runParse` consolidates them
+    // into the unified `diagnostics` list below once parsing returns.
+    const _textDiags = [];
+    const _jsonDiags = [];
+    // Unified diagnostic list consumed by the three renderers (`renderMeta`,
+    // `updateErrorDecorations`, `computeInlineDiagnostics`). Each entry:
+    //   { rendered: string,                    // text for pane + tooltip
+    //     severity: 'error'|'warning'|'note',
+    //     loc: { line, col, endLine?, endCol? } | null }
+    // When the JSON channel produced entries we use them (rustc-exact
+    // spans with end positions); otherwise we fall back to the text
+    // channel with a regex-extracted `line:col` and no end. Built once
+    // per parse so all three consumers see the same snapshot.
+    const diagnostics = [];
     // Which IR the output view currently shows; preserved across runParse
     // calls so the user doesn't lose their tab selection on every edit.
     // Null until the first successful parse; `renderTabs` picks a default.
@@ -340,14 +371,13 @@
         }
         parseMeta.appendChild(div);
       }
-      for (const msg of diagnosticCache) {
+      for (const d of diagnostics) {
         const pre = document.createElement('pre');
-        pre.className = `diagnostic ${severity(msg)}`;
-        pre.textContent = msg;
-        const loc = extractLoc(msg);
-        if (loc && loc.line >= 1 && loc.line <= view.state.doc.lines) {
+        pre.className = `diagnostic ${d.severity}`;
+        pre.textContent = d.rendered;
+        if (d.loc && d.loc.line >= 1 && d.loc.line <= view.state.doc.lines) {
           pre.classList.add('clickable');
-          pre.addEventListener('click', () => jumpToLoc(loc));
+          pre.addEventListener('click', () => jumpToLoc(d.loc));
         }
         parseMeta.appendChild(pre);
       }
@@ -360,9 +390,12 @@
     // Stages not yet cached render as disabled buttons so the full pipeline
     // shape stays visible during cold load / between runs.
     const renderTabs = () => {
-      parseTabsEl.textContent = '';
+      // Remove old tab buttons but preserve the static `.tab-actions`
+      // wrapper (and its bound click handlers) that lives in markup.
+      parseTabsEl.querySelectorAll('.tab').forEach(el => el.remove());
+      const tabActions = parseTabsEl.querySelector('.tab-actions');
       const currentGroup = currentTab ? GROUP_OF.get(currentTab) : null;
-      const cached = (v) => sectionCache.has(sectionFor(v));
+      const cached = (v) => sectionCache.has(v);
       for (const g of TAB_GROUPS) {
         const button = document.createElement('button');
         button.type = 'button';
@@ -378,22 +411,23 @@
           lastVariantInGroup.set(g.id, chosen);
           rerender();
         });
-        parseTabsEl.appendChild(button);
+        parseTabsEl.insertBefore(button, tabActions);
       }
+      downloadBtn.disabled = !currentTab || !sectionCache.has(currentTab);
+      downloadBtn.title = currentTab
+        ? `Download the ${currentTab} tab's contents`
+        : 'Download the current IR tab';
     };
 
     // Subtab row: sits right under the top tab bar, above the CM6 view.
-    // Holds two kinds of children, separated visually by `margin-left:
-    // auto` on the control block so pills hug the left edge and controls
-    // hug the right:
-    //   1. Variant pills — one per sibling section in the active group
-    //      (e.g., `ast` / `sst` / `poly` under VIR). Skipped when the
-    //      group has a single variant (Verus, HIR).
-    //   2. Group-level controls — currently only VIR's `Show vstd`
-    //      toggle, which swaps `sectionFor()` between pruned and full
-    //      twins (both cached per run, no re-verify).
-    // Row is hidden entirely when empty (`.output-subtabs:empty`) so
-    // tabs with no variants and no controls don't leave a dead band.
+    // One pill per sibling variant in the active group (e.g. `ast` /
+    // `sst` / `poly` under VIR). Skipped when the group has a single
+    // variant (Verus, HIR). Hidden via `.output-subtabs:empty` when the
+    // row would otherwise render nothing, so tabs with a single variant
+    // don't leave a dead band above the editor. (VSTD items now ride
+    // along inside each variant's body as a foldable block — see the
+    // `fold: true` flag in `verus_dump` payloads — so there's no
+    // separate Show-vstd toggle here.)
     const renderSubtabs = () => {
       parseSubtabsEl.textContent = '';
       const currentGroup = currentTab ? GROUP_OF.get(currentTab) : null;
@@ -405,7 +439,7 @@
           button.type = 'button';
           button.className = 'subtab' + (v === currentTab ? ' active' : '');
           button.textContent = VARIANT_LABEL[v];
-          button.disabled = !sectionCache.has(sectionFor(v));
+          button.disabled = !sectionCache.has(v);
           button.addEventListener('click', () => {
             currentTab = v;
             lastVariantInGroup.set(currentGroup, v);
@@ -413,21 +447,6 @@
           });
           parseSubtabsEl.appendChild(button);
         }
-      }
-      if (currentGroup === 'VIR') {
-        const label = document.createElement('label');
-        label.className = 'tab-control hint muted';
-        label.title = 'Include vstd items in the VIR / VIR-sst / VIR-poly dumps';
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = showVstd;
-        cb.addEventListener('change', () => {
-          showVstd = cb.checked;
-          rerender();
-        });
-        label.appendChild(cb);
-        label.appendChild(document.createTextNode(' Show vstd'));
-        parseSubtabsEl.appendChild(label);
       }
     };
 
@@ -591,17 +610,22 @@
     // the search panel's state).
     const outputLanguage = new Compartment();
 
-    // Fold service for the SMT / AIR tabs. Two shapes are foldable:
-    //   1. `(push)` / `(pop)` pairs — Verus wraps each check_valid in them
-    //      (air/context.rs:429), so each query collapses to one line.
-    //   2. `;; -- setup --` header — folds the preamble up to the line
-    //      right before the first `(push)` so the (usually large) axiom /
-    //      datatype setup can be hidden in one click. The setup marker
+    // Fold service — basicSetup's foldGutter asks this per line; non-
+    // foldable lines return null. Three shapes are foldable:
+    //   1. Rust-declared block folds from `sectionFolds` (e.g. the vstd
+    //      appendix on VIR / SST). Offered here so the user can manually
+    //      refold after expanding — the initial auto-fold still lives in
+    //      `renderOutputView`, which runs once per tab switch.
+    //   2. `(push)` / `(pop)` pairs — Verus wraps each check_valid in
+    //      them (air/context.rs:429), so each query collapses to one line.
+    //   3. `;; -- setup --` header — folds the preamble up to the line
+    //      right before the first `(push)` so the (usually large) axiom
+    //      / datatype setup can be hidden in one click. The setup marker
     //      comes from `split_setup_queries` in `src/lib.rs`.
-    // basicSetup's foldGutter asks this service per line; non-foldable
-    // lines return null. `renderOutputView` then auto-folds the setup
-    // range on every tab switch so it starts collapsed by default.
     const sectionFold = foldService.of((state, lineStart, lineEnd) => {
+      for (const f of sectionFolds.get(currentTab) ?? []) {
+        if (f.from === lineEnd) return f;
+      }
       const head = state.doc.sliceString(lineStart, lineEnd);
       if (/^;; -- setup --\s*$/.test(head)) {
         const idx = state.doc.toString().indexOf('\n(push)', lineEnd);
@@ -629,21 +653,22 @@
     // then restore the user's last scroll position for that tab (0 on first
     // visit). One long-lived view is cheaper than N-per-tab; the scroll map
     // is what buys back the "pick up where I left off" feel.
+    //
+    // The whole-doc replacement wipes any prior fold state (folds over a
+    // deleted range collapse to zero width), so auto-folds are re-applied
+    // on every render: Rust-declared block folds from `sectionFolds`
+    // (vstd appendix on VIR / SST), plus the `;; -- setup --` preamble
+    // on AIR / SMT tabs whose range is only knowable once the SMT body
+    // exists.
     const renderOutputView = () => {
-      const key = currentTab ? sectionFor(currentTab) : null;
-      const body = key && sectionCache.has(key) ? sectionCache.get(key) : '';
+      const body = currentTab && sectionCache.has(currentTab) ? sectionCache.get(currentTab) : '';
       outputView.dispatch({
         changes: { from: 0, to: outputView.state.doc.length, insert: body },
         effects: outputLanguage.reconfigure(LANGUAGE_FOR_SECTION[currentTab] ?? []),
       });
-      // Auto-fold the `;; -- setup --` preamble so the tab opens focused
-      // on the queries. Applies to every body produced by
-      // `split_setup_queries` — SMT and all three AIR tabs. The whole-doc
-      // replacement above wipes any prior fold state (folds over a
-      // deleted range collapse to zero width), so we re-apply on every
-      // render. If the body has no `(push)` (unreachable after the guard
-      // in `split_setup_queries`, but defensive) or isn't an SMT/AIR
-      // tab, nothing folds.
+      for (const { from, to } of sectionFolds.get(currentTab) ?? []) {
+        outputView.dispatch({ effects: foldEffect.of({ from, to }) });
+      }
       const pushIdx = body.indexOf('\n(push)');
       if (body.startsWith(';; -- setup --') && pushIdx > 0) {
         outputView.dispatch({
@@ -654,9 +679,9 @@
     };
 
     // Full re-render after a state change that can affect tabs, subtabs,
-    // and the shown section (tab click, subtab click, Show-vstd toggle,
-    // new parse result). All three are cheap (pure DOM rebuild + doc
-    // swap), so we always run the set rather than tracking dirty bits.
+    // and the shown section (tab click, subtab click, new parse result).
+    // All three are cheap (pure DOM rebuild + doc swap), so we always run
+    // the set rather than tracking dirty bits.
     const rerender = () => { renderTabs(); renderSubtabs(); renderOutputView(); };
 
     // Build CM6 `Diagnostic` objects (the @codemirror/lint shape) from the
@@ -674,42 +699,32 @@
     const computeInlineDiagnostics = (doc) => {
       const diags = [];
       // The wasm side feeds a single `input.rs` through `Input::Str`, so
-      // every span's `file_name` is that virtual path. Use `line_start` +
-      // `column_start` to map into the CM6 doc: JS strings are UTF-16 and
-      // rustc's `column_start` is a 1-based character offset, so walking
-      // from the line start by `column_start - 1` characters lines the
-      // squiggle up on the exact grapheme rustc caret'd. (Using byte
-      // offsets directly would desync on any non-ASCII source byte.)
+      // every span's `file_name` is that virtual path. Use `line` + `col`
+      // to map into the CM6 doc: JS strings are UTF-16 and rustc's
+      // `column_start` is a 1-based character offset, so walking from
+      // the line start by `col - 1` characters lines the squiggle up on
+      // the exact grapheme rustc caret'd. (Using byte offsets directly
+      // would desync on any non-ASCII source byte.)
       const toOffset = (line, col) => {
         if (line < 1 || line > doc.lines) return null;
         const info = doc.line(line);
         return Math.min(info.from + Math.max(0, col - 1), info.to);
       };
-      for (const d of diagnosticJsonCache) {
-        const primary = d.spans?.find(s => s.is_primary) ?? d.spans?.[0];
-        if (!primary) continue;
-        const from = toOffset(primary.line_start, primary.column_start);
-        let to = toOffset(primary.line_end, primary.column_end);
-        if (from === null || to === null) continue;
-        if (to <= from) to = Math.min(from + 1, doc.length);
-        const sev = d.level === 'warning' ? 'warning'
-                 : (d.level === 'note' || d.level === 'help') ? 'note'
-                 : 'error';
-        // Tooltip prefers the rendered text (what the DIAGNOSTICS pane
-        // shows) so hover and pane stay consistent; fall back to the bare
-        // message if `rendered` is empty.
-        const message = d.rendered ?? d.message ?? '';
-        diags.push({ from, to, severity: sev, message });
-      }
-      if (diags.length === 0) {
-        // Pre-MultiEmitter fallback / non-rustc messages.
-        for (const msg of diagnosticCache) {
-          const loc = extractLoc(msg);
-          if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
-          const lineInfo = doc.line(loc.line);
-          const from = Math.min(lineInfo.from + Math.max(0, loc.col - 1), lineInfo.to);
-          diags.push({ from, to: lineInfo.to, severity: severity(msg), message: msg });
+      for (const d of diagnostics) {
+        if (!d.loc) continue;
+        const from = toOffset(d.loc.line, d.loc.col);
+        if (from === null) continue;
+        // JSON-side entries carry an end span; text-fallback entries
+        // don't, so widen the squiggle to end-of-line in that case.
+        let to;
+        if (d.loc.endLine !== undefined) {
+          to = toOffset(d.loc.endLine, d.loc.endCol);
+          if (to === null) continue;
+          if (to <= from) to = Math.min(from + 1, doc.length);
+        } else {
+          to = doc.line(d.loc.line).to;
         }
+        diags.push({ from, to, severity: d.severity, message: d.rendered });
       }
       // CM6 requires diagnostics sorted by `from`.
       diags.sort((a, b) => a.from - b.from);
@@ -731,15 +746,13 @@
       // both an error and a warning — two line-bg decorations on one line
       // both render and the warning would visually layer over the error.
       const byLine = new Map();
-      for (const msg of diagnosticCache) {
-        const loc = extractLoc(msg);
-        if (!loc || loc.line < 1 || loc.line > doc.lines) continue;
-        const sev = severity(msg);
-        if (sev === 'note') continue;
-        const from = doc.line(loc.line).from;
+      for (const d of diagnostics) {
+        if (!d.loc || d.severity === 'note') continue;
+        if (d.loc.line < 1 || d.loc.line > doc.lines) continue;
+        const from = doc.line(d.loc.line).from;
         const prev = byLine.get(from);
-        if (!prev || (prev === 'warning' && sev === 'error')) {
-          byLine.set(from, sev);
+        if (!prev || (prev === 'warning' && d.severity === 'error')) {
+          byLine.set(from, d.severity);
         }
       }
       const decos = [...byLine.entries()]
@@ -754,14 +767,39 @@
     // calls. On a mid-pipeline trap the buffered caches survive the
     // unwind and `finally`-time renderers flush what's there.
     // ------------------------------------------------------------------
-    globalThis.verus_diagnostic = (msg) => { diagnosticCache.push(msg); };
+    globalThis.verus_diagnostic = (msg) => { _textDiags.push(msg); };
     globalThis.verus_diagnostic_json = (msg) => {
-      try { diagnosticJsonCache.push(JSON.parse(msg)); }
+      try { _jsonDiags.push(JSON.parse(msg)); }
       catch (e) { console.warn('verus_diagnostic_json: parse failed', e, msg); }
     };
-    globalThis.verus_dump = (section, body) => {
-      if (section === 'VERDICT') verdictCache = body;
-      else sectionCache.set(section, body);
+    // Rust sends structured blocks: `headers[i]` is an optional label
+    // (empty string means no header), `contents[i]` is the block text,
+    // `folds[i] === 1` asks JS to auto-fold that block on render. JS
+    // owns rendering: header lines are stitched in as `;; -- <h> --`
+    // comments, fold ranges are captured in `sectionFolds` and applied
+    // by `renderOutputView` (and re-offered for manual refold by the
+    // fold service).
+    globalThis.verus_dump = (section, headers, contents, folds) => {
+      let body = '';
+      const ranges = [];
+      for (let i = 0; i < headers.length; i++) {
+        if (body.length > 0 && !body.endsWith('\n')) body += '\n';
+        if (headers[i]) {
+          body += `;; -- ${headers[i]} --`;
+          const headerEnd = body.length;
+          body += '\n';
+          body += contents[i];
+          if (folds[i]) ranges.push({ from: headerEnd, to: body.length });
+        } else {
+          body += contents[i];
+        }
+      }
+      if (section === 'VERDICT') {
+        verdictCache = body;
+      } else {
+        sectionCache.set(section, body);
+        if (ranges.length > 0) sectionFolds.set(section, ranges);
+      }
     };
     // Rust side calls `verus_bench(label, ms)` for each timed pipeline
     // stage; leave it as a no-op in the browser (the signal is useful
@@ -769,22 +807,41 @@
     // own stub that writes to stderr).
     globalThis.verus_bench = () => {};
 
+    // Declared here (before `runParse`) so `runParse` can cancel any
+    // pending auto-verify at its top — otherwise an explicit verify
+    // (Verify click, Mod-Enter, example load) races with a pending
+    // 800ms auto-verify timer from a just-prior doc change and we end
+    // up double-verifying. The timer itself is armed by
+    // `scheduleAutoVerify` further down.
+    let autoVerifyTimer;
     let runId = 0;
     const runParse = () => {
+      // Wasm not ready yet — silently no-op. Reached only through
+      // `scheduleAutoVerify` firing during cold-load (the Verify button
+      // is disabled until `wasmReady` resolves, so the click path can't
+      // land here). The final `await wasmReady` at the bottom of this
+      // script runs the first real verify once wasm is live.
+      if (!verus) return;
+      clearTimeout(autoVerifyTimer);
+      // Flush any debounced URL-hash save so example-switch / Verify
+      // coalesce the dispatch-armed save into a single `replaceState`.
+      flushHashSave();
       const myRun = ++runId;
       parseButton.disabled = true;
       parseButtonLabel.textContent = 'Verifying…';
       sectionCache.clear();
+      sectionFolds.clear();
       verdictCache = null;
-      diagnosticCache.length = 0;
-      diagnosticJsonCache.length = 0;
+      _textDiags.length = 0;
+      _jsonDiags.length = 0;
+      diagnostics.length = 0;
       z3ResponseBuffer = [];
       try {
         verus.parse_source(view.state.doc.toString(), expandErrorsCheckbox.checked);
       } catch (e) {
         if (myRun !== runId) return;
-        if (diagnosticCache.length === 0 && sectionCache.size === 0 && verdictCache === null) {
-          diagnosticCache.push('Parse crashed: ' + (e?.message ?? e));
+        if (_textDiags.length === 0 && sectionCache.size === 0 && verdictCache === null) {
+          _textDiags.push('Parse crashed: ' + (e?.message ?? e));
           console.error(e);
         }
       } finally {
@@ -797,6 +854,28 @@
       // after `parse_source` returns rather than via `verus_dump`.
       if (z3ResponseBuffer.length) {
         sectionCache.set('Z3', z3ResponseBuffer.join('\n'));
+      }
+      // Consolidate the raw emission channels into the unified diagnostic
+      // list. JSON wins when rustc produced any (rustc-exact spans + level
+      // tags); otherwise fall back to the human channel so Verus-side or
+      // crash messages still surface. The two channels describe the same
+      // set of diagnostics, so mixing would double-count.
+      if (_jsonDiags.length > 0) {
+        for (const j of _jsonDiags) {
+          const primary = j.spans?.find(s => s.is_primary) ?? j.spans?.[0];
+          const loc = primary ? {
+            line: primary.line_start, col: primary.column_start,
+            endLine: primary.line_end, endCol: primary.column_end,
+          } : null;
+          const sev = j.level === 'warning' ? 'warning'
+                   : (j.level === 'note' || j.level === 'help') ? 'note'
+                   : 'error';
+          diagnostics.push({ rendered: j.rendered ?? j.message ?? '', loc, severity: sev });
+        }
+      } else {
+        for (const msg of _textDiags) {
+          diagnostics.push({ rendered: msg, loc: extractLoc(msg), severity: severity(msg) });
+        }
       }
       // Preserve user's tab selection when it survives the new run;
       // otherwise default to Z3-in (the actual solver input — most useful
@@ -814,9 +893,10 @@
     };
 
     // ------------------------------------------------------------------
-    // URL hash persistence: gzip + base64url-encode the doc into
-    // `location.hash` so a link captures the current source. Debounced at
-    // 500ms so fast typing doesn't thrash `history.replaceState`.
+    // URL hash sync: gzip + base64url-encode the doc into `location.hash`
+    // on every edit (debounced 500ms) so the address bar always reflects
+    // the current source and is directly shareable. Also decodes on page
+    // load (see `initialDoc` below) to restore from a pasted link.
     // CompressionStream is Safari 16.4+ / Chrome 80+ / Firefox 113+.
     // ------------------------------------------------------------------
     const b64urlEncode = (bytes) => {
@@ -842,16 +922,82 @@
       const stream = new Blob([b64urlDecode(hash)]).stream().pipeThrough(new DecompressionStream('gzip'));
       return await new Response(stream).text();
     };
-    let saveTimer;
+    // Debounced URL writer. `scheduleHashSave` is called from the
+    // updateListener on every doc change; `flushHashSave` is called at
+    // the top of `runParse` so a Verify / example-switch coalesces the
+    // dispatch-armed save into a single `replaceState` (no double
+    // update). Copy-link also awaits `flushHashSave` before reading
+    // `location.href` so the clipboard is never stale.
+    //
+    // Generation guard: `saveHashNow` captures `++hashSaveGen` and
+    // skips its `replaceState` if a later call bumped the gen past
+    // it — prevents a slow in-flight encode from overwriting a newer
+    // one when saves overlap.
+    let hashSaveTimer = null;
+    let hashSaveGen = 0;
+    const saveHashNow = async () => {
+      const myGen = ++hashSaveGen;
+      const encoded = await encodeSrc(view.state.doc.toString());
+      if (myGen !== hashSaveGen) return;
+      history.replaceState(null, '', '#' + encoded);
+    };
     const scheduleHashSave = () => {
-      clearTimeout(saveTimer);
-      saveTimer = setTimeout(async () => {
-        try {
-          const encoded = await encodeSrc(view.state.doc.toString());
-          history.replaceState(null, '', '#' + encoded);
-        } catch (e) { console.warn('hash save failed:', e); }
+      if (hashSaveTimer) clearTimeout(hashSaveTimer);
+      hashSaveTimer = setTimeout(() => {
+        hashSaveTimer = null;
+        saveHashNow();
       }, 500);
     };
+    const flushHashSave = () => {
+      if (!hashSaveTimer) return Promise.resolve();
+      clearTimeout(hashSaveTimer);
+      hashSaveTimer = null;
+      return saveHashNow();
+    };
+
+    // Filename extension per IR tab, used by the Download button. The
+    // AIR / SMT / Z3 stages are all SMT-LIB2-shaped; AST / HIR are
+    // pseudo-Rust; VIR / SST are their own s-expression-ish form, so
+    // `.vir` keeps editors from assuming Rust syntax.
+    const EXT_FOR_TAB = {
+      AST_PRE: 'rs', AST: 'rs', HIR: 'rs', HIR_TYPED: 'rs',
+      VIR: 'vir', SST_AST: 'vir', SST_POLY: 'vir',
+      AIR_INITIAL: 'smt2', AIR_MIDDLE: 'smt2', AIR_FINAL: 'smt2',
+      SMT: 'smt2', Z3: 'smt2',
+    };
+    const downloadCurrentTab = () => {
+      if (!currentTab || !sectionCache.has(currentTab)) return;
+      const body = sectionCache.get(currentTab);
+      const ext = EXT_FOR_TAB[currentTab] ?? 'txt';
+      const blob = new Blob([body], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `verus-${currentTab}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    };
+    const copyLink = async (button) => {
+      // Always save the current doc before copying — cold load with the
+      // default example has no hash yet, so a plain `flushHashSave` would
+      // copy a bare URL that restores the default rather than whatever's
+      // on screen. Cancel any pending debounce so it doesn't re-fire
+      // redundantly after this explicit save.
+      if (hashSaveTimer) { clearTimeout(hashSaveTimer); hashSaveTimer = null; }
+      try {
+        await saveHashNow();
+        await navigator.clipboard.writeText(location.href);
+        const prev = button.textContent;
+        button.textContent = 'Copied ✓';
+        setTimeout(() => { button.textContent = prev; }, 1500);
+      } catch (e) {
+        console.warn('copy failed:', e);
+      }
+    };
+    downloadBtn.addEventListener('click', downloadCurrentTab);
+    shareBtn.addEventListener('click', () => copyLink(shareBtn));
 
     // The dropdown's selected option doubles as a "this example is loaded
     // verbatim" indicator. On hash-load the editor holds whatever the user
@@ -899,7 +1045,9 @@
       // or manual Verify click.
       runParse();
     });
-    let autoVerifyTimer;
+    // `autoVerifyTimer` is declared up beside `runParse` so the explicit
+    // verify path can preempt a pending auto-fire; this function just
+    // arms it after each doc change.
     const scheduleAutoVerify = () => {
       clearTimeout(autoVerifyTimer);
       if (!autoVerifyCheckbox.checked) return;
@@ -933,7 +1081,19 @@
         // linter extension itself is what enables the hover tooltip.
         linter(v => computeInlineDiagnostics(v.state.doc)),
         EditorView.updateListener.of(u => {
-          if (u.docChanged) { scheduleHashSave(); scheduleAutoVerify(); }
+          if (u.docChanged) {
+            scheduleAutoVerify();
+            scheduleHashSave();
+            // Clear the dropdown label on user edits — the loaded example
+            // no longer matches what's on screen, so the label would lie.
+            // `isUserEvent('input'|'delete')` skips our own programmatic
+            // dispatches (example-switch, hash-load) which set the label
+            // themselves.
+            if (u.transactions.some(tr =>
+              tr.isUserEvent('input') || tr.isUserEvent('delete'))) {
+              exampleSelect.selectedIndex = -1;
+            }
+          }
         }),
         keymap.of([
           indentWithTab,
@@ -977,12 +1137,19 @@
     });
     parseButton.addEventListener('click', runParse);
 
-    // Cold-load done — flip the Verify button live.
-    parseButtonLabel.textContent = 'Verify';
-    parseButton.disabled = false;
-
+    // Paint the tab strip + empty output view immediately so the right
+    // pane shows its full structure (all tabs disabled) during cold load
+    // instead of a blank band.
     renderTabs();
     renderSubtabs();
+
+    // Hold here until the wasm chain resolves; editor + tabs are already
+    // live above so the left pane has been interactive the whole time.
+    // Flipping the button live and firing the first verify happens as
+    // soon as `verus` is assigned inside the IIFE.
+    await wasmReady;
+    parseButtonLabel.textContent = 'Verify';
+    parseButton.disabled = false;
     runParse();
   </script>
 
