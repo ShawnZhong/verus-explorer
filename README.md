@@ -2,10 +2,14 @@
 
 Browser-based explorer for the [Verus](https://verus-lang.github.io/verus/) verifier's internal pipeline. Paste Rust, see the verdict, and inspect every IR stage — rustc AST/HIR, Verus VIR/SST, AIR, SMT, Z3 responses — live in the page. No server, no install; everything runs in-browser via a patched rustc-in-wasm and a wasm build of Z3.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <img src="docs/screenshot-light.png" alt="verus-explorer screenshot">
-</picture>
+**[▶ Try it live](https://shawnzhong.github.io/verus-explorer/)** — no setup required.
+
+<a href="https://shawnzhong.github.io/verus-explorer/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+    <img src="docs/screenshot-light.png" alt="verus-explorer screenshot — click to try live">
+  </picture>
+</a>
 
 ## Quick start
 
@@ -73,3 +77,10 @@ make clean-host   # nuke patched rustc + host verus (slow to rebuild)
 - [`docs/architecture.md`](docs/architecture.md) — per-component detail
 - [`docs/roadmap.md`](docs/roadmap.md) — what's next
 - [`AGENTS.md`](AGENTS.md) — contribution conventions
+
+## Acknowledgments
+
+- [Verus](https://github.com/verus-lang/verus) — the verifier whose pipeline this exposes; all of the VIR / SST / AIR machinery is theirs.
+- [rustc](https://github.com/rust-lang/rust) — patched and compiled to wasm to run as an in-browser Rust frontend.
+- [Z3](https://github.com/Z3Prover/z3) — compiled to wasm (via Emscripten) to serve as the in-browser SMT solver.
+- [CodeMirror 6](https://codemirror.net/) — source and output editors.
