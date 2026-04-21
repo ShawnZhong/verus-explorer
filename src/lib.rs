@@ -801,14 +801,13 @@ impl<'tcx> rustc_hir_pretty::PpAnn for HirTypedAnn<'tcx> {
 // Callers pass `keys` in the exact order the printer visits items;
 // `zip` drops the trailing `(arch_word_bits …)` footer once keys run
 // out.
-fn items_to_blocks(text: &str, keys: Vec<Option<Arc<String>>>) -> Vec<Block> {
+fn items_to_blocks(text: &str, folds: Vec<bool>) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::new();
-    for (chunk, key) in text.split("\n\n")
+    for (chunk, fold) in text.split("\n\n")
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .zip(keys)
+        .zip(folds)
     {
-        let fold = key.is_some();
         if let Some(prev) = out.last_mut() {
             if fold && prev.fold {
                 prev.content.push('\n');
@@ -819,6 +818,14 @@ fn items_to_blocks(text: &str, keys: Vec<Option<Arc<String>>>) -> Vec<Block> {
         out.push(Block { content: chunk.to_string(), fold });
     }
     out
+}
+
+// An item folds if it's external (has a crate) or synthetic
+// (Verus-generated with no source location — tuple datatypes, autogen
+// axioms, etc.). Checked at key-building time so `items_to_blocks`
+// doesn't have to scan rendered text.
+fn item_fold(span_as_string: &str, krate: &Option<Arc<String>>) -> bool {
+    krate.is_some() || span_as_string == "no location"
 }
 
 fn dt_crate(dt: &Dt) -> Option<Arc<String>> {
@@ -854,20 +861,21 @@ fn dump_vir_and_verify(
         let mut buf: Vec<u8> = Vec::new();
         vir::printer::write_krate(&mut buf, &krate, &vir::printer::COMPACT_TONODEOPTS);
         let text = String::from_utf8_lossy(&buf).into_owned();
-        // Keys in the exact order `write_krate` visits items; trailing
-        // `(arch_word_bits …)` and any `path_as_rust_names` / banner
-        // chunks with no paired key get dropped by `items_to_blocks`.
-        let mut keys = Vec::new();
-        for d in krate.datatypes.iter() { keys.push(dt_crate(&d.x.name)); }
-        for f in krate.functions.iter() { keys.push(f.x.name.path.krate.clone()); }
-        for r in krate.reveal_groups.iter() { keys.push(r.x.name.path.krate.clone()); }
-        for t in krate.traits.iter() { keys.push(t.x.name.krate.clone()); }
-        for t in krate.trait_impls.iter() { keys.push(t.x.impl_path.krate.clone()); }
-        for a in krate.assoc_type_impls.iter() { keys.push(a.x.impl_path.krate.clone()); }
-        for m in krate.modules.iter() { keys.push(m.x.path.krate.clone()); }
-        for ef in krate.external_fns.iter() { keys.push(ef.path.krate.clone()); }
-        for et in krate.external_types.iter() { keys.push(et.krate.clone()); }
-        emit_section(Section { name: "VIR", blocks: items_to_blocks(&text, keys) });
+        // Fold flags in the exact order `write_krate` visits items;
+        // trailing `(arch_word_bits …)` / banner chunks with no paired
+        // flag get dropped by `items_to_blocks`. `external_fns` /
+        // `external_types` are always external by definition.
+        let mut folds = Vec::new();
+        for d in krate.datatypes.iter() { folds.push(item_fold(&d.span.as_string, &dt_crate(&d.x.name))); }
+        for f in krate.functions.iter() { folds.push(item_fold(&f.span.as_string, &f.x.name.path.krate)); }
+        for r in krate.reveal_groups.iter() { folds.push(item_fold(&r.span.as_string, &r.x.name.path.krate)); }
+        for t in krate.traits.iter() { folds.push(item_fold(&t.span.as_string, &t.x.name.krate)); }
+        for t in krate.trait_impls.iter() { folds.push(item_fold(&t.span.as_string, &t.x.impl_path.krate)); }
+        for a in krate.assoc_type_impls.iter() { folds.push(item_fold(&a.span.as_string, &a.x.impl_path.krate)); }
+        for m in krate.modules.iter() { folds.push(item_fold(&m.span.as_string, &m.x.path.krate)); }
+        for _ in krate.external_fns.iter() { folds.push(true); }
+        for _ in krate.external_types.iter() { folds.push(true); }
+        emit_section(Section { name: "VIR", blocks: items_to_blocks(&text, folds) });
     });
     if !verify {
         return;
@@ -1225,14 +1233,14 @@ fn verify_module(
         let mut buf: Vec<u8> = Vec::new();
         vir::printer::write_krate_sst(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
         let text = String::from_utf8_lossy(&buf).into_owned();
-        let mut keys = Vec::new();
-        for d in k.datatypes.iter() { keys.push(dt_crate(&d.x.name)); }
-        for f in k.functions.iter() { keys.push(f.x.name.path.krate.clone()); }
-        for t in k.traits.iter() { keys.push(t.x.name.krate.clone()); }
-        for t in k.trait_impls.iter() { keys.push(t.x.impl_path.krate.clone()); }
-        for a in k.assoc_type_impls.iter() { keys.push(a.x.impl_path.krate.clone()); }
-        for r in k.reveal_groups.iter() { keys.push(r.x.name.path.krate.clone()); }
-        blocks.extend(items_to_blocks(&text, keys));
+        let mut folds = Vec::new();
+        for d in k.datatypes.iter() { folds.push(item_fold(&d.span.as_string, &dt_crate(&d.x.name))); }
+        for f in k.functions.iter() { folds.push(item_fold(&f.span.as_string, &f.x.name.path.krate)); }
+        for t in k.traits.iter() { folds.push(item_fold(&t.span.as_string, &t.x.name.krate)); }
+        for t in k.trait_impls.iter() { folds.push(item_fold(&t.span.as_string, &t.x.impl_path.krate)); }
+        for a in k.assoc_type_impls.iter() { folds.push(item_fold(&a.span.as_string, &a.x.impl_path.krate)); }
+        for r in k.reveal_groups.iter() { folds.push(item_fold(&r.span.as_string, &r.x.name.path.krate)); }
+        blocks.extend(items_to_blocks(&text, folds));
     };
 
     let krate_sst = time("verify.ast_to_sst", || vir::ast_to_sst_crate::ast_to_sst_krate(
