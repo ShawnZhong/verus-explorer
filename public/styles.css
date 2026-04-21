@@ -395,6 +395,12 @@ kbd {
   color: var(--fg-muted);
   white-space: pre-wrap;
 }
+.subtab-timing {
+  margin-left: auto;
+  font-size: .75em;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
 
 /* One rustc/verus diagnostic per block, color-coded by severity. The
    `clickable` modifier marks messages whose `file:L:C` we managed to
