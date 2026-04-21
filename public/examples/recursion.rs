@@ -20,7 +20,9 @@ fn main() {
     proof {
         assert(triangle(0) == 0);
         assert(triangle(1) == 1);
+        // FIXME:
         assert(triangle(3) == 6);
+        // FIXME:
         assert(triangle(5) == 15);
     }
 }

@@ -21,6 +21,7 @@ fn count_up_to(n: u32) -> (r: u32)
 }
 
 fn main() {
+    // FIXME: cannot call exec function
     assert(count_up_to(0) == 0);
     let x = count_up_to(10);
     assert(x == 10);

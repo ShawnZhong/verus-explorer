@@ -3,6 +3,7 @@ use vstd::prelude::*;
 verus! {
 
 fn octuple(x1: i8) -> (x8: i8)
+    // FIXME: add pre and post conditions
     // requires
     //     -16 <= x1 < 16,
     // ensures

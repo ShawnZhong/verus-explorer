@@ -42,7 +42,7 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -790,61 +790,155 @@ impl<'tcx> rustc_hir_pretty::PpAnn for HirTypedAnn<'tcx> {
 // 8. Stage 3: HIR → VIR
 // ═══════════════════════════════════════════════════════════════════════
 
-// Dump-only partition: `verify` always sees the full krate, but the VIR
-// section splits items into two halves — user-owned (local crate) in
-// `.0` and everything else (vstd, core, alloc, …) in `.1`. JS joins
-// them back with a `;; -- vstd --` header and folds the vstd half by
-// default so the dump reads as user-code-first with vstd as an
-// expandable appendix. The structural marker is `PathX::krate` —
-// `None` for the local crate, `Some(ident)` for every external crate.
-// That's rustc / Verus's own distinction, so it's stable against
-// remappings, repo renames, or the source path layout on any given
-// machine.
-fn partition_krate(krate: &Krate) -> (Krate, Krate) {
-    let (user_fns, vstd_fns) = krate.functions.iter().cloned()
-        .partition(|x| is_local_path(&x.x.name.path));
-    let (user_reveal, vstd_reveal) = krate.reveal_groups.iter().cloned()
-        .partition(|x| is_local_path(&x.x.name.path));
-    let (user_dts, vstd_dts) = krate.datatypes.iter().cloned()
-        .partition(|x| is_local_dt(&x.x.name));
-    let (user_traits, vstd_traits) = krate.traits.iter().cloned()
-        .partition(|x| is_local_path(&x.x.name));
-    let (user_trait_impls, vstd_trait_impls) = krate.trait_impls.iter().cloned()
-        .partition(|x| is_local_path(&x.x.impl_path));
-    let (user_assoc, vstd_assoc) = krate.assoc_type_impls.iter().cloned()
-        .partition(|x| is_local_path(&x.x.impl_path));
-    let (user_mods, vstd_mods) = krate.modules.iter().cloned()
-        .partition(|x| is_local_path(&x.x.path));
-    let user = Arc::new(KrateX {
-        functions: user_fns, reveal_groups: user_reveal, datatypes: user_dts,
-        traits: user_traits, trait_impls: user_trait_impls,
-        assoc_type_impls: user_assoc, modules: user_mods,
-        // External-item metadata only makes sense on the vstd half.
-        external_fns: vec![], external_types: vec![], path_as_rust_names: vec![],
-        arch: krate.arch.clone(),
-        opaque_types: krate.opaque_types.clone(),
-    });
-    let vstd = Arc::new(KrateX {
-        functions: vstd_fns, reveal_groups: vstd_reveal, datatypes: vstd_dts,
-        traits: vstd_traits, trait_impls: vstd_trait_impls,
-        assoc_type_impls: vstd_assoc, modules: vstd_mods,
-        external_fns: krate.external_fns.clone(),
-        external_types: krate.external_types.clone(),
-        path_as_rust_names: krate.path_as_rust_names.clone(),
-        arch: krate.arch.clone(),
-        opaque_types: vec![],
-    });
-    (user, vstd)
+// Dump-only grouping: partition items by `PathX::krate` so each crate
+// (`None` = local / user, `Some(ident)` = external — vstd, core,
+// alloc, …) lands in its own mini-krate that JS can fold independently.
+// Returned as a Vec sorted by key so iteration yields `None` first,
+// then external crates alphabetically. Verify still runs on the full
+// krate; this split is display-only, stable against repo renames
+// because `PathX::krate` is rustc / Verus's canonical crate identifier.
+fn split_krate_by_crate(krate: &Krate) -> Vec<(Option<Arc<String>>, Krate)> {
+    // Tuples are structural, not per-crate — lump under the local crate.
+    let dt_key = |dt: &Dt| match dt {
+        Dt::Path(p) => p.krate.clone(),
+        Dt::Tuple(_) => None,
+    };
+    #[derive(Default)]
+    struct Bucket {
+        functions: Vec<vir::ast::Function>,
+        reveal_groups: Vec<vir::ast::RevealGroup>,
+        datatypes: Vec<Datatype>,
+        traits: Vec<vir::ast::Trait>,
+        trait_impls: Vec<vir::ast::TraitImpl>,
+        assoc_type_impls: Vec<vir::ast::AssocTypeImpl>,
+        modules: Vec<vir::ast::Module>,
+    }
+    let mut buckets: HashMap<Option<Arc<String>>, Bucket> = HashMap::new();
+    for f in krate.functions.iter() {
+        buckets.entry(f.x.name.path.krate.clone()).or_default().functions.push(f.clone());
+    }
+    for r in krate.reveal_groups.iter() {
+        buckets.entry(r.x.name.path.krate.clone()).or_default().reveal_groups.push(r.clone());
+    }
+    for d in krate.datatypes.iter() {
+        buckets.entry(dt_key(&d.x.name)).or_default().datatypes.push(d.clone());
+    }
+    for t in krate.traits.iter() {
+        buckets.entry(t.x.name.krate.clone()).or_default().traits.push(t.clone());
+    }
+    for t in krate.trait_impls.iter() {
+        buckets.entry(t.x.impl_path.krate.clone()).or_default().trait_impls.push(t.clone());
+    }
+    for a in krate.assoc_type_impls.iter() {
+        buckets.entry(a.x.impl_path.krate.clone()).or_default().assoc_type_impls.push(a.clone());
+    }
+    for m in krate.modules.iter() {
+        buckets.entry(m.x.path.krate.clone()).or_default().modules.push(m.clone());
+    }
+    buckets.into_iter().map(|(k, b)| {
+        let local = k.is_none();
+        let kk = Arc::new(KrateX {
+            functions: b.functions,
+            reveal_groups: b.reveal_groups,
+            datatypes: b.datatypes,
+            traits: b.traits,
+            trait_impls: b.trait_impls,
+            assoc_type_impls: b.assoc_type_impls,
+            modules: b.modules,
+            // External-item metadata is local-crate-scoped (user `#[external]`
+            // annotations) — keep it only on the local mini-krate.
+            external_fns: if local { krate.external_fns.clone() } else { vec![] },
+            external_types: if local { krate.external_types.clone() } else { vec![] },
+            path_as_rust_names: if local { krate.path_as_rust_names.clone() } else { vec![] },
+            arch: krate.arch.clone(),
+            opaque_types: if local { krate.opaque_types.clone() } else { vec![] },
+        });
+        (k, kk)
+    }).collect()
 }
 
-fn is_local_path(p: &VirPath) -> bool {
-    p.krate.is_none()
+// SST counterpart of `split_krate_by_crate`. Same partitioning by
+// `PathX::krate`, but on `KrateSst` (which has a smaller field set —
+// no modules / external_* / path_as_rust_names / arch).
+fn split_krate_sst_by_crate(krate: &KrateSst) -> Vec<(Option<Arc<String>>, KrateSst)> {
+    let dt_key = |dt: &Dt| match dt {
+        Dt::Path(p) => p.krate.clone(),
+        Dt::Tuple(_) => None,
+    };
+    #[derive(Default)]
+    struct Bucket {
+        functions: Vec<vir::sst::FunctionSst>,
+        datatypes: Vec<Datatype>,
+        traits: Vec<vir::ast::Trait>,
+        trait_impls: Vec<vir::sst::TraitImplSst>,
+        assoc_type_impls: Vec<vir::ast::AssocTypeImpl>,
+        reveal_groups: Vec<vir::ast::RevealGroup>,
+    }
+    let mut buckets: HashMap<Option<Arc<String>>, Bucket> = HashMap::new();
+    for f in krate.functions.iter() {
+        buckets.entry(f.x.name.path.krate.clone()).or_default().functions.push(f.clone());
+    }
+    for d in krate.datatypes.iter() {
+        buckets.entry(dt_key(&d.x.name)).or_default().datatypes.push(d.clone());
+    }
+    for t in krate.traits.iter() {
+        buckets.entry(t.x.name.krate.clone()).or_default().traits.push(t.clone());
+    }
+    for t in krate.trait_impls.iter() {
+        buckets.entry(t.x.impl_path.krate.clone()).or_default().trait_impls.push(t.clone());
+    }
+    for a in krate.assoc_type_impls.iter() {
+        buckets.entry(a.x.impl_path.krate.clone()).or_default().assoc_type_impls.push(a.clone());
+    }
+    for r in krate.reveal_groups.iter() {
+        buckets.entry(r.x.name.path.krate.clone()).or_default().reveal_groups.push(r.clone());
+    }
+    buckets.into_iter().map(|(k, b)| {
+        let local = k.is_none();
+        let kk = Arc::new(KrateSstX {
+            functions: b.functions,
+            datatypes: b.datatypes,
+            traits: b.traits,
+            trait_impls: b.trait_impls,
+            assoc_type_impls: b.assoc_type_impls,
+            reveal_groups: b.reveal_groups,
+            opaque_types: if local { krate.opaque_types.clone() } else { vec![] },
+        });
+        (k, kk)
+    }).collect()
 }
 
-fn is_local_dt(dt: &Dt) -> bool {
-    match dt {
-        Dt::Path(p) => is_local_path(p),
-        Dt::Tuple(_) => false,
+// Turn a per-crate grouping into blocks: local items split per-item
+// (unfolded), external crates collapsed into one folded block each
+// labeled `;; <crate>`. Shared by the VIR and SST dumps.
+fn push_by_crate<K>(
+    out: &mut Vec<Block>,
+    groups: Vec<(Option<Arc<String>>, K)>,
+    pp: impl Fn(&K) -> String,
+) {
+    for (key, k) in groups {
+        let text = pp(&k);
+        let text = text.trim_end();
+        if text.is_empty() { continue; }
+        match key {
+            None => {
+                // `write_krate` / `write_krate_sst` delimit items with
+                // `\n\n`, so splitting gives per-function / datatype /
+                // trait / … blocks without hand-iterating each kind.
+                for chunk in text.split("\n\n") {
+                    let chunk = chunk.trim();
+                    if !chunk.is_empty() {
+                        out.push(Block { content: chunk.to_string(), fold: false });
+                    }
+                }
+            }
+            Some(name) => {
+                out.push(Block {
+                    content: format!(";; {}\n{}", name, text),
+                    fold: true,
+                });
+            }
+        }
     }
 }
 
@@ -870,32 +964,12 @@ fn dump_vir_and_verify(
         return;
     };
     time("dump.vir", || {
-        let (uk, vk) = partition_krate(&krate);
-        let pp = |k: &Krate| {
+        let mut blocks = Vec::new();
+        push_by_crate(&mut blocks, split_krate_by_crate(&krate), |k: &Krate| {
             let mut buf: Vec<u8> = Vec::new();
             vir::printer::write_krate(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
             String::from_utf8_lossy(&buf).into_owned()
-        };
-        let mut blocks = Vec::new();
-        // Vstd: one folded block, labeled with a natural `;; vstd`
-        // comment (matches AIR's `;; AIR prelude` convention).
-        let vstd = pp(&vk);
-        if !vstd.trim().is_empty() {
-            blocks.push(Block {
-                content: format!(";; vstd\n{}", vstd.trim_end()),
-                fold: true,
-            });
-        }
-        // User: one block per top-level item. `write_krate` ends every
-        // item with a trailing `\n\n`, so splitting on that boundary
-        // gives per-function / datatype / trait / … blocks without
-        // having to iterate each item kind by hand.
-        for chunk in pp(&uk).split("\n\n") {
-            let chunk = chunk.trim();
-            if !chunk.is_empty() {
-                blocks.push(Block { content: chunk.to_string(), fold: false });
-            }
-        }
+        });
         emit_section(Section { name: "VIR", blocks });
     });
     if !verify {
@@ -988,12 +1062,12 @@ fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
 struct VerifyOutput {
     /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
     /// (still polymorphic; function bodies as SST expressions/statements).
-    /// One pair of (vstd, user) `Block`s per module — appended via
-    /// `push_user_vstd` as each module is verified.
+    /// One block per top-level user item plus one folded block per
+    /// external crate, per module — appended via `push_by_crate`.
     sst_ast_blocks: Vec<Block>,
     /// After `poly::poly_krate_for_module` — monomorphized SST
     /// (polymorphism erased; the form the AIR lowerer consumes). Same
-    /// per-module (vstd, user) block pattern as `sst_ast_blocks`.
+    /// per-module per-crate block shape as `sst_ast_blocks`.
     sst_poly_blocks: Vec<Block>,
     /// Block stream per AIR/SMT tab in `[AIR_INITIAL, AIR_MIDDLE,
     /// AIR_FINAL, SMT]` order. `AirBufs::drain_block` pushes one
@@ -1244,14 +1318,12 @@ fn verify_module(
         .map(|f| f.x.name.clone())
         .collect();
 
-    let pp_sst = |k: &KrateSst| {
-        let mut buf: Vec<u8> = Vec::new();
-        vir::printer::write_krate_sst(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
-        String::from_utf8_lossy(&buf).into_owned()
-    };
     let dump_sst = |blocks: &mut Vec<Block>, k: &KrateSst| {
-        let (user, vstd) = partition_krate_sst(k);
-        push_user_vstd(blocks, pp_sst(&user), pp_sst(&vstd));
+        push_by_crate(blocks, split_krate_sst_by_crate(k), |k: &KrateSst| {
+            let mut buf: Vec<u8> = Vec::new();
+            vir::printer::write_krate_sst(&mut buf, k, &vir::printer::COMPACT_TONODEOPTS);
+            String::from_utf8_lossy(&buf).into_owned()
+        });
     };
 
     let krate_sst = time("verify.ast_to_sst", || vir::ast_to_sst_crate::ast_to_sst_krate(
@@ -1586,54 +1658,6 @@ fn run_queries(
     }
     Ok(())
 }
-
-fn partition_krate_sst(krate: &KrateSst) -> (KrateSst, KrateSst) {
-    let (user_fns, vstd_fns) = krate.functions.iter().cloned()
-        .partition(|x| is_local_path(&x.x.name.path));
-    let (user_dts, vstd_dts) = krate.datatypes.iter().cloned()
-        .partition(|x| is_local_dt(&x.x.name));
-    let (user_traits, vstd_traits) = krate.traits.iter().cloned()
-        .partition(|x| is_local_path(&x.x.name));
-    let (user_trait_impls, vstd_trait_impls) = krate.trait_impls.iter().cloned()
-        .partition(|x| is_local_path(&x.x.impl_path));
-    let (user_assoc, vstd_assoc) = krate.assoc_type_impls.iter().cloned()
-        .partition(|x| is_local_path(&x.x.impl_path));
-    let (user_reveal, vstd_reveal) = krate.reveal_groups.iter().cloned()
-        .partition(|x| is_local_path(&x.x.name.path));
-    let user = Arc::new(KrateSstX {
-        functions: user_fns, datatypes: user_dts, traits: user_traits,
-        trait_impls: user_trait_impls, assoc_type_impls: user_assoc,
-        reveal_groups: user_reveal,
-        opaque_types: krate.opaque_types.clone(),
-    });
-    let vstd = Arc::new(KrateSstX {
-        functions: vstd_fns, datatypes: vstd_dts, traits: vstd_traits,
-        trait_impls: vstd_trait_impls, assoc_type_impls: vstd_assoc,
-        reveal_groups: vstd_reveal,
-        opaque_types: vec![],
-    });
-    (user, vstd)
-}
-
-// Push vstd-first (auto-folded) + user (expanded) blocks onto `out`.
-// The vstd content is prefixed with a `;; vstd` comment so the folded
-// view shows that line as its label — same convention AIR uses for
-// `;; AIR prelude`. User items follow without any separator marker:
-// they're the body the reader came for, not a labeled section. Either
-// half may be empty (skipped then). Used for VIR in one shot and for
-// SST per module.
-fn push_user_vstd(out: &mut Vec<Block>, user: String, vstd: String) {
-    if !vstd.trim().is_empty() {
-        out.push(Block {
-            content: format!(";; vstd\n{}", vstd.trim_end()),
-            fold: true,
-        });
-    }
-    if !user.trim().is_empty() {
-        out.push(Block { content: user, fold: false });
-    }
-}
-
 
 fn write_verify_output(output: VerifyOutput) {
     let VerifyOutput {
