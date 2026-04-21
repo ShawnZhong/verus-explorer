@@ -21,18 +21,13 @@ Open the page, edit code on the left, and watch each stage update on the right. 
 
 ## What you see
 
-| Tab        | What it is                                                |
-|------------|-----------------------------------------------------------|
-| Source     | Your editor (CodeMirror 6, Rust syntax, inline squiggles) |
-| AST_PRE    | rustc AST before expansion                                |
-| AST / HIR  | rustc AST after expansion, then HIR                       |
-| VIR        | Verus VIR (the verifier's high-level IR)                  |
-| SST_AST    | SST after AST→SST lowering                                |
-| SST_POLY   | SST after polymorphism desugaring                         |
-| AIR        | AIR trees (initial → middle → final, one per lowering)    |
-| SMT        | SMT-LIB2 commands sent to Z3                              |
-| Z3         | Z3's replies (`sat`/`unsat`/`unknown` + models + errors)  |
-| Verdict    | Per-query pass/fail summary under the editor              |
+| Tab           | What it is                                                                              |
+|---------------|-----------------------------------------------------------------------------------------|
+| Rust IR       | rustc output — `AST` / `Expanded AST` (after `verus!`) / `HIR` / `Typed HIR` (post-typeck) |
+| Verus IR      | Verus VIR / SST — `AST`, `SST`, `Mono` (SST after polymorphism simplification)          |
+| Assert IR     | Verus AIR — `Blocks` → `SSA` → `Flat` lowerings                                         |
+| Z3 Solver     | `Query` (SMT-LIB2 sent to Z3) and `Response` (sat / unsat / model)                      |
+| Verdict       | Per-query pass/fail summary under the editor                                            |
 
 Every item in VIR / SST / AIR / SMT carries a `;; <input.rs>:L:C` comment; click the span to jump the source editor to that position.
 

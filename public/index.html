@@ -68,9 +68,9 @@
   <script src="./z3/z3.js"></script>
 
   <script type="module">
-    // CodeMirror 6 bundle, built by `make dev` (see the `$(DIST)/editor.js`
-    // Makefile target). All CM6 imports flow through this one file; the
-    // export list lives in `editor/editor-src.js`.
+    // CodeMirror 6 bundle, built by `make dev` from `scripts/editor/editor-src.js`
+    // (the single source of truth for CM6 exports; add a line there to expose
+    // a new feature, then import it here).
     import {
       EditorView, basicSetup, keymap, indentWithTab, rust, oneDark,
       Decoration, StateField, StateEffect, EditorState,
@@ -285,31 +285,19 @@
       exampleSelect.appendChild(og);
     }
     const fetchExample = (file) => fetch(`./examples/${file}`).then(r => r.text());
-    // Output panel has two levels of navigation: a top tab strip picks the
-    // pipeline stage (Verus / HIR / VIR / AIR / Z3), and a subtab row under
-    // the CM6 view picks the variant within that stage (raw / SSA / flat
-    // for AIR, in / out for Z3, …). Collapsing sub-variants into a second
-    // row keeps the top strip fitting on one line and groups related IRs
-    // head-to-head. Groups with a single variant render no subtab row.
-    //
-    // Stage blurbs: `Verus` is the source-level AST (post-macro-expansion).
-    // `HIR` is rustc's high-level IR. The `VIR-*` family all lives in the
-    // `vir` crate: `VIR` is the AST form, `VIR-sst` is after
-    // `ast_to_sst_krate` (statement / expression trees closer to SMT),
-    // `VIR-poly` is after the `poly` pass (generics monomorphized / type-
-    // erased — what AIR consumes). AIR has three: initial block tree,
-    // SSA-versioned, flattened to one assertion. `Z3-in` is what we send
-    // to the solver; `Z3-out` is its reply — both SMT-LIB2.
+    // Two-level nav for the output pane: top tabs pick the pipeline stage,
+    // subtabs pick the variant within that stage. Single-variant groups
+    // render no subtab row. `id` is the stable internal key (URL hash,
+    // bench bucket, state maps); `label` is the user-facing tab text —
+    // spelled out so newcomers don't need to know what HIR/VIR/AIR stand for.
     const TAB_GROUPS = [
-      { id: 'Source', variants: ['AST_PRE', 'AST'] },
-      { id: 'HIR',   variants: ['HIR', 'HIR_TYPED'] },
-      { id: 'VIR',   variants: ['VIR', 'SST_AST', 'SST_POLY'] },
-      { id: 'AIR',   variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
-      { id: 'Z3',    variants: ['SMT', 'Z3'] },
+      { id: 'Rust',  label: 'Rust IR',     variants: ['AST_PRE', 'AST', 'HIR', 'HIR_TYPED'] },
+      { id: 'VIR',   label: 'Verus IR',    variants: ['VIR', 'SST_AST', 'SST_POLY'] },
+      { id: 'AIR',   label: 'Assert IR',   variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
+      { id: 'Z3',    label: 'Z3 Solver',   variants: ['SMT', 'Z3'] },
     ];
     const VARIANT_LABEL = {
-      AST_PRE: 'Rust', AST: 'Expanded',
-      HIR: 'Untyped', HIR_TYPED: 'Typed',
+      AST_PRE: 'AST', AST: 'Expanded AST', HIR: 'HIR', HIR_TYPED: 'Typed HIR',
       VIR: 'AST', SST_AST: 'SST', SST_POLY: 'Mono',
       AIR_INITIAL: 'Blocks', AIR_MIDDLE: 'SSA', AIR_FINAL: 'Flat',
       SMT: 'Query', Z3: 'Response',
@@ -363,9 +351,9 @@
     // `verify` / `verify.module` are wrapper labels (skipped here to
     // avoid double-counting their downstream `verify.*` children).
     const BENCH_GROUP = {
-      rustc_parse: 'Parse',
-      'dump.ast_pre': 'Parse', 'dump.ast': 'Parse',
-      'dump.hir': 'HIR', 'dump.hir_typed': 'HIR',
+      rustc_parse: 'Rust',
+      'dump.ast_pre': 'Rust', 'dump.ast': 'Rust',
+      'dump.hir': 'Rust', 'dump.hir_typed': 'Rust',
       build_vir: 'VIR', 'build_vir.vstd_deserialize': 'VIR',
       'build_vir.build_vir_crate': 'VIR', 'dump.vir': 'VIR',
       'verify.ast_to_sst': 'VIR', 'dump.sst_ast': 'VIR',
@@ -378,7 +366,7 @@
     // Which pipeline-timing bucket each top-level tab group maps to, so
     // the subtab row can surface the bucket matching the current view.
     const TAB_GROUP_BENCH = {
-      Source: 'Parse', HIR: 'HIR', VIR: 'VIR', AIR: 'AIR', Z3: 'Z3',
+      Rust: 'Rust', VIR: 'VIR', AIR: 'AIR', Z3: 'Z3',
     };
     // Which IR the output view currently shows; preserved across runParse
     // calls so the user doesn't lose their tab selection on every edit.
@@ -531,7 +519,7 @@
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'tab' + (g.id === currentGroup ? ' active' : '');
-        button.textContent = g.id;
+        button.textContent = g.label;
         button.disabled = !g.variants.some(cached);
         button.addEventListener('click', () => {
           const chosen = (lastVariantInGroup.has(g.id) && cached(lastVariantInGroup.get(g.id)))
@@ -1389,10 +1377,6 @@
     renderTabs();
     renderSubtabs();
 
-    // Populate the URL hash on cold load so the address bar is already a
-    // valid share link before any edit. Skipped when we arrived via hash
-    // (the hash is already correct) so we don't re-encode redundantly.
-    if (!loadedFromHash) saveHashNow();
 
     // Hold here until the wasm chain resolves; editor + tabs are already
     // live above so the left pane has been interactive the whole time.
