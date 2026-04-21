@@ -50,11 +50,10 @@ extern "C" {
       globalThis._sections = new Map();\n\
       globalThis.verus_diagnostic = () => {};\n\
       globalThis.verus_diagnostic_json = () => {};\n\
-      globalThis.verus_dump = (section, headers, contents, _folds) => {\n\
+      globalThis.verus_dump = (section, contents, _folds) => {\n\
         let body = '';\n\
-        for (let i = 0; i < headers.length; i++) {\n\
+        for (let i = 0; i < contents.length; i++) {\n\
           if (i > 0 && !body.endsWith('\\n')) body += '\\n';\n\
-          if (headers[i]) body += `;; -- ${headers[i]} --\\n`;\n\
           body += contents[i];\n\
         }\n\
         globalThis._sections.set(section, body);\n\

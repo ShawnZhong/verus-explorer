@@ -112,16 +112,17 @@ extern "C" {
     // (rustc's `abort_if_errors` → `unreachable`) would otherwise discard
     // the whole returned String, hiding every section we'd already built.
     //
-    // Content is passed as a parallel-array triple describing ordered
-    // blocks: `headers[i]` is an optional label (empty string = no
-    // header), `contents[i]` is the block's text, `folds[i]` is 1 if the
-    // block should be auto-folded on render. Rust stays out of rendering
-    // decisions (how headers display, whether folds use a placeholder,
-    // etc.) — JS concatenates the blocks and applies the declared folds.
-    // Used today to mark the vstd half of VIR / SST_AST / SST_POLY as a
-    // foldable appendix below the user-owned items.
+    // Content is passed as two parallel arrays describing ordered blocks
+    // that JS concatenates into one body: `contents[i]` is the block
+    // text, `folds[i]` is 1 when the block should auto-fold on render.
+    // No JS-inserted chrome — the natural `;;` comments that AIR / Verus
+    // already emit (`;; AIR prelude`, `;; Function-Def foo`, the
+    // explorer-inserted `;; vstd` separator on VIR / SST) serve as the
+    // visible first line of each block, and the fold range is
+    // [end-of-first-line, end-of-block]. Rust owns all section boundary
+    // decisions; JS only concatenates and folds.
     #[wasm_bindgen(js_name = verus_dump)]
-    fn verus_dump(section: &str, headers: Vec<String>, contents: Vec<String>, folds: Vec<u8>);
+    fn verus_dump(section: &str, contents: Vec<String>, folds: Vec<u8>);
 
     // Stage-level timing. `time()` emits one call per stage with the elapsed
     // ms. `public/index.html` and `tests/smoke.rs` both install a stub on
@@ -296,32 +297,30 @@ fn time<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
     result
 }
 
-// A labeled chunk of content within a `Section`. The optional `header`
-// is a human-readable label JS renders as a `;; -- <header> --` line
-// above the content; `fold: true` asks JS to auto-collapse the block on
-// render. No string marker is baked into `content` — keeping the
-// rendering decision (header style, fold placeholder) on the JS side.
-struct Block<'a> {
-    header: Option<&'a str>,
-    content: &'a str,
+// A chunk of content within a `Section`. The content's own first line
+// is what stays visible when folded — so callers that want a visible
+// label (AIR's `;; AIR prelude`, Verus's `;; Function-Def foo`, or the
+// explorer-inserted `;; vstd` on VIR / SST) put it at the top of the
+// content. `fold: true` asks JS to auto-collapse the block from that
+// first line's end to end-of-content.
+struct Block {
+    content: String,
     fold: bool,
 }
 
 // An ordered list of `Block`s that together form one logical output tab.
-// Most sections are a single `Block` with no header; VIR / SST_AST /
-// SST_POLY use two (user + vstd) so the vstd half can be folded away.
-struct Section<'a> {
-    name: &'a str,
-    blocks: Vec<Block<'a>>,
+// Most sections are a single `Block` with no fold; VIR / SST_AST /
+// SST_POLY use two (vstd-with-`;; vstd` header + user) and AIR / SMT
+// use many (prelude + one per op).
+struct Section {
+    name: &'static str,
+    blocks: Vec<Block>,
 }
 
-impl<'a> Section<'a> {
-    // Shorthand for the common single-block, no-header, no-fold case.
-    fn single(name: &'a str, content: &'a str) -> Self {
-        Section {
-            name,
-            blocks: vec![Block { header: None, content, fold: false }],
-        }
+impl Section {
+    // Shorthand for the common single-block, no-fold case.
+    fn single(name: &'static str, content: String) -> Self {
+        Section { name, blocks: vec![Block { content, fold: false }] }
     }
 }
 
@@ -332,16 +331,16 @@ impl<'a> Section<'a> {
 // and `tests/smoke.rs`) observe pipeline output exclusively through the
 // JS callbacks — no String accumulator is threaded through.
 fn emit_section(section: Section) {
-    let headers: Vec<String> = section.blocks.iter()
-        .map(|b| b.header.unwrap_or("").to_string())
-        .collect();
-    let contents: Vec<String> = section.blocks.iter()
-        .map(|b| b.content.trim_end().to_string())
-        .collect();
-    let folds: Vec<u8> = section.blocks.iter()
-        .map(|b| b.fold as u8)
-        .collect();
-    verus_dump(section.name, headers, contents, folds);
+    let n = section.blocks.len();
+    let mut contents = Vec::with_capacity(n);
+    let mut folds = Vec::with_capacity(n);
+    for b in section.blocks {
+        let mut c = b.content;
+        c.truncate(c.trim_end().len());
+        contents.push(c);
+        folds.push(b.fold as u8);
+    }
+    verus_dump(section.name, contents, folds);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -399,7 +398,7 @@ fn run_pipeline(compiler: &Compiler, verify: bool, expand_errors: bool) {
 fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
     time("dump.ast_pre", || {
         let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
-        emit_section(Section::single("AST_PRE", &body));
+        emit_section(Section::single("AST_PRE", body));
     });
 }
 
@@ -688,7 +687,7 @@ fn dump_ast(tcx: TyCtxt<'_>) {
         let borrow = tcx.resolver_for_lowering().borrow();
         let (_, krate) = &*borrow;
         let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
-        emit_section(Section::single("AST", &body));
+        emit_section(Section::single("AST", body));
     });
 }
 
@@ -716,7 +715,7 @@ fn dump_hir(tcx: TyCtxt<'_>) {
             body.push_str(&rustc_hir_pretty::item_to_string(&tcx, item));
             body.push('\n');
         }
-        emit_section(Section::single("HIR", &body));
+        emit_section(Section::single("HIR", body));
     });
 
     // Typed variant: mirror rustc's `-Zunpretty=hir-typed`
@@ -734,7 +733,7 @@ fn dump_hir(tcx: TyCtxt<'_>) {
                 body.push('\n');
             }
         });
-        emit_section(Section::single("HIR_TYPED", &body));
+        emit_section(Section::single("HIR_TYPED", body));
     });
 }
 
@@ -882,16 +881,10 @@ fn dump_vir_and_verify(
         return;
     };
     time("dump.vir", || {
-        let (user_krate, vstd_krate) = partition_krate(&krate);
-        let user = pretty_print_krate(&user_krate);
-        let vstd = pretty_print_krate(&vstd_krate);
-        emit_section(Section {
-            name: "VIR",
-            blocks: vec![
-                Block { header: None, content: &user, fold: false },
-                Block { header: Some("vstd"), content: &vstd, fold: true },
-            ],
-        });
+        let (uk, vk) = partition_krate(&krate);
+        let mut blocks = Vec::with_capacity(2);
+        push_user_vstd(&mut blocks, pretty_print_krate(&uk), pretty_print_krate(&vk));
+        emit_section(Section { name: "VIR", blocks });
     });
     if !verify {
         return;
@@ -910,7 +903,7 @@ fn dump_vir_and_verify(
     let _ = time("verify", || {
         verify_simplified_krate(krate, global_ctx, crate_name, compiler, &spans, expand_errors, &mut output)
     });
-    write_verify_output(&output);
+    write_verify_output(output);
 }
 
 // Drives Verus's HIR→VIR pipeline. `Verifier::build_vir_crate` (vendored
@@ -983,25 +976,24 @@ fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
 struct VerifyOutput {
     /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
     /// (still polymorphic; function bodies as SST expressions/statements).
-    /// Split per-module into user-owned vs vstd items; emitted as two
-    /// blocks under one `SST_AST` section so the vstd half renders as a
-    /// foldable appendix.
-    sst_ast_user: String,
-    sst_ast_vstd: String,
+    /// One pair of (vstd, user) `Block`s per module — appended via
+    /// `append_sst_dump` / `push_user_vstd` as each module is verified.
+    sst_ast_blocks: Vec<Block>,
     /// After `poly::poly_krate_for_module` — monomorphized SST
     /// (polymorphism erased; the form the AIR lowerer consumes). Same
-    /// user/vstd split as `sst_ast_*`.
-    sst_poly_user: String,
-    sst_poly_vstd: String,
-    /// Raw AIR (Block/Switch/Assert tree, AIR syntax).
-    air_initial: String,
-    /// After `var_to_const::lower_query` (SSA-style versioning of mutable vars).
-    air_middle: String,
-    /// After `block_to_assert::lower_query` (whole stmt tree → one big assert).
-    air_final: String,
-    /// SMT-LIB2 captured from `Context::set_smt_log` — full text sent to Z3
-    /// (macros expanded, plus push/pop, `(assert (not …))`, `(check-sat)`).
-    smt: String,
+    /// per-module (vstd, user) block pattern as `sst_ast_blocks`.
+    sst_poly_blocks: Vec<Block>,
+    /// Block stream per AIR/SMT tab in `[AIR_INITIAL, AIR_MIDDLE,
+    /// AIR_FINAL, SMT]` order. `AirBufs::drain_block` pushes one
+    /// block into each at every pipeline boundary (per-module prelude
+    /// and per-`OpGenerator` op), with the fold flag baked in at push
+    /// time: AIR tabs always fold (ToC-style navigation), SMT folds
+    /// only non-query chrome so the reader can scroll through actual
+    /// solver queries linearly. The block's first line is a natural
+    /// `;;` comment — AIR's `;; AIR prelude` or the
+    /// `op.to_air_comment()` we feed before each op — which serves as
+    /// the visible fold label.
+    air_blocks: [Vec<Block>; 4],
     verdicts: Vec<Verdict>,
 }
 
@@ -1093,11 +1085,30 @@ impl AirBufs {
         bufs
     }
 
-    fn drain_into(&self, out: &mut VerifyOutput) {
-        out.air_initial.push_str(&self.air_initial.drain_string());
-        out.air_middle.push_str(&self.air_middle.drain_string());
-        out.air_final.push_str(&self.air_final.drain_string());
-        out.smt.push_str(&self.smt.drain_string());
+    // Drain the four log buffers as one atomic snapshot and push one
+    // block into each of `blocks` (indexed [initial, middle, final,
+    // smt]). Called at every pipeline boundary — per-module prelude,
+    // per-op, plus a trailing drain for error paths — so the first
+    // line of each block is the natural `;;` comment Verus / AIR
+    // emitted right before. AIR tabs always fold (every block is a
+    // ToC entry); SMT folds only non-queries so the reader can scroll
+    // through actual solver queries without a click per query. Skips
+    // the push when the snapshot is empty — typical for the trailing
+    // drain after a successful run.
+    fn drain_block(&self, blocks: &mut [Vec<Block>; 4], is_query: bool) {
+        let texts: [String; 4] = [
+            self.air_initial.drain_string(),
+            self.air_middle.drain_string(),
+            self.air_final.drain_string(),
+            self.smt.drain_string(),
+        ];
+        if texts.iter().all(|t| t.trim().is_empty()) {
+            return;
+        }
+        let folds = [true, true, true, !is_query];
+        for (i, content) in texts.into_iter().enumerate() {
+            blocks[i].push(Block { content, fold: folds[i] });
+        }
     }
 }
 
@@ -1230,11 +1241,9 @@ fn verify_module(
         &bucket_funs,
         &pruned,
     ))?;
-    time("dump.sst_ast", || append_sst_dump(
-        &mut output.sst_ast_user, &mut output.sst_ast_vstd, &krate_sst));
+    time("dump.sst_ast", || append_sst_dump(&mut output.sst_ast_blocks, &krate_sst));
     let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
-    time("dump.sst_poly", || append_sst_dump(
-        &mut output.sst_poly_user, &mut output.sst_poly_vstd, &krate_sst));
+    time("dump.sst_poly", || append_sst_dump(&mut output.sst_poly_blocks, &krate_sst));
 
     let visible_dts: Vec<Datatype> = krate_sst
         .datatypes
@@ -1263,19 +1272,26 @@ fn verify_module(
 
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
     // Drain AIR/SMT buffers regardless of pass/fail: if `run_queries` errors
-    // partway through, every command fed before that point is still valuable
-    // dump material for the UI. Pipe the Err back out via `result?` after
-    // draining so the caller still sees the failure.
+    // partway through, every block drained before that point still ships
+    // to the UI. Final trailing drain after the `try` block covers anything
+    // emitted between the last per-op drain and the error / completion.
     let result: Result<(), VirErr> = (|| {
         time("verify.feed_decls", || {
             feed_module_decls(&mut feeder, &mut ctx, &krate_sst, &visible_dts, mctx)
         })?;
+        // Prelude drain: captures `;; AIR prelude` (emitted lazily by
+        // `Context::ensure_started` on first command — air/context.rs:412)
+        // plus every decl `feed_module_decls` pushed into the log writers.
+        bufs.drain_block(&mut output.air_blocks, /* is_query */ false);
         time("verify.queries", || {
-            run_queries(&mut feeder, &mut ctx, &krate_sst, bucket_funs, &mut output.verdicts, mctx.expand_errors)
+            run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, mctx.expand_errors)
         })?;
         Ok(())
     })();
-    bufs.drain_into(output);
+    // Trailing drain — usually empty, but defensive in case a later
+    // teardown step (or an early-exit path we didn't anticipate) leaves
+    // content in the buffers.
+    bufs.drain_block(&mut output.air_blocks, /* is_query */ false);
     result?;
     // `ctx.free()` drops the AirBufs-attached Z3 context → `Z3_del_context`.
     // Any deferred solver teardown shows up here.
@@ -1322,10 +1338,11 @@ fn feed_module_decls(
 // the pieces the explorer needs (no spinoff, profiler, or progress bars).
 fn run_queries(
     feeder: &mut Feeder,
+    bufs: &AirBufs,
     ctx: &mut Ctx,
     krate_sst: &KrateSst,
     bucket_funs: HashSet<Fun>,
-    verdicts: &mut Vec<Verdict>,
+    output: &mut VerifyOutput,
     expand_errors: bool,
 ) -> Result<(), VirErr> {
     let bucket = Bucket { funs: bucket_funs };
@@ -1350,6 +1367,16 @@ fn run_queries(
                 feeder.reporter.report(&diag);
             }
             let Some(op) = next_op else { break };
+
+            // Emit the op's label comment via `air_ctx.comment(...)` so
+            // every log gets a `;; <OpKind> <func-path>` line right
+            // before the op's commands. That line becomes the natural
+            // first-line label of the drain block below — no
+            // text-parsing needed downstream.
+            feeder.air_ctx.blank_line();
+            feeder.air_ctx.comment(&op.to_air_comment());
+
+            let is_query = matches!(op.kind, OpKind::Query { .. });
 
             // The explorer always compiles an anonymous crate, so every user
             // function's friendly name starts with `crate::`. Strip it so the
@@ -1465,7 +1492,7 @@ fn run_queries(
                                     let push = verdict_is_query
                                         && (is_first_check || !proved);
                                     if push {
-                                        verdicts.push(Verdict::from_result(
+                                        output.verdicts.push(Verdict::from_result(
                                             &result,
                                             func_name.clone(),
                                             *query_op,
@@ -1544,21 +1571,22 @@ fn run_queries(
                 };
                 function_opgen.report_expand_error_result(res);
             }
+            // Drain this op's text into its own block — first line is
+            // the `;; <OpKind> <func-path>` we emitted above, which
+            // serves as the visible fold label on the tab.
+            bufs.drain_block(&mut output.air_blocks, is_query);
         }
     }
     Ok(())
 }
 
 // `krate_sst` is per-module (SST lowering happens inside `verify_module`).
-// Each call appends a module's SST dump to both buffers — user-owned
-// items to `user_buf`, vstd items to `vstd_buf` — so the final section
-// contains every module's SSTs in order, split into two blocks the UI
-// can fold independently. Verify still runs on the full krate; these
-// partitions are display-only.
-fn append_sst_dump(user_buf: &mut String, vstd_buf: &mut String, krate_sst: &KrateSst) {
+// Each call appends one pair of (vstd, user) `Block`s for the module
+// onto `out`. Verify still runs on the full krate; these partitions
+// are display-only.
+fn append_sst_dump(out: &mut Vec<Block>, krate_sst: &KrateSst) {
     let (user, vstd) = partition_krate_sst(krate_sst);
-    user_buf.push_str(&pretty_print_krate_sst(&user));
-    vstd_buf.push_str(&pretty_print_krate_sst(&vstd));
+    push_user_vstd(out, pretty_print_krate_sst(&user), pretty_print_krate_sst(&vstd));
 }
 
 fn partition_krate_sst(krate: &KrateSst) -> (KrateSst, KrateSst) {
@@ -1589,98 +1617,55 @@ fn partition_krate_sst(krate: &KrateSst) -> (KrateSst, KrateSst) {
     (user, vstd)
 }
 
-// Each AIR/SMT dump begins with the global axiom/datatype preamble and then
-// transitions to query blocks at the first `(push)` (logged by `check_valid`
-// before each query — see air/context.rs:429). Inject `-- setup --` before
-// the preamble and `-- query N: <label> --` before each `(push)`, where
-// `<label>` is the first `;; ...` comment Verus wrote just before the push
-// (typically `Function-Def foo` / `Function-Termination bar`). The browser
-// uses the setup marker as a fold trigger (auto-collapsed on render) and
-// folds each `(push) ... (pop)` pair into a one-line summary.
-fn split_setup_queries(body: &str) -> String {
-    let needle = "\n(push";
-    let Some(first) = body.find(needle) else { return body.to_string(); };
-    let mut out = String::with_capacity(body.len() + 256);
-    out.push_str(";; -- setup --\n");
-    out.push_str(body[..first].trim_end());
-    let mut cursor = first;
-    let mut n = 0;
-    while let Some(rel) = body[cursor..].find(needle) {
-        let push_nl = cursor + rel;           // position of the '\n' before '(push'
-        let push_start = push_nl + 1;          // position of '(push'
-        n += 1;
-        out.push_str(&body[cursor..push_nl]);
-        let banner = match label_before(&body[..push_nl]) {
-            Some(label) => format!("\n;; -- query {}: {} --", n, label),
-            None => format!("\n;; -- query {} --", n),
-        };
-        out.push_str(&banner);
-        out.push_str(&body[push_nl..push_start]);
-        cursor = push_start;
+// Push vstd-first (auto-folded) + user (expanded) blocks onto `out`.
+// The vstd content is prefixed with a `;; vstd` comment so the folded
+// view shows that line as its label — same convention AIR uses for
+// `;; AIR prelude`. User items follow without any separator marker:
+// they're the body the reader came for, not a labeled section. Either
+// half may be empty (skipped then). Used for VIR in one shot and for
+// SST per module.
+fn push_user_vstd(out: &mut Vec<Block>, user: String, vstd: String) {
+    if !vstd.trim().is_empty() {
+        out.push(Block {
+            content: format!(";; vstd\n{}", vstd.trim_end()),
+            fold: true,
+        });
     }
-    out.push_str(&body[cursor..]);
-    out
+    if !user.trim().is_empty() {
+        out.push(Block { content: user, fold: false });
+    }
 }
 
-// Walk back from the end of `preceding` through blank lines and `;;`
-// comments; return the *topmost* comment of that contiguous block as the
-// query label (the `Function-Def ...` / `Function-Termination ...` line
-// Verus emits before calling `push`). `None` if no comment was found, so
-// the caller can emit a bare `;; -- query N --` instead of appending an
-// empty or placeholder label.
-fn label_before(preceding: &str) -> Option<String> {
-    let mut comments: Vec<&str> = Vec::new();
-    for line in preceding.lines().rev() {
-        let t = line.trim();
-        if t.is_empty() {
-            if comments.is_empty() { continue; }
-            break;
-        }
-        if let Some(rest) = t.strip_prefix(";;") {
-            comments.push(rest.trim());
-        } else {
-            break;
-        }
-    }
-    comments.last().copied().filter(|s| !s.is_empty()).map(str::to_string)
-}
 
-fn write_verify_output(output: &VerifyOutput) {
-    for (name, user, vstd) in [
-        ("SST_AST", &output.sst_ast_user, &output.sst_ast_vstd),
-        ("SST_POLY", &output.sst_poly_user, &output.sst_poly_vstd),
+fn write_verify_output(output: VerifyOutput) {
+    let VerifyOutput {
+        sst_ast_blocks, sst_poly_blocks, air_blocks, verdicts,
+    } = output;
+    let [air_initial, air_middle, air_final, smt] = air_blocks;
+    for (name, blocks) in [
+        ("SST_AST", sst_ast_blocks),
+        ("SST_POLY", sst_poly_blocks),
+        ("AIR_INITIAL", air_initial),
+        ("AIR_MIDDLE", air_middle),
+        ("AIR_FINAL", air_final),
+        ("SMT", smt),
     ] {
-        if user.is_empty() && vstd.is_empty() {
+        if blocks.iter().all(|b| b.content.trim().is_empty()) {
             continue;
-        }
-        let mut blocks = vec![Block { header: None, content: user, fold: false }];
-        if !vstd.trim().is_empty() {
-            blocks.push(Block { header: Some("vstd"), content: vstd, fold: true });
         }
         emit_section(Section { name, blocks });
     }
-    for (name, body) in [
-        ("AIR_INITIAL", &output.air_initial),
-        ("AIR_MIDDLE", &output.air_middle),
-        ("AIR_FINAL", &output.air_final),
-        ("SMT", &output.smt),
-    ] {
-        if body.is_empty() {
-            continue;
-        }
-        emit_section(Section::single(name, &split_setup_queries(body)));
-    }
     let mut verdict = String::new();
-    if output.verdicts.is_empty() {
+    if verdicts.is_empty() {
         writeln!(verdict, "no queries").unwrap();
-    } else if output.verdicts.iter().all(|v| v.proved) {
+    } else if verdicts.iter().all(|v| v.proved) {
         writeln!(verdict, "verified").unwrap();
     } else {
-        let n_failed = output.verdicts.iter().filter(|v| !v.proved).count();
-        writeln!(verdict, "{}/{} queries failed", n_failed, output.verdicts.len()).unwrap();
+        let n_failed = verdicts.iter().filter(|v| !v.proved).count();
+        writeln!(verdict, "{}/{} queries failed", n_failed, verdicts.len()).unwrap();
     }
-    for v in &output.verdicts {
+    for v in &verdicts {
         writeln!(verdict, "{}: {} → {}", v.function, v.kind, v.outcome).unwrap();
     }
-    emit_section(Section::single("VERDICT", &verdict));
+    emit_section(Section::single("VERDICT", verdict));
 }

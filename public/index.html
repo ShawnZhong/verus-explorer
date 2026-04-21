@@ -186,6 +186,16 @@
       ]},
     ];
     const EXAMPLES = EXAMPLE_GROUPS.flatMap(g => g.items);
+    // Placeholder option shown when the editor holds a user-edited or
+    // hash-loaded doc that doesn't match any pristine example. `hidden`
+    // keeps it out of the opened dropdown list; `disabled` blocks click
+    // selection. Selected programmatically via `exampleSelect.value = ''`.
+    const customOption = document.createElement('option');
+    customOption.value = '';
+    customOption.textContent = '— pick an example —';
+    customOption.disabled = true;
+    customOption.hidden = true;
+    exampleSelect.appendChild(customOption);
     for (const { group, items } of EXAMPLE_GROUPS) {
       const og = document.createElement('optgroup');
       og.label = group;
@@ -611,40 +621,15 @@
     const outputLanguage = new Compartment();
 
     // Fold service — basicSetup's foldGutter asks this per line; non-
-    // foldable lines return null. Three shapes are foldable:
-    //   1. Rust-declared block folds from `sectionFolds` (e.g. the vstd
-    //      appendix on VIR / SST). Offered here so the user can manually
-    //      refold after expanding — the initial auto-fold still lives in
-    //      `renderOutputView`, which runs once per tab switch.
-    //   2. `(push)` / `(pop)` pairs — Verus wraps each check_valid in
-    //      them (air/context.rs:429), so each query collapses to one line.
-    //   3. `;; -- setup --` header — folds the preamble up to the line
-    //      right before the first `(push)` so the (usually large) axiom
-    //      / datatype setup can be hidden in one click. The setup marker
-    //      comes from `split_setup_queries` in `src/lib.rs`.
+    // foldable lines return null. All foldable ranges are Rust-declared
+    // (VIR user/vstd split, AIR/SMT prelude + per-query blocks) and
+    // stored in `sectionFolds`: JS never scans the body to decide what
+    // folds. `renderOutputView` applies the same ranges on initial
+    // render; this service just re-offers them so the user can refold
+    // after expanding.
     const sectionFold = foldService.of((state, lineStart, lineEnd) => {
       for (const f of sectionFolds.get(currentTab) ?? []) {
         if (f.from === lineEnd) return f;
-      }
-      const head = state.doc.sliceString(lineStart, lineEnd);
-      if (/^;; -- setup --\s*$/.test(head)) {
-        const idx = state.doc.toString().indexOf('\n(push)', lineEnd);
-        return idx < 0 ? null : { from: lineEnd, to: idx };
-      }
-      if (/^\(push\)\s*$/.test(head)) {
-        let depth = 1;
-        let pos = lineEnd;
-        while (pos < state.doc.length) {
-          const nextLine = state.doc.lineAt(pos + 1);
-          const text = state.doc.sliceString(nextLine.from, nextLine.to);
-          if (/^\s*\(push\)\s*$/.test(text)) depth++;
-          else if (/^\s*\(pop\)\s*$/.test(text)) {
-            depth--;
-            if (depth === 0) return { from: lineEnd, to: nextLine.to };
-          }
-          if (nextLine.to >= state.doc.length) break;
-          pos = nextLine.to;
-        }
       }
       return null;
     });
@@ -655,11 +640,9 @@
     // is what buys back the "pick up where I left off" feel.
     //
     // The whole-doc replacement wipes any prior fold state (folds over a
-    // deleted range collapse to zero width), so auto-folds are re-applied
-    // on every render: Rust-declared block folds from `sectionFolds`
-    // (vstd appendix on VIR / SST), plus the `;; -- setup --` preamble
-    // on AIR / SMT tabs whose range is only knowable once the SMT body
-    // exists.
+    // deleted range collapse to zero width), so Rust-declared folds are
+    // re-applied from `sectionFolds` on every render. JS owns no body
+    // scanning — every fold range came from `verus_dump`.
     const renderOutputView = () => {
       const body = currentTab && sectionCache.has(currentTab) ? sectionCache.get(currentTab) : '';
       outputView.dispatch({
@@ -668,12 +651,6 @@
       });
       for (const { from, to } of sectionFolds.get(currentTab) ?? []) {
         outputView.dispatch({ effects: foldEffect.of({ from, to }) });
-      }
-      const pushIdx = body.indexOf('\n(push)');
-      if (body.startsWith(';; -- setup --') && pushIdx > 0) {
-        outputView.dispatch({
-          effects: foldEffect.of({ from: ';; -- setup --'.length, to: pushIdx }),
-        });
       }
       outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
     };
@@ -772,26 +749,26 @@
       try { _jsonDiags.push(JSON.parse(msg)); }
       catch (e) { console.warn('verus_diagnostic_json: parse failed', e, msg); }
     };
-    // Rust sends structured blocks: `headers[i]` is an optional label
-    // (empty string means no header), `contents[i]` is the block text,
-    // `folds[i] === 1` asks JS to auto-fold that block on render. JS
-    // owns rendering: header lines are stitched in as `;; -- <h> --`
-    // comments, fold ranges are captured in `sectionFolds` and applied
-    // by `renderOutputView` (and re-offered for manual refold by the
-    // fold service).
-    globalThis.verus_dump = (section, headers, contents, folds) => {
+    // Rust sends ordered blocks via parallel arrays: `contents[i]` is
+    // the block text (already includes a natural `;;` comment on its
+    // first line — `;; AIR prelude`, `;; Function-Def foo`, `;; vstd`,
+    // etc.), `folds[i] === 1` asks JS to auto-fold the block on render.
+    // Concatenate with `\n` between blocks; fold range is
+    // [end-of-first-line, end-of-block] so the natural comment line
+    // stays visible as the fold's label. `sectionFolds` feeds both the
+    // initial render (in `renderOutputView`) and the manual-refold path
+    // (in `sectionFold`).
+    globalThis.verus_dump = (section, contents, folds) => {
       let body = '';
       const ranges = [];
-      for (let i = 0; i < headers.length; i++) {
+      for (let i = 0; i < contents.length; i++) {
         if (body.length > 0 && !body.endsWith('\n')) body += '\n';
-        if (headers[i]) {
-          body += `;; -- ${headers[i]} --`;
-          const headerEnd = body.length;
-          body += '\n';
-          body += contents[i];
-          if (folds[i]) ranges.push({ from: headerEnd, to: body.length });
-        } else {
-          body += contents[i];
+        const start = body.length;
+        body += contents[i];
+        if (folds[i]) {
+          const firstNl = contents[i].indexOf('\n');
+          const labelEnd = firstNl < 0 ? body.length : start + firstNl;
+          ranges.push({ from: labelEnd, to: body.length });
         }
       }
       if (section === 'VERDICT') {
@@ -1016,7 +993,7 @@
       }
       return fetchExample(EXAMPLES[0].file);
     })();
-    if (loadedFromHash) exampleSelect.selectedIndex = -1;
+    if (loadedFromHash) exampleSelect.value = '';
 
     // ------------------------------------------------------------------
     // Auto-verify: debounced re-run on edits when the checkbox is on.
@@ -1091,7 +1068,7 @@
             // themselves.
             if (u.transactions.some(tr =>
               tr.isUserEvent('input') || tr.isUserEvent('delete'))) {
-              exampleSelect.selectedIndex = -1;
+              exampleSelect.value = '';
             }
           }
         }),
@@ -1142,6 +1119,11 @@
     // instead of a blank band.
     renderTabs();
     renderSubtabs();
+
+    // Populate the URL hash on cold load so the address bar is already a
+    // valid share link before any edit. Skipped when we arrived via hash
+    // (the hash is already correct) so we don't re-encode redundantly.
+    if (!loadedFromHash) saveHashNow();
 
     // Hold here until the wasm chain resolves; editor + tabs are already
     // live above so the left pane has been interactive the whole time.
