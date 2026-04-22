@@ -171,8 +171,8 @@ pub fn init() {
     );
 }
 
-/// Register one wasm-libs file (rmeta or `vstd.vir`) fetched by the JS
-/// loader from `./wasm-libs/<name>`. Call once per manifest entry, then call
+/// Register one libs file (rmeta or `vstd.vir`) fetched by the JS
+/// loader from `./libs/<name>`. Call once per manifest entry, then call
 /// `wasm_libs_finalize` before the first `parse_source` invocation.
 #[wasm_bindgen]
 pub fn wasm_libs_add_file(name: String, bytes: Vec<u8>) {
@@ -221,13 +221,14 @@ pub fn parse_source(src: &str, expand_errors: bool) {
 // consumed by `build_vir`.
 //
 // Bytes are not bundled into the wasm via `include_bytes!`. Instead the
-// browser loader fetches each rmeta + `vstd.vir` from `./wasm-libs/` (laid
-// out by `build.rs`, copied into `dist/` by the Makefile) and streams them
-// in one-by-one through `wasm_libs_add_file`, then calls `wasm_libs_finalize`
-// to register rustc's filesearch callbacks. Keeping ~60 MB of rmetas + .vir
-// out of the wasm shrinks the binary (~83 MB → ~23 MB), lets HTTP gzip
-// compress each artifact, and gives the browser independent cache entries
-// per crate.
+// browser loader fetches each rmeta + `vstd.vir` from `./libs/`
+// (staged by `make libs-sysroot` + `make libs-vir` and copied into
+// `dist/` by the Makefile) and streams them in one-by-one through
+// `wasm_libs_add_file`, then calls `wasm_libs_finalize` to register
+// rustc's filesearch callbacks. Keeping ~60 MB of rmetas + .vir out of
+// the wasm shrinks the binary (~83 MB → ~23 MB), lets HTTP gzip compress
+// each artifact, and gives the browser independent cache entries per
+// crate.
 //
 // The same sync contract rustc expects still holds:
 //   * `list(dir)` — directory listing for `SearchPath::new` in
@@ -254,6 +255,26 @@ struct WasmLibs {
 // static-init — wasm is single-threaded, so contention is impossible.
 static WASM_LIBS_PENDING: Mutex<Vec<(&'static str, &'static [u8])>> = Mutex::new(Vec::new());
 static WASM_LIBS_BUNDLE: OnceLock<WasmLibs> = OnceLock::new();
+
+// Flips `build_rustc_config`'s `-Zcrate-attr=no_std` injection and tells
+// the JS loader which vstd variant to register as `libvstd.rmeta`. Set
+// before `wasm_libs_finalize` from `public/index.html` based on the
+// `?std=1` URL param (opt-in). Defaults to `false` to match the page's
+// default nostd mode — tests and any out-of-band callers that forget to
+// call `set_std_mode` then get the smaller/faster bundle rather than a
+// spec mismatch. `AtomicBool` rather than `OnceLock<bool>` so JS can
+// flip the flag between `parse_source` calls if we ever wire a
+// no-reload toggle.
+static STD_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[wasm_bindgen]
+pub fn set_std_mode(enabled: bool) {
+    STD_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn std_mode() -> bool {
+    STD_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn wasm_libs() -> &'static WasmLibs {
     WASM_LIBS_BUNDLE
@@ -415,13 +436,13 @@ fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
 
 // `--sysroot=/virtual` pairs with the filesearch callbacks installed by
 // `wasm_libs_finalize` — rustc's crate locator finds `libcore.rmeta` (and
-// friends), plus our prebuilt `libverus_builtin.rmeta`, in the wasm-libs
+// friends), plus our prebuilt `libverus_builtin.rmeta`, in the libs
 // bundle instead of on disk. `#![no_std]` keeps std out (only `core` is
 // needed), and the caller prepends `extern crate verus_builtin;` so that
 // crate is linked and its `#[rustc_diagnostic_item]` registrations fire —
 // Verus keys its builtin lookups off those.
 fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
-    let argv: Vec<String> = [
+    let mut argv: Vec<&'static str> = vec![
         "--edition=2021",
         "--crate-type=lib",
         "--crate-name=v",
@@ -431,9 +452,8 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         // `extern crate vstd;\n` to the source instead, but that shifted
         // every diagnostic's line number by one — breaking the in-editor
         // error-line highlight. No `=PATH` needed: rustc's crate locator
-        // finds `libvstd.rmeta` via the wasm-libs sysroot bundle.
+        // finds `libvstd.rmeta` via the libs sysroot bundle.
         "--extern=vstd",
-        "-Zcrate-attr=no_std",
         "-Zcrate-attr=feature(register_tool)",
         // `verus!` expansion emits `#[...]` attributes on expressions
         // (e.g. `#[verus::internal(...)] foo`) — unstable without this.
@@ -451,10 +471,17 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
         "-Aunreachable_patterns", "-Aunused_parens", "-Aunused_braces",
         "-Adead_code", "-Aunreachable_code", "-Aunused_mut", "-Aunused_labels",
         "-Aunused_attributes", "-Anon_shorthand_field_patterns",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    ];
+    // Nostd mode: inject `#![no_std]` at the crate root so rustc bypasses
+    // the std prelude. The JS loader fetches a vstd variant built with
+    // `feature="alloc"` but NOT `feature="std"`, so user code can still
+    // `use vstd::prelude::*` but can't reach into std::*. Std mode
+    // (default) omits the attr; rustc then injects the std prelude and
+    // the full-fat vstd bundle is active.
+    if !std_mode() {
+        argv.push("-Zcrate-attr=no_std");
+    }
+    let argv: Vec<String> = argv.into_iter().map(String::from).collect();
 
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = rustc_driver::handle_options(&early_dcx, &argv).expect("handle_options");
@@ -888,7 +915,7 @@ fn build_vir<'tcx>(
     let mut args = ArgsX::new();
     // `Vstd::Imported` is the default and matches the user's
     // `extern crate vstd;` injection. The vstd VIR is served out of the
-    // fetched wasm-libs bundle (`wasm_libs_vstd_vir()`) and passed straight
+    // fetched libs bundle (`wasm_libs_vstd_vir()`) and passed straight
     // in as `other_vir_crates` — `args.import` is path-based and doesn't
     // work on wasm32, so we bypass the filesystem loader.
     // Only non-default override: skip the Polonius-based lifetime check
@@ -1241,14 +1268,16 @@ fn verify_module(
     let mut air_ctx = time("verify.air_ctx_new", || {
         let mut c = Context::new(mctx.msg.clone(), mctx.solver);
         c.set_z3_param("air_recommended_options", "true");
-        // Cap each Z3 query at ~10 seconds of solver work. Matches upstream
-        // Verus' documented `--rlimit=10` CLI default (`RLIMIT_PER_SECOND`
-        // = 3_000_000 in `verifier.rs:50`). Upstream's `ArgsX::new` default
-        // is `f32::INFINITY`, but that's only appropriate when a human can
-        // Ctrl-C; a pathological assert in the browser would otherwise hang
-        // the tab with no abort path. 10s is generous for the small snippets
-        // the explorer serves.
-        c.set_rlimit(10 * 3_000_000);
+        // Cap each Z3 query at ~60 seconds of solver work (`RLIMIT_PER_SECOND`
+        // = 3_000_000 in upstream Verus' `verifier.rs:50`, so 60 * that is
+        // roughly the 60-second budget). Upstream's `ArgsX::new` default
+        // is `f32::INFINITY`, which is only appropriate when a human can
+        // Ctrl-C; a pathological assert in the browser would otherwise
+        // hang the tab with no abort path. Bumped from the `--rlimit=10`
+        // CLI default because heavier examples (e.g. doubly_linked_xor's
+        // bit-vector XOR + quantifier reasoning) hit Z3's "incomplete
+        // theory quant" when they run out of budget mid-instantiation.
+        c.set_rlimit(60 * 3_000_000);
         c
     });
     let bufs = LogBufs::attach(&mut air_ctx);

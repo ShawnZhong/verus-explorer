@@ -38,6 +38,9 @@
         <label class="hint muted" title="Run expand-errors after a failed query to pinpoint which sub-conjunct breaks (slower)">
           <input type="checkbox" id="expand-errors" /> Diagnostics
         </label>
+        <label class="hint muted" title="Check to enable libstd + std-flavored vstd (unlocks println!, HashMap, PPtr::new at ~20% slower verify). Unchecked is the default: no_std + alloc-only vstd. Toggle reloads the page.">
+          <input type="checkbox" id="std-mode" /> Use std
+        </label>
       </div>
     </section>
 
@@ -80,34 +83,79 @@
       ViewPlugin, RangeSetBuilder,
     } from './editor.js';
 
-    // wasm-libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
+    // libs bundle: rustc-in-wasm resolves `extern crate core/alloc/vstd`
     // against rmetas laid out at `/virtual/lib/rustlib/wasm32-unknown-unknown/lib`.
-    // `build.rs` stages each file gzipped as `${name}.gz` under `./wasm-libs/`;
-    // we fetch each `.gz` and pipe through the native `DecompressionStream`
-    // (gzip is supported in all evergreen browsers; brotli isn't yet), then
-    // re-install into every fresh wasm instance via `wasm_libs_add_file` +
-    // `wasm_libs_finalize`. The names below are the uncompressed filenames
-    // rustc's crate locator expects in memory, *not* what's on the wire.
-    const WASM_LIBS = [
+    // The Makefile stages each file gzipped as `${name}.gz` under
+    // `./libs/` (with mode-specific subdirs `./libs/std/` and `./libs/nostd/`);
+    // we fetch each `.gz`, pipe through the native `DecompressionStream`
+    // (gzip is supported in all evergreen browsers; brotli isn't yet),
+    // then re-install into every fresh wasm instance via
+    // `wasm_libs_add_file` + `wasm_libs_finalize`. The names are the
+    // uncompressed filenames rustc's crate locator expects in memory,
+    // *not* what's on the wire.
+    //
+    // Two bundle modes picked by URL param `?std=1` (opt-in, default
+    // is nostd):
+    //   nostd (default) — no libstd; vstd built with only
+    //                     `feature="alloc"`, user code is `#![no_std]`.
+    //                     ~13 MB gzipped, ~20% faster warm verify.
+    //   std             — libstd + its wasm32 dep chain under
+    //                     ./libs/std/, vstd built with `feature="std"`.
+    //                     Unlocks PPtr::new / HashMap / println!. ~16
+    //                     MB gzipped, ~30-50 ms slower per warm verify.
+    //                     Opt in via `?std=1` or the toolbar checkbox.
+    // Dropped from both lists despite being declared libstd deps:
+    // libpanic_{abort,unwind} — rustc doesn't fetch panic runtimes
+    // under `--emit=metadata` since no linking happens (measured).
+    // Backtrace crates (gimli, object, addr2line, miniz_oxide, adler2,
+    // memchr) don't appear because we disabled `rust.backtrace` in
+    // `third_party/rust/bootstrap.toml` so libstd itself stops
+    // declaring them. libtest, libproc_macro, libgetopts, libsysroot,
+    // and librustc_std_workspace_std are x.py by-products libstd
+    // doesn't depend on.
+    const stdMode = new URLSearchParams(location.search).get('std') === '1';
+    const LIBS_SHARED = [
       'liballoc.rmeta',
       'libcompiler_builtins.rmeta',
       'libcore.rmeta',
       'libverus_builtin.rmeta',
       'libverus_builtin_macros.rmeta',
       'libverus_state_machines_macros.rmeta',
-      'libvstd.rmeta',
-      'vstd.vir',
     ];
+    // Mode-specific fetches. Paths are relative to `./libs/`. The
+    // `libvstd.rmeta` / `vstd.vir` entries under std/ and nostd/ have
+    // the same *logical* names on the rustc side — we register them
+    // with those names via `wasm_libs_add_file` — but the bytes come
+    // from the mode's subdir.
+    const LIBS_STD_ONLY = [
+      'std/libstd.rmeta',
+      'std/libcfg_if.rmeta',
+      'std/libdlmalloc.rmeta',
+      'std/libhashbrown.rmeta',
+      'std/liblibc.rmeta',
+      'std/librustc_demangle.rmeta',
+      'std/librustc_std_workspace_alloc.rmeta',
+      'std/librustc_std_workspace_core.rmeta',
+      'std/libstd_detect.rmeta',
+      'std/libunwind.rmeta',
+      'std/libvstd.rmeta',
+      'std/vstd.vir',
+    ];
+    const LIBS_NOSTD_ONLY = [
+      'nostd/libvstd.rmeta',
+      'nostd/vstd.vir',
+    ];
+    const LIBS = [...LIBS_SHARED, ...(stdMode ? LIBS_STD_ONLY : LIBS_NOSTD_ONLY)];
 
     // Kick off wasm loading in the background (Z3 init, Verus wasm compile,
-    // wasm-libs fetch+decompress — all independent, so fire as one
-    // Promise.all; critical path = max, not sum). We deliberately do NOT
-    // await here: the editor, tab strip, and example dropdown are cheap to
-    // mount and should appear immediately so the user can start reading /
-    // editing during the multi-MB cold-load. `verus` stays `null` until the
-    // chain resolves; the Verify button is disabled and `runParse` is a
-    // no-op until then. The bottom of this script `await`s `wasmReady` to
-    // flip the button live and kick off the first verify.
+    // libs fetch+decompress — all independent, so fire as one Promise.all;
+    // critical path = max, not sum). We deliberately do NOT await here: the
+    // editor, tab strip, and example dropdown are cheap to mount and should
+    // appear immediately so the user can start reading / editing during the
+    // multi-MB cold-load. `verus` stays `null` until the chain resolves;
+    // the Verify button is disabled and `runParse` is a no-op until then.
+    // The bottom of this script `await`s `wasmReady` to flip the button
+    // live and kick off the first verify.
     let verus = null;
     // z3 transcript buffer — hoisted out of the IIFE so `runParse` (which
     // clears it at the top of each run and reads it at the bottom) sees the
@@ -116,24 +164,28 @@
     // captures the *variable*, not the initial array, so the push keeps
     // targeting the live buffer.
     let z3ResponseBuffer = [];
-    // Progress counter for cold-load. Each `wasm-libs/*.gz` fetch bumps
-    // this when it resolves and updates the Verify button label, so the
-    // user sees "Loading 3/8 libs…" instead of a static "Loading verifier…"
-    // while the multi-MB download stream in. Safe to reference
-    // `parseButtonLabel` from the async callback even though the DOM ref
-    // is grabbed later in the script — the callback fires after the first
-    // microtask, by which point all const declarations have executed.
+    // Progress counter for cold-load. Each `libs/*.gz` fetch bumps this
+    // when it resolves and updates the Verify button label, so the user
+    // sees "Loading 3/18 libs…" instead of a static "Loading verifier…"
+    // while the multi-MB download streams in. Safe to reference
+    // `parseButtonLabel` from the async callback even though the DOM
+    // ref is grabbed later in the script — the callback fires after
+    // the first microtask, by which point all const declarations have
+    // executed.
     let wasmLibsLoaded = 0;
     const wasmReady = (async () => {
       const [Z3, verusModule, wasmLibs] = await Promise.all([
         globalThis.initZ3(),
         WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm')),
-        Promise.all(WASM_LIBS.map(async name => {
-          const res = await fetch(`./wasm-libs/${name}.gz`);
+        Promise.all(LIBS.map(async path => {
+          const res = await fetch(`./libs/${path}.gz`);
           const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
           const buf = await new Response(stream).arrayBuffer();
           wasmLibsLoaded++;
-          parseButtonLabel.textContent = `Loading ${wasmLibsLoaded}/${WASM_LIBS.length} libs…`;
+          parseButtonLabel.textContent = `Loading ${wasmLibsLoaded}/${LIBS.length} libs…`;
+          // Strip the mode subdir prefix ('std/' or 'nostd/') so the
+          // in-wasm crate locator sees plain `libvstd.rmeta` etc.
+          const name = path.replace(/^(std|nostd)\//, '');
           return [name, new Uint8Array(buf)];
         })),
       ]);
@@ -162,6 +214,10 @@
       // survive across calls and amortize, so #2/#3 run at ~2× #1 speed.
       const v = await import('./verus_explorer.js');
       await v.default({ module_or_path: verusModule });
+      // Tell the wasm side which vstd bundle is loaded so
+      // `build_rustc_config` injects `#![no_std]` in nostd mode (but
+      // not in std mode, where user code should see the std prelude).
+      v.set_std_mode(stdMode);
       for (const [name, bytes] of wasmLibs) v.wasm_libs_add_file(name, bytes);
       v.wasm_libs_finalize();
       verus = v;
@@ -242,6 +298,19 @@
     const exampleSelect = document.getElementById('example-select');
     const autoVerifyCheckbox = document.getElementById('auto-verify');
     const expandErrorsCheckbox = document.getElementById('expand-errors');
+    // std toggle: initial state reflects the URL param (`?std=1` opts
+    // in; default is nostd). Flipping it rewrites the URL and reloads,
+    // because the libs bundle is picked up at wasm instance init and
+    // can't be swapped mid-session without rebuilding the cstore.
+    const stdModeCheckbox = document.getElementById('std-mode');
+    stdModeCheckbox.checked = stdMode;
+    stdModeCheckbox.addEventListener('change', () => {
+      const params = new URLSearchParams(location.search);
+      if (stdModeCheckbox.checked) params.set('std', '1');
+      else params.delete('std');
+      const qs = params.toString();
+      location.search = qs ? `?${qs}` : '';
+    });
     const downloadBtn = document.getElementById('download-btn');
     const shareBtn = document.getElementById('share-btn');
 

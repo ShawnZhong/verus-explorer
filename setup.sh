@@ -8,7 +8,7 @@ source "${HOME}/.cargo/env"
 cargo install wasm-pack
 
 # `wasm-pack test --node` (tests/smoke.rs) drives the pipeline under Node so
-# it can read the staged wasm-libs bundle off disk via the `fs` module. We install the
+# it can read the staged libs bundle off disk via the `fs` module. We install the
 # official tarball straight into `editor/node/` (gitignored) so the
 # Makefile's `test` target can prepend `editor/node/bin` to PATH and
 # pin the Node version — `wasm-bindgen-test-runner` invokes Node via plain

@@ -19,7 +19,10 @@ use wasm_bindgen_test::*;
 // Node's built-in `fs`. `wasm-pack test --node` emits CommonJS glue, so this
 // resolves to `require('fs')`. Buffers returned by `readFileSync` are
 // Uint8Array subclasses — wasm-bindgen marshals them into `Vec<u8>` via the
-// standard typed-array path.
+// standard typed-array path. We read from
+// `CARGO_MANIFEST_DIR/../target/wasm-libs/...` — the dir the
+// `make wasm-vir` target populates. Resolved at compile time via
+// concat!(env!("CARGO_MANIFEST_DIR"), ...); no build.rs involved.
 #[wasm_bindgen(module = "fs")]
 extern "C" {
     #[wasm_bindgen(js_name = readFileSync)]
@@ -50,6 +53,7 @@ extern "C" {
       globalThis._sections = new Map();\n\
       globalThis.verus_diagnostic = () => {};\n\
       globalThis.verus_diagnostic_json = () => {};\n\
+      globalThis.verus_z3_annotate = () => {};\n\
       globalThis.verus_dump = (section, contents, _folds) => {\n\
         let body = '';\n\
         for (let i = 0; i < contents.length; i++) {\n\
@@ -130,19 +134,30 @@ fn pipeline_preserves_ghost_proof_block() {
     install_pipeline_stubs();
     install_z3_stubs();
 
-    // Stream every rmeta + `vstd.vir` staged by `build.rs` into the
-    // wasm-libs bundle. The `.gz` siblings are for the browser loader;
-    // here we read the originals directly.
+    // Stream the libs bundle staged by `make libs` into the wasm
+    // instance. Layout: shared rmetas at the root of `target/libs/`,
+    // std-mode-only rmetas under `std/`, nostd-mode-only under
+    // `nostd/`. The smoke test exercises the nostd bundle — a basic
+    // proof that uses only `vstd::prelude` + `assert`, so libstd's
+    // surface isn't needed and the smaller bundle loads faster. Path
+    // resolved at compile time relative to `CARGO_MANIFEST_DIR`
+    // (`verus-explorer/`) so no build-script env var is required.
+    verus_explorer::set_std_mode(false);
     let t0 = perf_now();
-    let dir = env!("WASM_LIBS_DIR");
-    for entry in readdir_sync(dir) {
-        let name = entry.as_string().expect("readdirSync returns strings");
-        if !(name.ends_with(".rmeta") || name == "vstd.vir") {
-            continue;
+    const LIBS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/libs");
+    let stream_dir = |sub: &str| {
+        let dir = format!("{LIBS}/{sub}");
+        for entry in readdir_sync(&dir) {
+            let name = entry.as_string().expect("readdirSync returns strings");
+            if !(name.ends_with(".rmeta") || name == "vstd.vir") {
+                continue;
+            }
+            let bytes = read_file_sync(&format!("{dir}/{name}"));
+            verus_explorer::wasm_libs_add_file(name, bytes);
         }
-        let bytes = read_file_sync(&format!("{dir}/{name}"));
-        verus_explorer::wasm_libs_add_file(name, bytes);
-    }
+    };
+    stream_dir("");
+    stream_dir("nostd");
     verus_explorer::wasm_libs_finalize();
     let t_libs = perf_now();
 

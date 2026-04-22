@@ -58,7 +58,7 @@ make release      # opt-level=z + wasm-opt -Oz (production bundle)
 make serve        # dev + python3 http.server --directory dist/ 8000
 make test         # wasm-bindgen Node-hosted smoke test
 make deploy       # release + push dist/ to origin/gh-pages
-make clean        # cargo / wasm-libs / wasm-z3 (keeps host-rust)
+make clean        # cargo / libs / wasm-z3 (keeps host-rust)
 make clean-host   # nuke patched rustc + host verus (slow to rebuild)
 ```
 

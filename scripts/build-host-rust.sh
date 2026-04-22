@@ -9,12 +9,18 @@
 # Three steps in one shot:
 #   1. ./x.py build --stage 1 library --target <host>,wasm32-unknown-unknown
 #   2. ./x.py dist rustc-dev --stage 1
-#   3. stage build/host/stage1 + raw stage1-std into target/host-rust/.
-#      Required because steps 1 and 2 mutually wipe each other's outputs in
-#      build/host/stage1/lib (library --target wasm32 regenerates the sysroot
-#      fresh and drops rustc-dev libs; dist rustc-dev drops the wasm32 sysroot
-#      the other way). The wasm32 std survives in the raw build/<host>/
-#      stage1-std dir, which neither command touches.
+#   3. Stage build/host/stage1 + raw stage1-std into target/host-rust/.
+#      Required because steps 1 and 2 mutually wipe each other's outputs
+#      in build/host/stage1/lib (library --target wasm32 regenerates the
+#      sysroot fresh and drops rustc-dev libs; dist rustc-dev drops the
+#      wasm32 sysroot the other way). The wasm32 std survives in the raw
+#      build/<host>/stage1-std dir, which neither command touches.
+#
+# The complementary `x.py check --target wasm32` pass that produces the
+# smaller metadata-only rmetas for the browser bundle lives in
+# scripts/build-libs-sysroot.sh — it reuses the stage1 rustc built here
+# but runs in a clean shell (from `make libs-sysroot`) so it doesn't
+# inherit cargo's RUSTFLAGS/CC from a build.rs caller.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 repo="$PWD"
@@ -89,11 +95,22 @@ done
     cp -R "$RUSTUP_STABLE/lib/rustlib/$HOST_TRIPLE/bin/gcc-ld" \
         "$SNAP/lib/rustlib/$HOST_TRIPLE/bin/gcc-ld"
 
-# wasm32 sysroot from the raw build dir — survives x.py dist invocations.
+# wasm32 sysroot from the raw build dir — survives x.py dist
+# invocations. Stage only the rlib+rmeta pairs from `x.py build`. If a
+# previous run of build-libs-sysroot.sh left check-only rmetas behind
+# in the deps dir (no rlib sibling), skip them — rustc-rlibs' wasm32
+# cargo build reads host-rust as its sysroot and would fail with E0464
+# "multiple candidates for rmeta dependency" on duplicate libcore-*.
 for f in "$RAW_STD/wasm32-unknown-unknown/release/deps/"*; do
     base=$(basename "$f")
     case "$base" in
-        *.rlib|*.rmeta)
+        *.rlib)
+            ln "$f" "$SNAP/lib/rustlib/wasm32-unknown-unknown/lib/$base" \
+                2>/dev/null || cp "$f" "$SNAP/lib/rustlib/wasm32-unknown-unknown/lib/$base"
+            ;;
+        *.rmeta)
+            sibling="${f%.rmeta}.rlib"
+            [ -e "$sibling" ] || continue
             ln "$f" "$SNAP/lib/rustlib/wasm32-unknown-unknown/lib/$base" \
                 2>/dev/null || cp "$f" "$SNAP/lib/rustlib/wasm32-unknown-unknown/lib/$base"
             ;;

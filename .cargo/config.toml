@@ -7,7 +7,7 @@
 RUSTC_BOOTSTRAP = "1"
 # Must match the patched stage1 rustc's self-reported version (the host rustc
 # in target/host-rust/, see `rustc -vV`). Sysroot rmetas built by that rustc
-# (scripts/build-wasm-libs.sh, scripts/build-host-verus.sh) get stamped with
+# (scripts/build-wasm-{sysroot,vir}.sh, scripts/build-host-verus.sh) get stamped with
 # its baked-in version; the in-wasm rustc compiled here picks up these envs
 # at compile time via `env!()`/`option_env!()` and bakes the same string in,
 # so rmeta version checks (E0514) line up. x.py builds without a configured
@@ -26,11 +26,21 @@ RUSTC_INSTALL_BINDIR = "bin"
 # rustc_session::config::host_tuple() panics if this is missing.
 CFG_COMPILER_HOST_TRIPLE = "wasm32-unknown-unknown"
 
-# `-z stack-size=8MiB` matches rustc's own 8 MiB thread stack — our wasm
-# `run_in_thread_with_globals` patch runs `run_compiler` inline on the main
-# thread, so we need the linker to reserve the stack at module level. With
-# the wasm default (1 MiB) HIR lowering overflows into "memory access out of
-# bounds".
+# `-z stack-size=64MiB` reserves 64 MB of stack at module-instantiate
+# time (set by rust-lld in the wasm linear memory layout; unused bytes
+# cost nothing thanks to zero-page mapping). Sized for two load-bearing
+# callers that each assumed huge native stacks:
+#   * rustc — its `run_in_thread_with_globals` normally spawns a
+#     thread with an 8 MiB stack, but our wasm patch runs it inline;
+#     HIR lowering overflows at the wasm default (1 MiB).
+#   * Verus' VIR interpreter (`vir/src/interpreter.rs`) — originally
+#     spawned a 1 GiB-stack thread for `compute` mode spec evaluation;
+#     wasm32 has no threads, so our patch runs it inline on the main
+#     stack. Deep recursion in `eval_expr` (spec-function unfolding,
+#     recursive datatype traversal) can blow the stack on nontrivial
+#     proofs, which is what drove this bump from 8 → 64 MiB.
+# Browsers allow hundreds of MiB of wasm memory, so 64 MiB is a
+# comfortable fit with headroom to grow if needed.
 # `./scripts/rustc-wrapper.sh` injects a profile-aware
 # `-L .../wasm32-unknown-unknown/<profile>/deps` for wasm32 builds so
 # rustc finds rustc-rlibs' output. Kept out of rustflags below because
@@ -55,5 +65,5 @@ rustflags = ["--allow=unexpected_cfgs"]
 [target.wasm32-unknown-unknown]
 rustflags = [
     "--allow=unexpected_cfgs",
-    "-C", "link-arg=-zstack-size=8388608",
+    "-C", "link-arg=-zstack-size=67108864",
 ]

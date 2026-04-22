@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the host rust_verify driver into target/host-verus/release/.
-# build-wasm-libs.sh invokes rust_verify to compile vstd → wasm32 rmeta +
-# .vir for the wasm-libs bundle.
+# build-libs-vir.sh invokes rust_verify to compile vstd → wasm32 rmeta +
+# .vir for the libs bundle.
 #
 # `--target-dir target/host-verus` redirects cargo out of Verus's own
 # workspace (`third_party/verus/source/target/`) so it sits alongside the
