@@ -53,7 +53,7 @@ use air::context::{Context, SmtSolver, ValidityResult};
 use air::messages::{Diagnostics, MessageLevel};
 use rust_verify::buckets::Bucket;
 use rust_verify::cargo_verus_dep_tracker::DepTracker;
-use rust_verify::commands::{OpGenerator, OpKind, QueryOp, Style};
+use rust_verify::commands::{FunctionOpGenerator, Op, OpGenerator, OpKind, QueryOp, Style};
 use rust_verify::config::ArgsX;
 use rust_verify::expand_errors_driver::ExpandErrorsResult;
 use rust_verify::import_export::CrateWithMetadata;
@@ -73,8 +73,8 @@ use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::FileLoader;
 use rustc_span::{FileName, Symbol};
-use vir::ast::{ArchWordBits, Datatype, Fun, Krate, Path as VirPath, VirErr};
-use vir::ast_util::{fun_as_friendly_rust_name, is_visible_to};
+use vir::ast::{ArchWordBits, Fun, Krate, VirErr};
+use vir::ast_util::fun_as_friendly_rust_name;
 use vir::context::{Ctx, GlobalCtx};
 use vir::messages::{ToAny, VirMessageInterface};
 use vir::prelude::PreludeConfig;
@@ -1109,11 +1109,21 @@ impl<'a, 'tcx> Feeder<'a, 'tcx> {
     fn feed(&mut self, cmd: &Command) -> ValidityResult {
         self.air_ctx.command(&**self.msg, self.reporter, cmd, Default::default())
     }
-    fn feed_all(&mut self, cmds: &[Command]) {
-        for cmd in cmds {
+    fn feed_all(&mut self, cmds: &air::ast::Commands) {
+        for cmd in cmds.iter() {
             self.feed(cmd);
         }
     }
+}
+
+// Stamp the op's label into the AIR/SMT logs (via `air_ctx.comment`) and
+// into the Z3 response buffer (via the JS extern). Both tabs then read as
+// per-op stanzas instead of a flat stream. Same payload for each sink so
+// the banners line up across tabs.
+fn emit_op_banner(feeder: &mut Feeder, op: &Op) {
+    let comment = op.to_air_comment();
+    feeder.air_ctx.comment(&comment);
+    verus_z3_annotate(&comment);
 }
 
 // -------- drivers --------
@@ -1244,33 +1254,35 @@ fn verify_module(
     let bufs = LogBufs::attach(&mut air_ctx);
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
     time("verify.queries", || {
-        run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, &module_path, mctx)
+        run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, mctx)
     })?;
     // `ctx.free()` drops the LogBufs-attached Z3 context → `Z3_del_context`.
     // Any deferred solver teardown shows up here.
     Ok(time("verify.ctx_free", || ctx.free()))
 }
 
-// Prelude, fuel, trait/assoc/datatype/opaque decls, plus per-function symbol
-// declarations. Order matches `Verifier::verify_bucket`.
+// Feeds the per-bucket AIR preamble. The prelude is sent first, then the
+// `feed_bucket_preamble` helper (upstream patch in `rust_verify::verifier`)
+// walks the fuel / trait / datatype / opaque / function-decl sequence in
+// the same order `Verifier::verify_bucket` does — by delegating we stay in
+// sync if upstream adds a new step.
 fn feed_module_decls(
     feeder: &mut Feeder,
     ctx: &mut Ctx,
     krate_sst: &KrateSst,
-    visible_dts: &Vec<Datatype>,
     mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
     feeder.feed_all(&Ctx::prelude(PreludeConfig {
         arch_word_bits: mctx.arch_word_bits,
         solver: mctx.solver,
     }));
-    feeder.feed_all(&ctx.fuel());
-    feeder.feed_all(&vir::traits::trait_decls_to_air(ctx, krate_sst));
-    feeder.feed_all(&vir::assoc_types_to_air::assoc_type_decls_to_air(ctx, &krate_sst.traits));
-    feeder.feed_all(&vir::datatype_to_air::datatypes_and_primitives_to_air(ctx, visible_dts));
-    feeder.feed_all(&vir::traits::trait_bound_axioms(ctx, &krate_sst.traits));
-    feeder.feed_all(&vir::assoc_types_to_air::assoc_type_impls_to_air(ctx, &krate_sst.assoc_type_impls));
-    feeder.feed_all(&vir::opaque_type_to_air::opaque_types_to_air(ctx, &krate_sst.opaque_types));
+    let module = ctx.module_path();
+    let preamble = rust_verify::verifier::Verifier::build_bucket_preamble(ctx, krate_sst, &module);
+    for (cmds, _label) in preamble.batches() {
+        feeder.feed_all(cmds);
+    }
+    // Per-function name declarations — verify_bucket mirrors this loop
+    // alongside its own proof-note bookkeeping; we only need the feeds.
     for f in &krate_sst.functions {
         ctx.fun = vir::ast_to_sst_func::mk_fun_ctx(f, false);
         feeder.feed_all(&vir::sst_to_air_func::func_name_to_air(ctx, mctx.reporter, f)?);
@@ -1296,7 +1308,6 @@ fn run_queries(
     krate_sst: &KrateSst,
     bucket_funs: HashSet<Fun>,
     output: &mut VerifyOutput,
-    module_path: &VirPath,
     mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
     // Feed the module-scoped AIR prelude (axioms, fuel, datatype /
@@ -1305,254 +1316,263 @@ fn run_queries(
     // boilerplate the reader rarely wants expanded. Each op below
     // drains into its own expanded block so queries / context ops
     // read linearly beneath the collapsed prelude.
-    let visible_dts: Vec<Datatype> = krate_sst.datatypes.iter()
-        .filter(|d| is_visible_to(&d.x.visibility, module_path))
-        .cloned()
-        .collect();
     verus_z3_annotate("AIR prelude");
-    time("verify.feed_decls", || feed_module_decls(feeder, ctx, krate_sst, &visible_dts, mctx))?;
+    time("verify.feed_decls", || feed_module_decls(feeder, ctx, krate_sst, mctx))?;
     bufs.drain_block(&mut output.air_blocks, /* fold */ true);
 
     let bucket = Bucket { funs: bucket_funs };
     let mut opgen = OpGenerator::new(ctx, krate_sst, bucket);
     while let Some(mut function_opgen) = opgen.next()? {
-        loop {
-            // The expand-errors driver produces either the next expansion op to
-            // run or, once it's exhausted all sub-queries, the final diagnostic
-            // to print. Only yields when armed by a prior failure.
-            let mut next_op = None;
-            let mut expand_diag = None;
-            if let Some(r) = function_opgen.expand_errors_next(None) {
-                match r {
-                    Ok(op) => next_op = Some(op),
-                    Err(diag) => expand_diag = Some(diag),
-                }
-            }
-            if next_op.is_none() {
-                next_op = function_opgen.next();
-            }
-            if let Some(diag) = expand_diag {
-                feeder.reporter.report(&diag);
-            }
-            let Some(op) = next_op else { break };
+        while let Some(op) = next_op(&mut function_opgen, feeder.reporter) {
+            handle_op(op, &mut function_opgen, feeder, bufs, output, mctx)?;
+        }
+    }
+    Ok(())
+}
 
-            // Emit the op's label comment via `air_ctx.comment(...)` so
-            // every log gets a `;; <OpKind> <func-path>` line right
-            // before the op's commands. That becomes the natural
-            // first-line label of the drain block below. Also stamp the
-            // same label into the Z3 response buffer so the Z3 tab
-            // (which otherwise is a flat stream of sat/unsat/empty
-            // replies) reads as per-op stanzas.
-            let air_comment = op.to_air_comment();
-            feeder.air_ctx.comment(&air_comment);
-            verus_z3_annotate(&air_comment);
+// Pull the next op. Preference: first drain any expand-errors sub-query
+// (sub-conjunct probes after a failed Normal body), else ask the main
+// OpGenerator for the next scheduled op. If expand-errors finished with
+// a summary diagnostic rather than a sub-query, report it before
+// returning — the subsequent `.next()` is still consulted so we don't
+// skip a real queued op on the flush.
+fn next_op<'tcx>(
+    function_opgen: &mut FunctionOpGenerator,
+    reporter: &Reporter<'tcx>,
+) -> Option<Op> {
+    let mut next_op = None;
+    let mut expand_diag = None;
+    if let Some(r) = function_opgen.expand_errors_next(None) {
+        match r {
+            Ok(op) => next_op = Some(op),
+            Err(diag) => expand_diag = Some(diag),
+        }
+    }
+    if next_op.is_none() {
+        next_op = function_opgen.next();
+    }
+    if let Some(diag) = expand_diag {
+        reporter.report(&diag);
+    }
+    next_op
+}
 
-            // The explorer always compiles an anonymous crate, so every user
-            // function's friendly name starts with `crate::`. Strip it so the
-            // verdict detail reads `main: body → valid` instead of the
-            // redundant `crate::main: body → valid`.
-            let func_name = op
-                .function
-                .as_ref()
-                .map(|f| fun_as_friendly_rust_name(&f.x.name))
-                .map(|n| n.strip_prefix("crate::").map(str::to_string).unwrap_or(n))
-                .unwrap_or_default();
-            let mut any_invalid = false;
-            let mut any_timed_out = false;
-            let mut default_prover_failed_assert_ids: Vec<AssertId> = vec![];
-            let mut retry_kind: Option<QueryOp> = None;
-            match &op.kind {
-                OpKind::Context(_, commands) => feeder.feed_all(commands),
-                OpKind::Query { commands_with_context_list, query_op, .. } => {
-                    retry_kind = Some(*query_op);
-                    // Upstream maps each QueryOp to a MessageLevel
-                    // (`verifier.rs:1558-1563`). Recommends retries emit at
-                    // Note / Warning (informational context around a real
-                    // failure), not Error. Routing them through rustc at the
-                    // right level is what makes the UI render them as muted
-                    // notes instead of blocking errors.
-                    let level = match query_op {
-                        QueryOp::SpecTermination
-                        | QueryOp::Body(Style::Normal)
-                        | QueryOp::Body(Style::Expanded)
-                        | QueryOp::Body(Style::CheckApiSafety) => MessageLevel::Error,
-                        QueryOp::Body(Style::RecommendsFollowupFromError) => MessageLevel::Note,
-                        QueryOp::Body(Style::RecommendsChecked) => MessageLevel::Warning,
-                    };
-                    // Only Error-level ops count as pass/fail queries in the
-                    // verdict list. Recommends variants are diagnostic
-                    // side-channels — if they fail, the reporter surfaces them
-                    // as notes/warnings alongside the original error; counting
-                    // them toward `N/M queries failed` would just inflate the
-                    // tally with informational output.
-                    let verdict_is_query = level == MessageLevel::Error;
-                    for cmds in commands_with_context_list.iter() {
-                        // Contextual advice that Verus attaches to certain
-                        // proof obligations (e.g. loop-invariant hints). Upstream
-                        // emits it once per `CheckValid` command, as a `note:`
-                        // preceding the first failing probe (`verifier.rs:910`).
-                        // Single-threaded wasm, so the Mutex `.lock()` is free;
-                        // we clone out so we don't hold the guard across probes.
-                        let hint = cmds
-                            .hint_upon_failure
-                            .lock()
-                            .expect("hint_upon_failure mutex poisoned")
-                            .clone();
-                        for cmd in cmds.commands.iter() {
-                            let mut result = feeder.feed(cmd);
-                            if matches!(&**cmd, CommandX::CheckValid(_)) {
-                                // Probe for more failing asserts in the same
-                                // body via `check_valid_again`. Mirrors the
-                                // two-phase loop in Verus'
-                                // `verifier.rs:834-982`:
-                                //   1. Up to `checks_remaining` "any more
-                                //      errors" probes (upstream default:
-                                //      `--multiple-errors=2`; bumped here
-                                //      because explorer snippets are small
-                                //      and users want to see everything).
-                                //   2. When the budget runs out, flip
-                                //      `only_check_earlier=true`. That pass
-                                //      is guaranteed to terminate — AIR
-                                //      strictly shrinks the enabled-label
-                                //      set each call
-                                //      (`smt_verify.rs:149-168`) and returns
-                                //      Valid once none remain.
-                                let mut checks_remaining: u32 = 8;
-                                let mut only_check_earlier = false;
-                                let mut is_first_check = true;
-                                loop {
-                                    if let ValidityResult::Invalid(_, Some(err), _) = &result {
-                                        feeder.reporter.report_as(err, level);
-                                        // Emit the hint right after the first
-                                        // failure's error so the user sees
-                                        // them grouped. Matches upstream's
-                                        // first-check-only gate.
-                                        if is_first_check {
-                                            if let Some(h) = &hint {
-                                                feeder
-                                                    .reporter
-                                                    .report_as(&h.clone().to_any(), MessageLevel::Note);
-                                            }
-                                        }
-                                    }
-                                    // Only DefaultProver failures get
-                                    // expand-errors; Nonlinear / BitVector
-                                    // use solver paths the expansion
-                                    // machinery doesn't cover.
-                                    if let ValidityResult::Invalid(_, _, Some(id)) = &result {
-                                        if cmds.prover_choice == ProverChoice::DefaultProver {
-                                            default_prover_failed_assert_ids.push(id.clone());
-                                        }
-                                    }
-                                    if matches!(result, ValidityResult::Canceled) {
-                                        any_timed_out = true;
-                                    }
-                                    let proved = matches!(result, ValidityResult::Valid(_));
-                                    if !proved {
-                                        any_invalid = true;
-                                    }
-                                    // Push a verdict only for the first check
-                                    // of an Error-level op, or for any
-                                    // subsequent Invalid probe (more failing
-                                    // asserts in the same body). Valid probe
-                                    // responses are end-of-probe sentinels,
-                                    // not results — skipping them is what
-                                    // keeps `1/N queries failed` meaningful.
-                                    let push = verdict_is_query
-                                        && (is_first_check || !proved);
-                                    if push {
-                                        output.verdicts.push(Verdict::from_result(
-                                            &result,
-                                            func_name.clone(),
-                                            *query_op,
-                                        ));
-                                    }
+// Process one op: emit its banner, dispatch on kind, run any probes,
+// arm follow-up work (auto-recommends, expand-errors), and drain the
+// op's log text into the right blocks. Everything after the OpGenerator
+// yields an op happens here.
+fn handle_op<'tcx>(
+    op: Op,
+    function_opgen: &mut FunctionOpGenerator,
+    feeder: &mut Feeder<'_, 'tcx>,
+    bufs: &LogBufs,
+    output: &mut VerifyOutput,
+    mctx: &ModuleCtx,
+) -> Result<(), VirErr> {
+    emit_op_banner(feeder, &op);
 
-                                    // `check_valid_again` panics unless the
-                                    // previous result was Invalid with both
-                                    // a model and a message — that's how AIR
-                                    // stores its continuation state. Any
-                                    // other variant (Valid, Canceled,
-                                    // Invalid without a model) terminates
-                                    // the loop naturally.
-                                    let can_probe = matches!(
-                                        &result,
-                                        ValidityResult::Invalid(Some(_), Some(_), _),
-                                    );
-                                    if !can_probe {
-                                        break;
+    // The explorer always compiles an anonymous crate, so every user
+    // function's friendly name starts with `crate::`. Strip it so the
+    // verdict detail reads `main: body → valid` instead of the
+    // redundant `crate::main: body → valid`.
+    let func_name = op
+        .function
+        .as_ref()
+        .map(|f| fun_as_friendly_rust_name(&f.x.name))
+        .map(|n| n.strip_prefix("crate::").map(str::to_string).unwrap_or(n))
+        .unwrap_or_default();
+    let mut any_invalid = false;
+    let mut any_timed_out = false;
+    let mut default_prover_failed_assert_ids: Vec<AssertId> = vec![];
+    let mut retry_kind: Option<QueryOp> = None;
+    match &op.kind {
+        OpKind::Context(_, commands) => feeder.feed_all(commands),
+        OpKind::Query { commands_with_context_list, query_op, .. } => {
+            retry_kind = Some(*query_op);
+            // Upstream maps each QueryOp to a MessageLevel
+            // (`verifier.rs:1558-1563`). Recommends retries emit at
+            // Note / Warning (informational context around a real
+            // failure), not Error. Routing them through rustc at the
+            // right level is what makes the UI render them as muted
+            // notes instead of blocking errors.
+            let level = match query_op {
+                QueryOp::SpecTermination
+                | QueryOp::Body(Style::Normal)
+                | QueryOp::Body(Style::Expanded)
+                | QueryOp::Body(Style::CheckApiSafety) => MessageLevel::Error,
+                QueryOp::Body(Style::RecommendsFollowupFromError) => MessageLevel::Note,
+                QueryOp::Body(Style::RecommendsChecked) => MessageLevel::Warning,
+            };
+            // Only Error-level ops count as pass/fail queries in the
+            // verdict list. Recommends variants are diagnostic
+            // side-channels — if they fail, the reporter surfaces them
+            // as notes/warnings alongside the original error; counting
+            // them toward `N/M queries failed` would just inflate the
+            // tally with informational output.
+            let verdict_is_query = level == MessageLevel::Error;
+            for cmds in commands_with_context_list.iter() {
+                // Contextual advice that Verus attaches to certain
+                // proof obligations (e.g. loop-invariant hints). Upstream
+                // emits it once per `CheckValid` command, as a `note:`
+                // preceding the first failing probe (`verifier.rs:910`).
+                // Single-threaded wasm, so the Mutex `.lock()` is free;
+                // we clone out so we don't hold the guard across probes.
+                let hint = cmds
+                    .hint_upon_failure
+                    .lock()
+                    .expect("hint_upon_failure mutex poisoned")
+                    .clone();
+                for cmd in cmds.commands.iter() {
+                    let mut result = feeder.feed(cmd);
+                    if matches!(&**cmd, CommandX::CheckValid(_)) {
+                        // Probe for more failing asserts in the same
+                        // body via `check_valid_again`. Mirrors the
+                        // two-phase loop in Verus'
+                        // `verifier.rs:834-982`:
+                        //   1. Up to `checks_remaining` "any more
+                        //      errors" probes (upstream default:
+                        //      `--multiple-errors=2`; bumped here
+                        //      because explorer snippets are small
+                        //      and users want to see everything).
+                        //   2. When the budget runs out, flip
+                        //      `only_check_earlier=true`. That pass
+                        //      is guaranteed to terminate — AIR
+                        //      strictly shrinks the enabled-label
+                        //      set each call
+                        //      (`smt_verify.rs:149-168`) and returns
+                        //      Valid once none remain.
+                        let mut checks_remaining: u32 = 8;
+                        let mut only_check_earlier = false;
+                        let mut is_first_check = true;
+                        loop {
+                            if let ValidityResult::Invalid(_, Some(err), _) = &result {
+                                feeder.reporter.report_as(err, level);
+                                // Emit the hint right after the first
+                                // failure's error so the user sees
+                                // them grouped. Matches upstream's
+                                // first-check-only gate.
+                                if is_first_check {
+                                    if let Some(h) = &hint {
+                                        feeder
+                                            .reporter
+                                            .report_as(&h.clone().to_any(), MessageLevel::Note);
                                     }
-                                    if !only_check_earlier {
-                                        checks_remaining -= 1;
-                                        if checks_remaining == 0 {
-                                            only_check_earlier = true;
-                                        }
-                                    }
-                                    is_first_check = false;
-                                    result = feeder.air_ctx.check_valid_again(
-                                        feeder.reporter,
-                                        only_check_earlier,
-                                        Default::default(),
-                                    );
                                 }
-                                feeder.air_ctx.finish_query();
                             }
+                            // Only DefaultProver failures get
+                            // expand-errors; Nonlinear / BitVector
+                            // use solver paths the expansion
+                            // machinery doesn't cover.
+                            if let ValidityResult::Invalid(_, _, Some(id)) = &result {
+                                if cmds.prover_choice == ProverChoice::DefaultProver {
+                                    default_prover_failed_assert_ids.push(id.clone());
+                                }
+                            }
+                            if matches!(result, ValidityResult::Canceled) {
+                                any_timed_out = true;
+                            }
+                            let proved = matches!(result, ValidityResult::Valid(_));
+                            if !proved {
+                                any_invalid = true;
+                            }
+                            // Push a verdict only for the first check
+                            // of an Error-level op, or for any
+                            // subsequent Invalid probe (more failing
+                            // asserts in the same body). Valid probe
+                            // responses are end-of-probe sentinels,
+                            // not results — skipping them is what
+                            // keeps `1/N queries failed` meaningful.
+                            let push = verdict_is_query && (is_first_check || !proved);
+                            if push {
+                                output.verdicts.push(Verdict::from_result(
+                                    &result,
+                                    func_name.clone(),
+                                    *query_op,
+                                ));
+                            }
+
+                            // `check_valid_again` panics unless the
+                            // previous result was Invalid with both
+                            // a model and a message — that's how AIR
+                            // stores its continuation state. Any
+                            // other variant (Valid, Canceled,
+                            // Invalid without a model) terminates
+                            // the loop naturally.
+                            let can_probe = matches!(
+                                &result,
+                                ValidityResult::Invalid(Some(_), Some(_), _),
+                            );
+                            if !can_probe {
+                                break;
+                            }
+                            if !only_check_earlier {
+                                checks_remaining -= 1;
+                                if checks_remaining == 0 {
+                                    only_check_earlier = true;
+                                }
+                            }
+                            is_first_check = false;
+                            result = feeder.air_ctx.check_valid_again(
+                                feeder.reporter,
+                                only_check_earlier,
+                                Default::default(),
+                            );
                         }
+                        feeder.air_ctx.finish_query();
                     }
                 }
             }
-            // Auto-recommends: on a failed Normal body or spec-termination
-            // query, enqueue recommends-retry ops. Mirrors the trigger in
-            // Verus' `verifier.rs:1829-1879`.
-            if any_invalid
-                && matches!(
-                    retry_kind,
-                    Some(QueryOp::Body(Style::Normal)) | Some(QueryOp::SpecTermination)
-                )
-            {
-                function_opgen.retry_with_recommends(&op, /* from_error */ true)?;
-            }
-            // Arm expand-errors on a failed Normal body. Driver starts here;
-            // subsequent loop iterations feed its sub-queries in via
-            // `expand_errors_next` at the top. Gated by the user-facing
-            // "Expand errors" toggle — skipping the sub-queries shaves a
-            // couple hundred ms per failed query in the browser.
-            if mctx.expand_errors
-                && matches!(retry_kind, Some(QueryOp::Body(Style::Normal)))
-                && any_invalid
-                && !default_prover_failed_assert_ids.is_empty()
-            {
-                function_opgen.start_expand_errors_if_possible(
-                    &op,
-                    default_prover_failed_assert_ids[0].clone(),
-                );
-            }
-            // Report the outcome of each Expanded sub-query so the driver
-            // advances through the conjunct tree. Pass/Fail/Timeout controls
-            // which branch the next sub-query descends into.
-            if matches!(retry_kind, Some(QueryOp::Body(Style::Expanded))) {
-                let res = if any_timed_out {
-                    ExpandErrorsResult::Timeout
-                } else if any_invalid {
-                    ExpandErrorsResult::Fail
-                } else {
-                    ExpandErrorsResult::Pass
-                };
-                function_opgen.report_expand_error_result(res);
-            }
-            // Drain this op's text. Mirrors `push_item`'s VIR/SST rule:
-            // fold iff the op isn't local user code — context ops for
-            // external crates (vstd function-axioms / specs) and
-            // no-function setup ops (broadcasts, trait-impl axioms)
-            // collapse into the prelude row; context ops for local
-            // functions and queries (always tied to a local function)
-            // stay expanded so the reader sees the actual check-sat
-            // bodies and their immediate setup. `drain_block` merges
-            // adjacent folded blocks so vstd runs stay as one row.
-            let fold = op.function.as_ref().is_none_or(|f| f.x.name.path.krate.is_some());
-            bufs.drain_block(&mut output.air_blocks, fold);
         }
     }
+    // Auto-recommends: on a failed Normal body or spec-termination
+    // query, enqueue recommends-retry ops. Mirrors the trigger in
+    // Verus' `verifier.rs:1829-1879`.
+    if any_invalid
+        && matches!(
+            retry_kind,
+            Some(QueryOp::Body(Style::Normal)) | Some(QueryOp::SpecTermination)
+        )
+    {
+        function_opgen.retry_with_recommends(&op, /* from_error */ true)?;
+    }
+    // Arm expand-errors on a failed Normal body. Driver starts here;
+    // subsequent loop iterations feed its sub-queries in via
+    // `expand_errors_next` at the top. Gated by the user-facing
+    // "Expand errors" toggle — skipping the sub-queries shaves a
+    // couple hundred ms per failed query in the browser.
+    if mctx.expand_errors
+        && matches!(retry_kind, Some(QueryOp::Body(Style::Normal)))
+        && any_invalid
+        && !default_prover_failed_assert_ids.is_empty()
+    {
+        function_opgen.start_expand_errors_if_possible(
+            &op,
+            default_prover_failed_assert_ids[0].clone(),
+        );
+    }
+    // Report the outcome of each Expanded sub-query so the driver
+    // advances through the conjunct tree. Pass/Fail/Timeout controls
+    // which branch the next sub-query descends into.
+    if matches!(retry_kind, Some(QueryOp::Body(Style::Expanded))) {
+        let res = if any_timed_out {
+            ExpandErrorsResult::Timeout
+        } else if any_invalid {
+            ExpandErrorsResult::Fail
+        } else {
+            ExpandErrorsResult::Pass
+        };
+        function_opgen.report_expand_error_result(res);
+    }
+    // Drain this op's text. Mirrors `push_item`'s VIR/SST rule: fold
+    // iff the op isn't local user code — context ops for external
+    // crates (vstd function-axioms / specs) and no-function setup ops
+    // (broadcasts, trait-impl axioms) collapse into the prelude row;
+    // context ops for local functions and queries (always tied to a
+    // local function) stay expanded so the reader sees the actual
+    // check-sat bodies and their immediate setup. `drain_block`
+    // merges adjacent folded blocks so vstd runs stay as one row.
+    let fold = op.function.as_ref().is_none_or(|f| f.x.name.path.krate.is_some());
+    bufs.drain_block(&mut output.air_blocks, fold);
     Ok(())
 }
 
