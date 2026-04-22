@@ -21,11 +21,11 @@ The full [Verus](https://verus-lang.github.io/verus/) pipeline running in-browse
 
 ## Implementation
 
-- **Z3** — unmodified source, compiled to wasm with Emscripten.
-- **rustc** — lightly patched for wasm32-host compilation and proc-macro registration.
-- **Verus** — small `pub` / `pub(crate)` exposures, plus a new `Verifier::build_bucket_preamble` helper shared between `verify_bucket` (native) and the explorer so the preamble stays lock-step. All IR construction (`vir` / `air` / `rust_verify`) runs upstream-as-is.
-- **verus-explorer (wasm crate)** — drives the pipeline inside the browser: its own `run_queries` driver for per-op log drainage, a custom `Reporter` that routes diagnostics through rustc's channels, and in-memory log writers in place of file-based ones. `verify_bucket` is monolithic with no per-op hooks, so we drive `OpGenerator` directly instead of calling it.
-- **verus-explorer (frontend)** — the page itself: CodeMirror 6 source + output editors with custom syntax modes for each IR stage, tab/subtab navigation, fold-state management, span-link decorations, diagnostic rendering, and URL-hash share wiring.
+- [**Z3**](https://github.com/Z3Prover/z3/tree/z3-4.16.0) — unmodified source, compiled to wasm with Emscripten.
+- [**rustc**](https://github.com/rust-lang/rust/compare/1.94.0...ShawnZhong:rust:main) — lightly patched for wasm32-host compilation and proc-macro registration.
+- [**Verus**](https://github.com/verus-lang/verus/compare/release/0.2026.04.19.6f7d4de...ShawnZhong:verus:main) — small `pub` / `pub(crate)` exposures, plus a new `Verifier::build_bucket_preamble` helper shared between `verify_bucket` (native) and the explorer so the preamble stays lock-step. All IR construction (`vir` / `air` / `rust_verify`) runs upstream-as-is.
+- [**verus-explorer (wasm crate)**](verus-explorer) — drives the pipeline inside the browser: its own `run_queries` driver for per-op log drainage, a custom `Reporter` that routes diagnostics through rustc's channels, and in-memory log writers in place of file-based ones. `verify_bucket` is monolithic with no per-op hooks, so we drive `OpGenerator` directly instead of calling it.
+- [**verus-explorer (frontend)**](public) — the page itself: CodeMirror 6 source + output editors with custom syntax modes for each IR stage, tab/subtab navigation, fold-state management, span-link decorations, diagnostic rendering, and URL-hash share wiring.
 
 ## Project layout
 
