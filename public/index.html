@@ -1356,8 +1356,14 @@
         sectionFold,
         bannerLines,
         spanLinks,
+        // `readOnly` rejects edit transactions; `editable.of(false)`
+        // would set `contenteditable=false` which breaks Select-All and
+        // text selection on some browsers, so we skip it.
         EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
+        // Identifier-shaped IR output is not English prose — disable the
+        // browser's spellcheck to lose the red squiggles and save CPU
+        // on multi-thousand-line dumps.
+        EditorView.contentAttributes.of({ spellcheck: 'false' }),
         ...(dark ? [oneDark] : []),
       ],
     });
