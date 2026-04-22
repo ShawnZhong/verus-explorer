@@ -1,35 +1,31 @@
 # verus-explorer
 
-Browser-based explorer for the [Verus](https://verus-lang.github.io/verus/) verifier's internal pipeline. Paste Rust, see the verdict, and inspect every IR stage — rustc AST/HIR, Verus VIR/SST, AIR, SMT, Z3 responses — live in the page. No server, no install; everything runs in-browser via a patched rustc-in-wasm and a wasm build of Z3.
+The full [Verus](https://verus-lang.github.io/verus/) pipeline running in-browser via wasm — no install, no backend. Pick an example, watch every IR from rustc AST through Z3 update live as you type. Aimed at learners, educators, people debugging or reviewing Verus proofs, and contributors poking at the verifier internals.
 
 **[▶ Try it live](https://shawnzhong.github.io/verus-explorer/)** — no setup required.
 
 <a href="https://shawnzhong.github.io/verus-explorer/">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-    <img src="docs/screenshot-light.png" alt="verus-explorer screenshot — click to try live">
+    <source media="(prefers-color-scheme: dark)" srcset="public/screenshot-dark.png">
+    <img src="public/screenshot-light.png" alt="verus-explorer screenshot — click to try live">
   </picture>
 </a>
 
-## Quick start
+## Features
 
-```sh
-make dev serve       # build into dist/, serve http://localhost:8000
-```
+**Pipeline coverage.** Every IR stage is its own tab — rustc AST (parsed & expanded), rustc HIR (untyped & typed), Verus VIR/SST (incl. polymorphism-simplified), AIR (initial, SSA, flat), and SMT-LIB2 queries + Z3 responses. Plus a per-query pass/fail Verdict summary.
 
-Open the page, edit code on the left, and watch each stage update on the right. Auto-verify fires ~800ms after each keystroke; `Cmd+Enter` forces a run.
+**Reading & debugging.** Every `<input.rs>:L:C` span in every IR tab is clickable and scrolls the source editor to the exact line. In AIR/SMT/Z3, each `Function-Def` / `Function-Specs` / `Function-Axioms` op gets its own collapsible block with a `;; <label> <span>` banner — vstd-crate items fold by default, local-crate items stay expanded. Rustc errors surface as inline squiggles on the source editor with hover tooltips and a diagnostics pane, same as `cargo verify`; an **Expand errors** toggle turns on Verus' sub-conjunct expansion so a failed compound assertion reports which specific piece broke.
 
-## What you see
+**Editing & sharing.** Auto-verify ~500ms after each keystroke (toggleable); `Cmd+Enter` forces a run. Per-stage timings show in the subtab row so you can see which stage dominates. A dropdown preloads examples (arithmetic, loop invariants, recursion, requires/ensures, collections, structs with invariants). The URL hash encodes the current source (gzip + base64url) — share a link and someone else opens at the exact same state.
 
-| Tab           | What it is                                                                              |
-|---------------|-----------------------------------------------------------------------------------------|
-| Rust IR       | rustc output — `AST` / `Expanded AST` (after `verus!`) / `HIR` / `Typed HIR` (post-typeck) |
-| Verus IR      | Verus VIR / SST — `AST`, `SST`, `Mono` (SST after polymorphism simplification)          |
-| Assert IR     | Verus AIR — `Blocks` → `SSA` → `Flat` lowerings                                         |
-| Z3 Solver     | `Query` (SMT-LIB2 sent to Z3) and `Response` (sat / unsat / model)                      |
-| Verdict       | Per-query pass/fail summary under the editor                                            |
+## Implementation
 
-Every item in VIR / SST / AIR / SMT carries a `;; <input.rs>:L:C` comment; click the span to jump the source editor to that position.
+- **Z3** — unmodified source, compiled to wasm with Emscripten.
+- **rustc** — lightly patched for wasm32-host compilation and proc-macro registration.
+- **Verus** — small `pub` / `pub(crate)` exposures, plus a new `Verifier::build_bucket_preamble` helper shared between `verify_bucket` (native) and the explorer so the preamble stays lock-step. All IR construction (`vir` / `air` / `rust_verify`) runs upstream-as-is.
+- **verus-explorer (wasm crate)** — drives the pipeline inside the browser: its own `run_queries` driver for per-op log drainage, a custom `Reporter` that routes diagnostics through rustc's channels, and in-memory log writers in place of file-based ones. `verify_bucket` is monolithic with no per-op hooks, so we drive `OpGenerator` directly instead of calling it.
+- **verus-explorer (frontend)** — the page itself: CodeMirror 6 source + output editors with custom syntax modes for each IR stage, tab/subtab navigation, fold-state management, span-link decorations, diagnostic rendering, and URL-hash share wiring.
 
 ## Project layout
 
@@ -41,7 +37,6 @@ scripts/editor/         CodeMirror 6 bundle entry (esbuild input)
 scripts/screenshot/     Playwright hero-image generator
 third_party/verus/      Verus source tree, patched for in-browser use
 third_party/rust/       Patched rustc (built once via `make host-rust`)
-docs/                   architecture.md, overview.md, roadmap.md
 Cargo.toml              Workspace manifest (members + shared profiles)
 Makefile                All build/serve/deploy targets
 ```
@@ -66,13 +61,6 @@ make deploy       # release + push dist/ to origin/gh-pages
 make clean        # cargo / wasm-libs / wasm-z3 (keeps host-rust)
 make clean-host   # nuke patched rustc + host verus (slow to rebuild)
 ```
-
-## Further reading
-
-- [`docs/overview.md`](docs/overview.md) — data flow through the pipeline
-- [`docs/architecture.md`](docs/architecture.md) — per-component detail
-- [`docs/roadmap.md`](docs/roadmap.md) — what's next
-- [`AGENTS.md`](AGENTS.md) — contribution conventions
 
 ## Acknowledgments
 

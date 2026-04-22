@@ -8,7 +8,7 @@
 //   (cd scripts && npm install && npx playwright install chromium)
 //   (cd scripts && node screenshot.mjs)
 //
-// Writes ../docs/screenshot-{light,dark}.png. Waits for the verdict
+// Writes ../public/screenshot-{light,dark}.png. Waits for the verdict
 // section so the screenshots capture a completed verify, not the
 // cold-load state.
 
@@ -16,8 +16,8 @@ import { chromium } from 'playwright';
 import { mkdirSync } from 'fs';
 
 const SERVE_URL = process.env.URL || 'http://localhost:8000';
-// Script runs from scripts/screenshot/; write into project-root docs/.
-const outDir = new URL('../../docs/', import.meta.url).pathname;
+// Script runs from scripts/screenshot/; write into project-root public/.
+const outDir = new URL('../../public/', import.meta.url).pathname;
 
 mkdirSync(outDir, { recursive: true });
 
