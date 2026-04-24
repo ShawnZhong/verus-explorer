@@ -661,8 +661,7 @@ const renderSubtabs = () => {
 // color as a constant rather than a plain variable.
 const SEXP_ATOMS = new Set([
   'true', 'false',
-  'sat', 'unsat', 'unknown',            // Z3 `(check-sat)` / `(get-*)` replies
-  'RNA', 'RNE', 'RTN', 'RTP', 'RTZ',    // IEEE-754 rounding modes
+  'sat', 'unsat', 'unknown',   // Z3 `(check-sat)` / `(get-*)` replies
 ]);
 // Shared tokenizer for every parenthesized IR tab (AIR, SMT, Z3, VIR,
 // SST). Two things carry coloring:

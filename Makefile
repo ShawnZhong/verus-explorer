@@ -21,7 +21,7 @@
 #   target/libs/          browser-shipped bundle (shared rmetas at root, mode-specific under std/ and nostd/, + .gz siblings)
 #   target/wasm-z3/       z3.{js,wasm} for the in-browser SMT runtime
 
-.PHONY: dev release serve deploy test libs-sysroot libs-vir libs clean clean-host clean-dist
+.PHONY: dev release serve deploy test libs clean clean-host clean-dist
 
 DIST  := dist
 WASM_Z3 := target/wasm-z3
@@ -52,25 +52,15 @@ export RUSTC := $(CURDIR)/target/host-rust/bin/rustc
 # tags. Emscripten's MODULARIZE glue resolves z3.wasm relative to z3.js's
 # own `document.currentScript?.src`, so the subfolder move is transparent
 # as long as `public/index.html` loads `./z3/z3.js`.
+# `dev` + `release` share a recipe, differing only in the wasm-pack
+# profile flag (`$@` expands to the invoked target name). `rm -f
+# dist/{package.json,.gitignore}` drops the bundler-flavored files
+# wasm-pack emits for npm publish — noise for static-site hosting.
+# The libs staging copies only the gzipped siblings; raw rmetas stay
+# in target/libs/ for tests/smoke.rs.
 dev release: $(DIST)/public.stamp $(DIST)/editor.js $(DIST)/z3/z3.js $(DIST)/z3/z3.wasm libs
-	# wasm-pack resolves `--out-dir` relative to the crate it's building,
-	# so pass an absolute path — otherwise the bundle lands in
-	# `verus-explorer/dist/` instead of the top-level `dist/`.
 	wasm-pack build verus-explorer --$@ --target web --out-dir $(CURDIR)/$(DIST) --no-typescript
-	# wasm-pack always drops a bundler-flavored `package.json` + `.gitignore`
-	# next to the wasm/js (for `npm publish`). We're shipping static files
-	# to GitHub Pages, so both are noise — remove them so `dist/` stays a
-	# clean browser-servable tree.
 	rm -f $(DIST)/package.json $(DIST)/.gitignore
-	# Copy the pre-gzipped libs bundle assembled by the `libs` target
-	# into dist/. Structure mirrored from target/libs/: shared `.gz`
-	# rmetas at the root, mode-specific under `std/` and `nostd/`.
-	# The browser fetches `${name}.gz` from here and decompresses via
-	# `DecompressionStream('gzip')` before handing the bytes to
-	# `wasm_libs_add_file`; the file list is in `public/index.html`.
-	# Originals stay in `target/libs/` for `tests/smoke.rs` + manual
-	# re-runs. Stable profile-independent source path, so debug +
-	# release share it.
 	rm -rf $(DIST)/libs
 	mkdir -p $(DIST)/libs/std $(DIST)/libs/nostd
 	cp $(LIBS_DIR)/*.gz $(DIST)/libs/
@@ -102,96 +92,25 @@ $(HOST_VERUS_BIN):
 	./scripts/build-host-verus.sh
 host-verus: $(HOST_VERUS_BIN)
 
-# libs-sysroot: stage1 check rmetas + verus_builtin + macro stubs,
-# staged into target/libs-sysroot/. The heavy step (`x.py check`) is
-# already incremental internally; build-libs-sysroot.sh also does a
-# `rm -rf + repopulate`, so every file in the sysroot lib dir has the
-# same mtime after a successful run — making libcore.rmeta a faithful
-# witness for the whole sysroot layout.
-SYSROOT_LIB := target/libs-sysroot/lib/rustlib/wasm32-unknown-unknown/lib
-SYSROOT_WITNESS := $(SYSROOT_LIB)/libcore.rmeta
-
-# vstd source tree — any edit here forces `libs-vir` to rebuild both
-# std and nostd variants. `$(shell find ...)` evaluates at make parse
-# time, so new files appear as dependencies after they're added.
+# libs pipeline: single stamp target, orchestration lives in
+# `scripts/build-libs.sh` (which calls build-libs-sysroot.sh,
+# build-libs-vir.sh std, build-libs-vir.sh nostd, then assembles the
+# browser bundle). Dep list is the union of every script input that
+# could invalidate the bundle — when any of these is newer than
+# $(LIBS_STAMP), Make re-runs the orchestrator which rebuilds every
+# stage unconditionally. Stages don't need their own stamps because
+# they always rebuild together on any upstream change.
 VSTD_SOURCES := $(shell find third_party/verus/source/vstd -name '*.rs' 2>/dev/null)
-
-# libs-sysroot's non-x.py inputs: verus_builtin + the two macro stub
-# crates. Edits here trigger a resysroot even when the rust source
-# tree is untouched.
 SYSROOT_EXTRA_SOURCES := $(shell find third_party/verus/source/builtin \
     third_party/verus/source/builtin_macros \
     third_party/verus/source/state_machines_macros \
     -name '*.rs' 2>/dev/null)
-
-$(SYSROOT_WITNESS): $(HOST_RUST_BIN) $(SYSROOT_EXTRA_SOURCES) scripts/build-libs-sysroot.sh
-	./scripts/build-libs-sysroot.sh
-
-libs-sysroot: $(SYSROOT_WITNESS)
-
-# Produce libvstd.rmeta + vstd.vir into target/libs-vir/{std,nostd}/ via
-# rust_verify against the staged sysroot — one run per mode. `std`
-# builds vstd with `feature="alloc"` + `feature="std"` (PPtr::new,
-# HashMap, println! resolve; user code isn't `#![no_std]`); `nostd`
-# builds with just `feature="alloc"` (faster verify, smaller bundle).
-# `public/index.html`'s URL-param toggle picks which of the two the
-# browser fetches.
-#
-# Per-mode stamp file witnesses the pair (libvstd.rmeta + vstd.vir).
-# Stamp-based rather than grouped-target (`&:`) so this works on the
-# macOS-shipped GNU Make 3.81 too. The stamp lives inside the mode dir
-# so the script's own `rm -rf "$out"` + `mkdir -p` wipes it on every
-# rebuild, keeping its mtime aligned with the rmeta + vir siblings.
-target/libs-vir/std/.stamp: $(HOST_VERUS_BIN) $(SYSROOT_WITNESS) $(VSTD_SOURCES) scripts/build-libs-vir.sh
-	./scripts/build-libs-vir.sh std
-	@touch $@
-
-target/libs-vir/nostd/.stamp: $(HOST_VERUS_BIN) $(SYSROOT_WITNESS) $(VSTD_SOURCES) scripts/build-libs-vir.sh
-	./scripts/build-libs-vir.sh nostd
-	@touch $@
-
-libs-vir: target/libs-vir/std/.stamp target/libs-vir/nostd/.stamp
-
-# Assemble the browser-shipped bundle at target/libs/. Layout:
-#     target/libs/
-#       lib<shared>.rmeta[.gz]     # needed by both modes
-#       std/lib<std-only>.rmeta[.gz] + libvstd.rmeta[.gz] + vstd.vir[.gz]
-#       nostd/libvstd.rmeta[.gz] + vstd.vir[.gz]
-# Shared files sit at the root so they're fetched once regardless of
-# mode; the mode-specific subdirs hold the pieces that differ. libstd
-# and its wasm32 dep chain live under std/ because only std mode loads
-# them (rustc's crate locator walks libstd's declared deps eagerly, so
-# they're eager; nostd mode doesn't pull libstd at all).
-#
-# `cp -l` hardlinks (sysroot-built rmetas are immutable, so the link
-# is safe and costs zero disk). `gzip -kf9` keeps the raw files for
-# tests/smoke.rs, overwrites stale `.gz` siblings, picks the smallest
-# output. `rm -rf` stays so removing an entry from LIBS_SHARED /
-# LIBS_STD_ONLY doesn't leave stale `.rmeta(.gz)` siblings in place.
-# Stamp witness lives inside $(LIBS_DIR) so it's wiped + recreated on
-# every rebuild, keeping its mtime aligned with the bundle contents.
 LIBS_DIR   := target/libs
 LIBS_STAMP := $(LIBS_DIR)/.stamp
-LIBS_SHARED := libcore.rmeta liballoc.rmeta libcompiler_builtins.rmeta \
-               libverus_builtin.rmeta libverus_builtin_macros.rmeta \
-               libverus_state_machines_macros.rmeta
-# std mode's additional sysroot rmetas (libstd + its wasm32 dep chain).
-LIBS_STD_ONLY := libstd.rmeta libcfg_if.rmeta libdlmalloc.rmeta \
-                 libhashbrown.rmeta liblibc.rmeta librustc_demangle.rmeta \
-                 librustc_std_workspace_alloc.rmeta \
-                 librustc_std_workspace_core.rmeta libstd_detect.rmeta \
-                 libunwind.rmeta
-$(LIBS_STAMP): $(SYSROOT_WITNESS) \
-		target/libs-vir/std/.stamp target/libs-vir/nostd/.stamp
-	rm -rf $(LIBS_DIR)
-	mkdir -p $(LIBS_DIR)/std $(LIBS_DIR)/nostd
-	for f in $(LIBS_SHARED); do cp -l $(SYSROOT_LIB)/$$f $(LIBS_DIR)/$$f; done
-	for f in $(LIBS_STD_ONLY); do cp -l $(SYSROOT_LIB)/$$f $(LIBS_DIR)/std/$$f; done
-	cp target/libs-vir/std/libvstd.rmeta target/libs-vir/std/vstd.vir $(LIBS_DIR)/std/
-	cp target/libs-vir/nostd/libvstd.rmeta target/libs-vir/nostd/vstd.vir $(LIBS_DIR)/nostd/
-	gzip -kf9 $(LIBS_DIR)/*.rmeta \
-	          $(LIBS_DIR)/std/*.rmeta $(LIBS_DIR)/std/vstd.vir \
-	          $(LIBS_DIR)/nostd/*.rmeta $(LIBS_DIR)/nostd/vstd.vir
+$(LIBS_STAMP): $(HOST_RUST_BIN) $(HOST_VERUS_BIN) \
+		$(VSTD_SOURCES) $(SYSROOT_EXTRA_SOURCES) \
+		scripts/build-libs.sh scripts/build-libs-sysroot.sh scripts/build-libs-vir.sh
+	./scripts/build-libs.sh
 	@touch $@
 
 libs: $(LIBS_STAMP)
@@ -199,8 +118,13 @@ libs: $(LIBS_STAMP)
 $(DIST)/z3/z3.%: $(WASM_Z3)/z3.% | $(DIST)
 	mkdir -p $(DIST)/z3
 	cp $< $@
+# Short git hash baked into the dist copy of index.html, so the header's
+# "Code" link lands on the exact deployed source tree. `|| echo main`
+# fallback covers the rare `make` run outside a git checkout.
+GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo main)
 $(DIST)/public.stamp: $(PUBLIC_FILES) | $(DIST)
 	cp -R public/. $(DIST)/
+	sed -i '' "s|__COMMIT__|$(GIT_HASH)|g" $(DIST)/index.html
 	@touch $@
 
 # Bundle CodeMirror 6 straight into `$(DIST)/editor.js` via esbuild. The
