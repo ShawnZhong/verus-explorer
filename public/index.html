@@ -5,6 +5,18 @@
   <meta charset="utf-8" />
   <title>Verus Explorer — every stage of Verus, from source to solver</title>
   <link rel="stylesheet" href="./styles.css" />
+  <!-- Hint the browser to start the heaviest cold-load fetches during
+       HTML parse, before the module script below executes. `as="fetch"
+       crossorigin` matches the default mode/credentials of the later
+       `fetch(url)` calls so the preloaded response is reused, not
+       duplicated. Only the always-loaded pieces appear here — mode-
+       specific libs (std vs nostd vstd/vstd.vir) stay off the list
+       because we don't know stdMode until JS reads the URL param. -->
+  <link rel="preload" as="fetch" href="./verus_explorer_bg.wasm" crossorigin>
+  <link rel="preload" as="fetch" href="./z3/z3.wasm" crossorigin>
+  <link rel="preload" as="fetch" href="./libs/libcore.rmeta.gz" crossorigin>
+  <link rel="preload" as="fetch" href="./libs/liballoc.rmeta.gz" crossorigin>
+  <link rel="preload" as="fetch" href="./libs/libcompiler_builtins.rmeta.gz" crossorigin>
 </head>
 
 <body>

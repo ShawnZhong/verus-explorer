@@ -436,42 +436,41 @@ fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
 
 // `--sysroot=/virtual` pairs with the filesearch callbacks installed by
 // `wasm_libs_finalize` — rustc's crate locator finds `libcore.rmeta` (and
-// friends), plus our prebuilt `libverus_builtin.rmeta`, in the libs
-// bundle instead of on disk. `#![no_std]` keeps std out (only `core` is
-// needed), and the caller prepends `extern crate verus_builtin;` so that
-// crate is linked and its `#[rustc_diagnostic_item]` registrations fire —
-// Verus keys its builtin lookups off those.
+// friends), plus our prebuilt `libverus_builtin.rmeta`, in the libs bundle
+// instead of on disk. `#![no_std]` keeps std out (only `core` is needed).
 fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
-    let mut argv: Vec<&'static str> = vec![
-        "--edition=2021",
-        "--crate-type=lib",
-        "--crate-name=v",
-        "--sysroot=/virtual",
-        // `--extern=vstd` puts vstd in the edition-2018+ extern prelude so
-        // user code can `use vstd::prelude::*;` directly. We used to prepend
-        // `extern crate vstd;\n` to the source instead, but that shifted
-        // every diagnostic's line number by one — breaking the in-editor
-        // error-line highlight. No `=PATH` needed: rustc's crate locator
-        // finds `libvstd.rmeta` via the libs sysroot bundle.
-        "--extern=vstd",
-        "-Zcrate-attr=feature(register_tool)",
-        // `verus!` expansion emits `#[...]` attributes on expressions
-        // (e.g. `#[verus::internal(...)] foo`) — unstable without this.
-        "-Zcrate-attr=feature(stmt_expr_attributes)",
+    // Put `vstd` and `verus_builtin` in the edition-2018+ extern prelude so
+    // user code can `use vstd::prelude::*;` / `use verus_builtin::*;` directly
+    // — same flags native Verus's driver and test harness pass. We used to
+    // prepend `extern crate vstd;\n` to the source, but that shifted every
+    // diagnostic's line number by one, breaking the editor's error-line
+    // highlight. No `=PATH` needed: rustc's crate locator finds the rmetas
+    // via the libs sysroot bundle.
+    let mut argv: Vec<String> = ["--edition=2021", "--crate-type=lib", "--crate-name=v",
+        "--sysroot=/virtual", "--extern=vstd", "--extern=verus_builtin"]
+        .into_iter().map(String::from).collect();
+    // Feature gates, `register_tool(...)`, and the native subset of lint
+    // allows come straight from `rust_verify::config`, so any upstream rustc
+    // flag drift tracks automatically instead of requiring a hand-maintained
+    // mirror. `syntax_macro = true` because user input always runs through
+    // `verus!`; `erase_ghost = false` is currently ignored by the function.
+    rust_verify::config::enable_default_features_and_verus_attr(
+        &mut argv, /* syntax_macro */ true, /* erase_ghost */ false,
+    );
+    // Explorer-specific additions on top of the upstream set:
+    //   * `proc_macro_hygiene` — the wasm shim registers Verus macros via
+    //     `rustc_metadata::proc_macro_registry` (see `init`) instead of
+    //     dlopen'ing a host dylib; this gate keeps rustc from rejecting the
+    //     resulting hygiene pattern.
+    //   * Extra `-A lint` flags for false positives observed on standalone
+    //     snippets that aren't wired into a larger crate (the native driver
+    //     doesn't suppress these because cargo's own rustc run does).
+    argv.extend([
         "-Zcrate-attr=feature(proc_macro_hygiene)",
-        "-Zcrate-attr=register_tool(verus)",
-        "-Zcrate-attr=register_tool(verifier)",
-        // `verus!` macro expansion triggers a pile of rustc lints that are
-        // false positives against the *source* (e.g. `unused_parens` on
-        // `x * (x - 1)` where dropping the parens changes precedence;
-        // `non_shorthand_field_patterns` on `MyStruct { f }` rewritten to
-        // `{ f: f }`). This is the same list Verus's own driver suppresses
-        // — see `rust_verify/src/driver.rs`.
-        "-Aunused_imports", "-Aunused_variables", "-Aunused_assignments",
-        "-Aunreachable_patterns", "-Aunused_parens", "-Aunused_braces",
-        "-Adead_code", "-Aunreachable_code", "-Aunused_mut", "-Aunused_labels",
+        "-Aunused_variables", "-Aunused_assignments", "-Aunreachable_patterns",
+        "-Adead_code", "-Aunreachable_code", "-Aunused_labels",
         "-Aunused_attributes", "-Anon_shorthand_field_patterns",
-    ];
+    ].into_iter().map(String::from));
     // Nostd mode: inject `#![no_std]` at the crate root so rustc bypasses
     // the std prelude. The JS loader fetches a vstd variant built with
     // `feature="alloc"` but NOT `feature="std"`, so user code can still
@@ -479,9 +478,8 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
     // (default) omits the attr; rustc then injects the std prelude and
     // the full-fat vstd bundle is active.
     if !std_mode() {
-        argv.push("-Zcrate-attr=no_std");
+        argv.push("-Zcrate-attr=no_std".into());
     }
-    let argv: Vec<String> = argv.into_iter().map(String::from).collect();
 
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = rustc_driver::handle_options(&early_dcx, &argv).expect("handle_options");
@@ -524,13 +522,26 @@ fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
                 ColorConfig::Never,
             );
             psess.dcx().set_emitter(Box::new(MultiEmitter { human, json }));
-            // `verus_keep_ghost` alone keeps ghost *stubs* (enough for typeck)
-            // but the `verus!` proc-macro's `cfg_erase()` strips ghost bodies
-            // unless `verus_keep_ghost_body` is also on — see
-            // builtin_macros/src/lib.rs. `cfg_erase` evaluates these via
-            // `expand_expr`, which reads `psess.config`.
+            // Mirrors the `--cfg` flags native Verus passes in its verify
+            // phase (`rust_verify/src/driver.rs:270-274`). We can't add these
+            // via `--cfg` in argv because rustc's `parse_cfg` would construct
+            // a fresh `ParseSess` with the default `RealFileLoader` and
+            // `current_directory()` traps on wasm32 (same reason `crate_cfg`
+            // is kept empty above).
+            //
+            //  * `verus_keep_ghost` keeps ghost *stubs* through typeck; alone,
+            //    the `verus!` proc-macro's `cfg_erase()` still strips ghost
+            //    bodies — see builtin_macros/src/lib.rs. `cfg_erase` evaluates
+            //    these via `expand_expr`, which reads `psess.config`.
+            //  * `verus_keep_ghost_body` keeps those bodies too, so VIR
+            //    construction has real code to lower.
+            //  * `verus_only` is user-facing: `#[cfg(verus_only)]` / attrs
+            //    like `#[cfg_attr(verus_only, verus::loop_isolation(false))]`.
+            //    Omit and pasted Verus snippets silently hit the
+            //    `not(verus_only)` branch.
             psess.config.insert((Symbol::intern("verus_keep_ghost"), None));
             psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
+            psess.config.insert((Symbol::intern("verus_only"), None));
         })),
         hash_untracked_state: None,
         register_lints: None,
