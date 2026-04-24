@@ -238,6 +238,13 @@ pre {
   gap: .5em 1em;
   margin-top: .5em;
 }
+/* Hold width across the Verify ↔ Verify… label swap so the row
+   doesn't reflow. Sized to fit "Verify…" with default button padding;
+   cold-load labels still push past, but the button is disabled then
+   and the one-time width shift isn't perceived as jitter. */
+#parse-run {
+  min-width: 6em;
+}
 /* Prev/next buttons flanking the example dropdown: small chevron pills
    that sit inline with the dropdown at matching height. */
 .source-nav {

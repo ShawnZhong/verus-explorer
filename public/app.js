@@ -1006,7 +1006,7 @@ const runParse = async () => {
   flushHashSave();
   const myRun = ++runId;
   parseButton.disabled = true;
-  parseButtonLabel.textContent = 'Verifying…';
+  parseButtonLabel.textContent = 'Verify…';
   sectionCache.clear();
   sectionFolds.clear();
   verdictCache = null;
@@ -1015,7 +1015,7 @@ const runParse = async () => {
   diagnostics.length = 0;
   benchCache.clear();
   z3ResponseBuffer = [];
-  // Yield to the browser so the disabled button + "Verifying…" label
+  // Yield to the browser so the disabled button + "Verify…" label
   // actually paint before `parse_source` pegs the main thread. rAF
   // schedules the callback for the next pre-paint hook; the nested
   // `setTimeout(_, 0)` defers the resume until *after* that paint has
