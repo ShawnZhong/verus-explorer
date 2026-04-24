@@ -170,7 +170,7 @@ serve:
 #   curl -sL https://nodejs.org/dist/v24.15.0/node-v24.15.0-darwin-arm64.tar.gz \
 #     | tar xz -C scripts/editor && mv scripts/editor/node-v24.15.0-darwin-arm64 scripts/editor/node
 test: $(HOST_VERUS_BIN)
-	PATH="$(CURDIR)/scripts/editor/node/bin:$$PATH" wasm-pack test verus-explorer --node
+	PATH="$(CURDIR)/scripts/editor/node/bin:$$PATH" wasm-pack test --node verus-explorer
 
 # Each deploy re-creates gh-pages as a single-commit orphan branch in dist/
 # and force-pushes, so there's no history either locally or remotely.

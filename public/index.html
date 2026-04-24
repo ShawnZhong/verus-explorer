@@ -40,12 +40,12 @@
         <button id="source-reset" class="source-reset" type="button"
                 title="Revert to the shipped example source" hidden>Reset</button>
       </div>
-      <div id="parse-input"></div>
+      <div id="source-input"></div>
       <div id="left-resizer" title="Drag to resize"></div>
-      <div id="parse-meta"></div>
+      <div id="meta-panel"></div>
       <div class="controls">
-        <button id="parse-run" disabled>
-          <span id="parse-run-label">Loading verifier…</span>
+        <button id="verify-run" disabled>
+          <span id="verify-run-label">Loading verifier…</span>
         </button>
         <label class="hint muted" title="Re-verify 500ms after each edit">
           <input type="checkbox" id="auto-verify" /> Rerun on edit
@@ -62,11 +62,11 @@
     <div id="col-resizer" title="Drag to resize"></div>
 
     <section class="pane" id="right-pane">
-      <!-- Stage tab buttons are appended into `#parse-tabs` by `renderTabs`;
+      <!-- Stage tab buttons are appended into `#output-tabs` by `renderTabs`;
            the static `.tab-actions` block lives in markup so its buttons
            aren't torn down on every tab switch, only their disabled state
            changes. `margin-left: auto` (CSS) pins it right. -->
-      <div class="output-tabs" id="parse-tabs" role="tablist">
+      <div class="output-tabs" id="output-tabs" role="tablist">
         <div class="tab-actions">
           <button class="tab-action" id="download-btn" type="button"
                   title="Download the current IR tab" disabled>Download</button>
@@ -74,8 +74,8 @@
                   title="Copy the current URL to clipboard">Copy link</button>
         </div>
       </div>
-      <div class="output-subtabs" id="parse-subtabs" role="tablist"></div>
-      <div id="parse-output-view"></div>
+      <div class="output-subtabs" id="output-subtabs" role="tablist"></div>
+      <div id="output-view"></div>
     </section>
   </main>
 

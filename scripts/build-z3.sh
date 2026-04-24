@@ -32,7 +32,7 @@ emcc -x c /dev/null "$out/libz3.a" \
     -fwasm-exceptions \
     -Oz \
     -s WASM_BIGINT \
-    -s ENVIRONMENT=web \
+    -s ENVIRONMENT=web,node \
     -s MODULARIZE=1 \
     -s EXPORT_NAME=initZ3 \
     -s EXPORTED_FUNCTIONS='["_Z3_mk_config","_Z3_mk_context","_Z3_del_config","_Z3_eval_smtlib2_string","_Z3_del_context"]' \

@@ -169,12 +169,12 @@ pre {
   margin-bottom: .4em;
   flex-wrap: wrap;
 }
-#parse-input {
+#source-input {
   flex: 1;
   min-height: 0;
   display: flex;
 }
-#parse-input .cm-editor {
+#source-input .cm-editor {
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -182,16 +182,16 @@ pre {
   border-radius: 6px;
   font-size: 13px;
 }
-#parse-input .cm-editor.cm-focused {
+#source-input .cm-editor.cm-focused {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
-#parse-output-view {
+#output-view {
   flex: 1;
   min-height: 0;
   display: flex;
 }
-#parse-output-view .cm-editor {
+#output-view .cm-editor {
   flex: 1;
   /* `min-width: 0` lets the editor shrink to its grid cell instead of
      inflating to its widest line (flex children default to
@@ -227,8 +227,8 @@ pre {
   }
   #col-resizer { display: none; }
   .pane { overflow: visible; }
-  #parse-input .cm-editor { min-height: 14em; }
-  #parse-output-view { min-height: 20em; }
+  #source-input .cm-editor { min-height: 14em; }
+  #output-view { min-height: 20em; }
 }
 
 .controls {
@@ -242,8 +242,8 @@ pre {
    doesn't reflow. Sized to fit "Verify…" with default button padding;
    cold-load labels still push past, but the button is disabled then
    and the one-time width shift isn't perceived as jitter. */
-#parse-run {
-  min-width: 6em;
+#verify-run {
+  min-width: 7em;
 }
 /* Prev/next buttons flanking the example dropdown: small chevron pills
    that sit inline with the dropdown at matching height. */
@@ -386,7 +386,7 @@ label.hint > input[type="checkbox"] {
    pane. Capped height with internal scroll so a long rustc dump
    doesn't squeeze the editor; collapses to zero when no run has
    produced a verdict yet (so the source fills the whole pane). */
-#parse-meta {
+#meta-panel {
   flex: 0 1 auto;
   max-height: 30%;
   overflow-y: auto;
@@ -407,7 +407,7 @@ label.hint > input[type="checkbox"] {
 #left-resizer:hover, #left-resizer.dragging {
   background: var(--focus-ring);
 }
-#left-pane:has(#parse-meta:empty) #left-resizer {
+#left-pane:has(#meta-panel:empty) #left-resizer {
   display: none;
 }
 

@@ -11,7 +11,7 @@
 //   - Error-line decoration in the source editor
 //   - Renderers
 //   - Rust → JS bridge
-//   - `runParse` pipeline driver
+//   - `runVerify` pipeline driver
 //   - URL hash sync
 //   - Auto-verify
 //   - CM6 source editor
@@ -99,14 +99,14 @@ const LIBS = [...LIBS_SHARED, ...(stdMode ? LIBS_STD_ONLY : LIBS_NOSTD_ONLY)];
 // editor, tab strip, and example dropdown are cheap to mount and should
 // appear immediately so the user can start reading / editing during the
 // multi-MB cold-load. `verus` stays `null` until the chain resolves;
-// the Verify button is disabled and `runParse` is a no-op until then.
+// the Verify button is disabled and `runVerify` is a no-op until then.
 // The bottom of this script `await`s `wasmReady` to flip the button
 // live and kick off the first verify.
 let verus = null;
-// z3 transcript buffer — hoisted out of the IIFE so `runParse` (which
+// z3 transcript buffer — hoisted out of the IIFE so `runVerify` (which
 // clears it at the top of each run and reads it at the bottom) sees the
 // same binding the Z3 eval wrapper pushes into. Reassigned (not just
-// cleared) by `runParse` to `[]` each run; the wrapper's closure
+// cleared) by `runVerify` to `[]` each run; the wrapper's closure
 // captures the *variable*, not the initial array, so the push keeps
 // targeting the live buffer.
 let z3ResponseBuffer = [];
@@ -114,7 +114,7 @@ let z3ResponseBuffer = [];
 // when it resolves and updates the Verify button label, so the user
 // sees "Loading 3/18 libs…" instead of a static "Loading verifier…"
 // while the multi-MB download streams in. Safe to reference
-// `parseButtonLabel` from the async callback even though the DOM
+// `verifyButtonLabel` from the async callback even though the DOM
 // ref is grabbed later in the script — the callback fires after
 // the first microtask, by which point all const declarations have
 // executed.
@@ -128,7 +128,7 @@ const wasmReady = (async () => {
       const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
       const buf = await new Response(stream).arrayBuffer();
       wasmLibsLoaded++;
-      parseButtonLabel.textContent = `Loading ${wasmLibsLoaded}/${LIBS.length} libs…`;
+      verifyButtonLabel.textContent = `Loading ${wasmLibsLoaded}/${LIBS.length} libs…`;
       // Strip the mode subdir prefix ('std/' or 'nostd/') so the
       // in-wasm crate locator sees plain `libvstd.rmeta` etc.
       const name = path.replace(/^(std|nostd)\//, '');
@@ -146,7 +146,7 @@ const wasmReady = (async () => {
   // `unsat` / errors / model output) for each batch of SMT commands sent
   // from the AIR driver. The AIR log writers capture *input* SMT-LIB2 but
   // the replies are otherwise opaque; tee them into `z3ResponseBuffer`
-  // here so `runParse` can stash the transcript as a 'Z3' section.
+  // here so `runVerify` can stash the transcript as a 'Z3' section.
   const z3Eval = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
   globalThis.Z3_eval_smtlib2_string = (ctx, query) => {
     const reply = z3Eval(ctx, query);
@@ -154,7 +154,7 @@ const wasmReady = (async () => {
     return reply;
   };
 
-  // One wasm instance, reused for every `parse_source` call. Each
+  // One wasm instance, reused for every `verify` call. Each
   // `run_compiler` builds its own Session+CStore; nothing leaks across
   // calls (confirmed by `tests/smoke.rs`). V8 JIT + rustc LazyLock entries
   // survive across calls and amortize, so #2/#3 run at ~2× #1 speed.
@@ -172,11 +172,11 @@ const wasmReady = (async () => {
 // ------------------------------------------------------------------
 // DOM refs + tiny state
 // ------------------------------------------------------------------
-const parseButton = document.getElementById('parse-run');
-const parseButtonLabel = document.getElementById('parse-run-label');
-const parseMeta = document.getElementById('parse-meta');
+const verifyButton = document.getElementById('verify-run');
+const verifyButtonLabel = document.getElementById('verify-run-label');
+const metaPanel = document.getElementById('meta-panel');
 // Drag the splitter above the diagnostics pane to reshape the left
-// column. Adjusts `#parse-meta`'s flex-basis; the editor (flex: 1)
+// column. Adjusts `#meta-panel`'s flex-basis; the editor (flex: 1)
 // absorbs the rest. Bounded below by 40px so the pane can't vanish
 // behind the handle, and above by 90% of the column so the editor
 // always has a usable strip.
@@ -190,8 +190,8 @@ const parseMeta = document.getElementById('parse-meta');
     // Strip the CSS `max-height: 30%` cap once the user drags —
     // otherwise the stylesheet rule beats the inline flex-basis
     // and the pane refuses to grow past 30% of the column.
-    parseMeta.style.maxHeight = 'none';
-    parseMeta.style.flex = `0 0 ${Math.min(maxH, Math.max(40, startH + dy))}px`;
+    metaPanel.style.maxHeight = 'none';
+    metaPanel.style.flex = `0 0 ${Math.min(maxH, Math.max(40, startH + dy))}px`;
   };
   const onUp = () => {
     resizer.classList.remove('dragging');
@@ -200,7 +200,7 @@ const parseMeta = document.getElementById('parse-meta');
   };
   resizer.addEventListener('mousedown', (e) => {
     startY = e.clientY;
-    startH = parseMeta.getBoundingClientRect().height;
+    startH = metaPanel.getBoundingClientRect().height;
     resizer.classList.add('dragging');
     document.addEventListener('mousemove', onMove);
     document.addEventListener('mouseup', onUp);
@@ -238,9 +238,9 @@ const parseMeta = document.getElementById('parse-meta');
     e.preventDefault();
   });
 }
-const parseTabsEl = document.getElementById('parse-tabs');
-const parseSubtabsEl = document.getElementById('parse-subtabs');
-const parseOutputViewEl = document.getElementById('parse-output-view');
+const outputTabsEl = document.getElementById('output-tabs');
+const outputSubtabsEl = document.getElementById('output-subtabs');
+const outputViewEl = document.getElementById('output-view');
 const sourceSelect = document.getElementById('source-select');
 const autoVerifyCheckbox = document.getElementById('auto-verify');
 const expandErrorsCheckbox = document.getElementById('expand-errors');
@@ -377,14 +377,14 @@ const lastVariantInGroup = new Map();
 // to the fold gutter so the user can refold after expanding.
 const sectionFolds = new Map();
 
-// `parse_source` always produces every IR; bodies are cached here so
+// `verify` always produces every IR; bodies are cached here so
 // flipping a tab just swaps the output-view's doc instead of re-parsing.
 const sectionCache = new Map();
 let verdictCache = null;
-// Raw buffers the wasm callbacks push into during `parse_source`.
+// Raw buffers the wasm callbacks push into during `verify`.
 // `_textDiags` holds `HumanEmitter` output (colorized terminal form);
 // `_jsonDiags` holds parsed `JsonEmitter` objects (with `spans[]`
-// carrying rustc-exact line/col ranges). `runParse` consolidates them
+// carrying rustc-exact line/col ranges). `runVerify` consolidates them
 // into the unified `diagnostics` list below once parsing returns.
 const _textDiags = [];
 const _jsonDiags = [];
@@ -426,7 +426,7 @@ const BENCH_GROUP = {
 const TAB_GROUP_BENCH = {
   Rust: 'Rust', VIR: 'VIR', AIR: 'AIR', Z3: 'Z3',
 };
-// Which IR the output view currently shows; preserved across runParse
+// Which IR the output view currently shows; preserved across runVerify
 // calls so the user doesn't lose their tab selection on every edit.
 // Null until the first successful parse; `renderTabs` picks a default.
 let currentTab = null;
@@ -516,7 +516,7 @@ const jumpToLoc = (loc) => {
 // so the eye grasps the order of magnitude without scanning digits.
 const fmtMs = (ms) => ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 const renderMeta = () => {
-  parseMeta.textContent = '';
+  metaPanel.textContent = '';
   if (verdictCache !== null) {
     const [headline, ...rest] = verdictCache.split('\n');
     const isOk = headline === 'verified';
@@ -543,7 +543,7 @@ const renderMeta = () => {
       d.textContent = detail;
       div.appendChild(d);
     }
-    parseMeta.appendChild(div);
+    metaPanel.appendChild(div);
   }
   for (const d of diagnostics) {
     const pre = document.createElement('pre');
@@ -556,7 +556,7 @@ const renderMeta = () => {
       pre.classList.add('clickable');
       pre.addEventListener('click', () => jumpToLoc(d.loc));
     }
-    parseMeta.appendChild(pre);
+    metaPanel.appendChild(pre);
   }
 };
 
@@ -569,8 +569,8 @@ const renderMeta = () => {
 const renderTabs = () => {
   // Remove old tab buttons but preserve the static `.tab-actions`
   // wrapper (and its bound click handlers) that lives in markup.
-  parseTabsEl.querySelectorAll('.tab').forEach(el => el.remove());
-  const tabActions = parseTabsEl.querySelector('.tab-actions');
+  outputTabsEl.querySelectorAll('.tab').forEach(el => el.remove());
+  const tabActions = outputTabsEl.querySelector('.tab-actions');
   const currentGroup = currentTab ? GROUP_OF.get(currentTab) : null;
   const cached = (v) => sectionCache.has(v);
   for (const g of TAB_GROUPS) {
@@ -589,7 +589,7 @@ const renderTabs = () => {
       rerender();
       writeTabToUrl();
     });
-    parseTabsEl.insertBefore(button, tabActions);
+    outputTabsEl.insertBefore(button, tabActions);
   }
   downloadBtn.disabled = !currentTab || !sectionCache.has(currentTab);
   downloadBtn.title = currentTab
@@ -607,7 +607,7 @@ const renderTabs = () => {
 // `fold: true` flag in `verus_dump` payloads — so there's no
 // separate Show-vstd toggle here.)
 const renderSubtabs = () => {
-  parseSubtabsEl.textContent = '';
+  outputSubtabsEl.textContent = '';
   const currentGroup = currentTab ? GROUP_OF.get(currentTab) : null;
   if (!currentGroup) return;
   const group = TAB_GROUPS.find(g => g.id === currentGroup);
@@ -624,7 +624,7 @@ const renderSubtabs = () => {
         rerender();
         writeTabToUrl();
       });
-      parseSubtabsEl.appendChild(button);
+      outputSubtabsEl.appendChild(button);
     }
   }
   // Right-of-subtabs status line: `stageMs / totalMs` — this tab's
@@ -641,7 +641,7 @@ const renderSubtabs = () => {
     const timing = document.createElement('div');
     timing.className = 'subtab-timing';
     timing.textContent = `${fmtMs(stageMs)} / ${fmtMs(totalMs)}`;
-    parseSubtabsEl.appendChild(timing);
+    outputSubtabsEl.appendChild(timing);
   }
 };
 
@@ -855,7 +855,7 @@ const rerender = () => { renderTabs(); renderSubtabs(); renderOutputView(); };
 // with the line-bg wash `updateErrorDecorations` applies.
 //
 // Pure: reads from the diagnostic caches and a given `doc`, returns a
-// fresh array. Used both by the post-parse dispatch in `runParse` and
+// fresh array. Used both by the post-parse dispatch in `runVerify` and
 // by the `linter(...)` source below — the latter re-fires on every
 // doc change, so returning the cached diagnostics (instead of `[]`)
 // keeps the lint field idempotent across those auto-firings.
@@ -925,7 +925,7 @@ const updateErrorDecorations = () => {
 };
 
 // ------------------------------------------------------------------
-// Rust → JS bridge. Synchronous during `parse_source`; JS is
+// Rust → JS bridge. Synchronous during `verify`; JS is
 // single-threaded, so the DOM won't actually repaint between these
 // calls. On a mid-pipeline trap the buffered caches survive the
 // unwind and `finally`-time renderers flush what's there.
@@ -985,7 +985,7 @@ globalThis.verus_z3_annotate = (label) => {
   z3ResponseBuffer.push(`;; ${label}`);
 };
 
-// Declared here (before `runParse`) so `runParse` can cancel any
+// Declared here (before `runVerify`) so `runVerify` can cancel any
 // pending auto-verify at its top — otherwise an explicit verify
 // (Verify click, example load) races with a pending 500 ms auto-
 // verify timer from a just-prior doc change and we end up double-
@@ -993,7 +993,7 @@ globalThis.verus_z3_annotate = (label) => {
 // `scheduleAutoVerify` further down.
 let autoVerifyTimer;
 let runId = 0;
-const runParse = async () => {
+const runVerify = async () => {
   // Wasm not ready yet — silently no-op. Reached only through
   // `scheduleAutoVerify` firing during cold-load (the Verify button
   // is disabled until `wasmReady` resolves, so the click path can't
@@ -1001,12 +1001,9 @@ const runParse = async () => {
   // script runs the first real verify once wasm is live.
   if (!verus) return;
   clearTimeout(autoVerifyTimer);
-  // Flush any debounced URL-hash save so example-switch / Verify
-  // coalesce the dispatch-armed save into a single `replaceState`.
-  flushHashSave();
   const myRun = ++runId;
-  parseButton.disabled = true;
-  parseButtonLabel.textContent = 'Verify…';
+  verifyButton.disabled = true;
+  verifyButtonLabel.textContent = 'Verify…';
   sectionCache.clear();
   sectionFolds.clear();
   verdictCache = null;
@@ -1016,19 +1013,19 @@ const runParse = async () => {
   benchCache.clear();
   z3ResponseBuffer = [];
   // Yield to the browser so the disabled button + "Verify…" label
-  // actually paint before `parse_source` pegs the main thread. rAF
+  // actually paint before `verify` pegs the main thread. rAF
   // schedules the callback for the next pre-paint hook; the nested
   // `setTimeout(_, 0)` defers the resume until *after* that paint has
   // committed. Without this, the DOM mutations above stay invisible —
   // the sync wasm call runs to completion, then the `finally` below
   // flips the button back to "Verify" before any frame lands.
   await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
-  // If a newer runParse fired while we were yielding (rapid ⌘↵ mashing,
+  // If a newer runVerify fired while we were yielding (rapid ⌘↵ mashing,
   // or auto-verify firing during an explicit click), abandon this one
   // — the later one will do its own fresh work.
   if (myRun !== runId) return;
   try {
-    verus.parse_source(view.state.doc.toString(), expandErrorsCheckbox.checked);
+    verus.verify(view.state.doc.toString(), expandErrorsCheckbox.checked);
   } catch (e) {
     if (myRun !== runId) return;
     if (_textDiags.length === 0 && sectionCache.size === 0 && verdictCache === null) {
@@ -1037,12 +1034,12 @@ const runParse = async () => {
     }
   } finally {
     if (myRun === runId) {
-      parseButton.disabled = false;
-      parseButtonLabel.textContent = 'Verify';
+      verifyButton.disabled = false;
+      verifyButtonLabel.textContent = 'Verify';
     }
   }
   // Z3 transcript lives on the JS side (wrapped cwrap), so it's installed
-  // after `parse_source` returns rather than via `verus_dump`.
+  // after `verify` returns rather than via `verus_dump`.
   if (z3ResponseBuffer.length) {
     sectionCache.set('Z3', z3ResponseBuffer.join('\n'));
   }
@@ -1090,6 +1087,13 @@ const runParse = async () => {
   // the tab (e.g. the shared link named a tab that isn't produced by
   // this source). Cheap — just rewrites the suffix.
   writeTabToUrl();
+  // Save the URL whenever `runVerify` reaches its tail — whether verify
+  // said "proof OK", Verus emitted errors, or rustc's abort_if_errors
+  // trapped on a syntax error. All three return fast, so the URL
+  // tracks the latest finished state. A true hang never reaches here
+  // at all, so the hang-on-reload loop stays closed. Stale runs
+  // (superseded by a newer edit) skip; the newer run will save.
+  if (myRun === runId) saveHashNow();
 };
 
 // ------------------------------------------------------------------
@@ -1122,12 +1126,11 @@ const decodeSrc = async (hash) => {
   const stream = new Blob([b64urlDecode(hash)]).stream().pipeThrough(new DecompressionStream('gzip'));
   return await new Response(stream).text();
 };
-// Debounced URL writer. `scheduleHashSave` is called from the
-// updateListener on every doc change; `flushHashSave` is called at
-// the top of `runParse` so a Verify / example-switch coalesces the
-// dispatch-armed save into a single `replaceState` (no double
-// update). Copy-link also awaits `flushHashSave` before reading
-// `location.href` so the clipboard is never stale.
+// URL writer. `saveHashNow` fires from `runVerify`'s tail on a
+// successful `verify` return and from user-initiated flows
+// (loadSource / resetSource / copyLink). No keystroke-debounced
+// path — the URL deliberately lags the editor by one verify so a
+// hung source can't persist into the URL and re-trap after reload.
 //
 // Generation guard: `saveHashNow` captures `++hashSaveGen` and
 // skips its `replaceState` if a later call bumped the gen past
@@ -1143,7 +1146,6 @@ const decodeSrc = async (hash) => {
 //     on load so old shared links keep working, but never written.
 // `parseHash` returns the same shape whichever form it saw, so the
 // hash-load path doesn't branch on layout.
-let hashSaveTimer = null;
 let hashSaveGen = 0;
 // The last hash we wrote via `replaceState`, tracked so the
 // `hashchange` listener can distinguish our own writes from the
@@ -1181,19 +1183,6 @@ const writeTabToUrl = () => {
   const head = hash.split('&')[0];
   if (!head) return;
   writeHash('#' + head + buildHashTabSuffix());
-};
-const scheduleHashSave = () => {
-  if (hashSaveTimer) clearTimeout(hashSaveTimer);
-  hashSaveTimer = setTimeout(() => {
-    hashSaveTimer = null;
-    saveHashNow();
-  }, 500);
-};
-const flushHashSave = () => {
-  if (!hashSaveTimer) return Promise.resolve();
-  clearTimeout(hashSaveTimer);
-  hashSaveTimer = null;
-  return saveHashNow();
 };
 // Parse a hash string (without the leading `#`) and return
 //   { sourceFile, src, tab } | null
@@ -1262,12 +1251,10 @@ const downloadCurrentTab = () => {
   URL.revokeObjectURL(url);
 };
 const copyLink = async (button) => {
-  // Always save the current doc before copying — cold load with the
-  // default example has no hash yet, so a plain `flushHashSave` would
-  // copy a bare URL that restores the default rather than whatever's
-  // on screen. Cancel any pending debounce so it doesn't re-fire
-  // redundantly after this explicit save.
-  if (hashSaveTimer) { clearTimeout(hashSaveTimer); hashSaveTimer = null; }
+  // URL-hash is only updated on successful verify, so on a fresh
+  // load with mid-edit content the URL can trail the editor. Force
+  // a save before copying so the clipboard carries what's on screen,
+  // not the last verified state.
   try {
     await saveHashNow();
     await navigator.clipboard.writeText(location.href);
@@ -1287,7 +1274,7 @@ shareBtn.addEventListener('click', () => copyLink(shareBtn));
 //   2. `#code=<b64>` / legacy `#<b64>` → decoded source, custom mode.
 //   3. No hash → the first shipped example + any override for it.
 // Restores `currentTab` from the hash suffix before the first
-// `runParse` so the default-pick logic treats it as "keep this"
+// `runVerify` so the default-pick logic treats it as "keep this"
 // when the named section is cached.
 const initialDoc = await (async () => {
   const parsed = await parseHash(location.hash.slice(1));
@@ -1324,7 +1311,7 @@ autoVerifyCheckbox.addEventListener('change', () => {
   // Flipping the checkbox on is effectively a request to verify now —
   // the user just expressed "yes, I want verification running" — so
   // kick off a run. Flipping off is silent; we only cancel pending work.
-  if (autoVerifyCheckbox.checked) runParse();
+  if (autoVerifyCheckbox.checked) runVerify();
 });
 // Expand-errors: always default off — runs per-conjunct sub-queries on a
 // failed body, which doubles-to-triples verify time but pinpoints which
@@ -1332,18 +1319,18 @@ autoVerifyCheckbox.addEventListener('change', () => {
 // the slower path opt-in rather than sticky.
 expandErrorsCheckbox.checked = false;
 expandErrorsCheckbox.addEventListener('change', () => {
-  // The flag is only read by `parse_source`, so a re-run is required to
+  // The flag is only read by `verify`, so a re-run is required to
   // see the effect — do it eagerly instead of waiting for the next edit
   // or manual Verify click.
-  runParse();
+  runVerify();
 });
-// `autoVerifyTimer` is declared up beside `runParse` so the explicit
+// `autoVerifyTimer` is declared up beside `runVerify` so the explicit
 // verify path can preempt a pending auto-fire; this function just
 // arms it after each doc change.
 const scheduleAutoVerify = () => {
   clearTimeout(autoVerifyTimer);
   if (!autoVerifyCheckbox.checked) return;
-  autoVerifyTimer = setTimeout(runParse, 500);
+  autoVerifyTimer = setTimeout(runVerify, 500);
 };
 
 // ------------------------------------------------------------------
@@ -1352,7 +1339,7 @@ const scheduleAutoVerify = () => {
 // ------------------------------------------------------------------
 const dark = matchMedia('(prefers-color-scheme: dark)').matches;
 const view = new EditorView({
-  parent: document.getElementById('parse-input'),
+  parent: document.getElementById('source-input'),
   doc: initialDoc,
   extensions: [
     basicSetup,
@@ -1365,7 +1352,7 @@ const view = new EditorView({
     search({ top: true }),
     // Source recomputes from the current diagnostic caches so the
     // auto-firing on every doc change (default 750ms) is idempotent
-    // instead of wiping the squiggles that `runParse` just set. The
+    // instead of wiping the squiggles that `runVerify` just set. The
     // fresh squiggles after a parse still land via the direct
     // `setDiagnostics` dispatch in `buildInlineDiagnostics` — the
     // linter extension itself is what enables the hover tooltip.
@@ -1373,11 +1360,11 @@ const view = new EditorView({
     EditorView.updateListener.of(u => {
       if (u.docChanged) {
         scheduleAutoVerify();
-        scheduleHashSave();
-        // Per-example persistence + dirty marker. When an example is
-        // loaded we mirror the editor into localStorage so switching
-        // away and back preserves edits; flipping back to pristine
-        // drops the entry so we don't hoard stale copies.
+        // No hash save here — `runVerify` fires `saveHashNow()` at the
+        // tail end on a successful return, so the URL only captures
+        // source that verify has proven non-hanging. Local per-example
+        // persistence still mirrors every keystroke below for within-
+        // session continuity.
         if (loadedSource !== null) {
           const src = view.state.doc.toString();
           if (src === pristineSource) {
@@ -1404,7 +1391,7 @@ view.focus();
 // lines. `outputLanguage.of([])` reserves a language slot we swap
 // per tab via `renderOutputView`.
 const outputView = new EditorView({
-  parent: parseOutputViewEl,
+  parent: outputViewEl,
   doc: '',
   extensions: [
     basicSetup,
@@ -1452,12 +1439,12 @@ const loadSource = async (file) => {
   loadedSource = file;
   setEditorText(src);
   updateSourceUI();
-  // Dispatch above already scheduled a hash save via the update
-  // listener, but we want the address bar to reflect the new
-  // example immediately (so Copy-link right after a switch doesn't
-  // return the previous doc's hash).
-  flushHashSave();
-  runParse();
+  // Write the URL immediately on example switch so Copy-link right
+  // after the switch doesn't carry over the previous doc's hash.
+  // `runVerify` will also saveHashNow on success — harmless double
+  // write, URL is stable in between.
+  saveHashNow();
+  runVerify();
 };
 // Revert the editor to the shipped source and drop the localStorage
 // override. Only meaningful while an example is loaded and dirty —
@@ -1467,8 +1454,8 @@ const resetSource = () => {
   localStorage.removeItem(STORAGE_PREFIX + loadedSource);
   setEditorText(pristineSource);
   updateSourceUI();
-  flushHashSave();
-  runParse();
+  saveHashNow();
+  runVerify();
 };
 // Walk the flat `EXAMPLES` list by `step` (±1). From custom content,
 // `step < 0` jumps to the last example and `step > 0` to the first,
@@ -1492,7 +1479,7 @@ resetBtn.addEventListener('click', resetSource);
 // from the init block above because the view wasn't constructed
 // yet and `isDirty` reads its doc.
 updateSourceUI();
-parseButton.addEventListener('click', runParse);
+verifyButton.addEventListener('click', runVerify);
 // External hash changes (user pastes a different link into the address
 // bar, edits the fragment, hits back/forward on a history entry we
 // wrote) should reload the editor. Our own `replaceState` calls don't
@@ -1511,8 +1498,8 @@ window.addEventListener('hashchange', async () => {
     pristineSource = null;
     setEditorText(parsed.src);
     updateSourceUI();
-    flushHashSave();
-    runParse();
+    saveHashNow();
+    runVerify();
     return;
   }
   // Empty / unparseable hash — fall back to the first example.
@@ -1529,6 +1516,6 @@ renderSubtabs();
 // Hold here until the wasm chain resolves; editor + tabs are already
 // live above so the left pane has been interactive the whole time.
 await wasmReady;
-parseButtonLabel.textContent = 'Verify';
-parseButton.disabled = false;
-runParse();
+verifyButtonLabel.textContent = 'Verify';
+verifyButton.disabled = false;
+runVerify();

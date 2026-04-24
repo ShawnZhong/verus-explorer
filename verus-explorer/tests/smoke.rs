@@ -1,5 +1,8 @@
-// Node-hosted smoke test for the rustc → HIR → VIR pipeline. Stops before
-// AIR → Z3 (`verify = false`) so no Z3 plumbing is needed.
+// Node-hosted smoke test for the full Verus pipeline. Z3 is stubbed
+// (see `install_z3_stubs` below) so we exercise rustc → HIR → VIR → AIR
+// → SMT emission end-to-end; the stub returns `unsat` for every
+// `(check-sat)`, so this is structural coverage of the AIR → SMT wiring,
+// not a solver correctness check.
 //
 // Runs under `wasm-pack test --node` (see the Makefile). Node is preferred
 // over a headless browser because `wasm-bindgen-test-runner`'s server only
@@ -16,13 +19,13 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_test::*;
 
-// Node's built-in `fs`. `wasm-pack test --node` emits CommonJS glue, so this
-// resolves to `require('fs')`. Buffers returned by `readFileSync` are
-// Uint8Array subclasses — wasm-bindgen marshals them into `Vec<u8>` via the
-// standard typed-array path. We read from
-// `CARGO_MANIFEST_DIR/../target/wasm-libs/...` — the dir the
-// `make wasm-vir` target populates. Resolved at compile time via
-// concat!(env!("CARGO_MANIFEST_DIR"), ...); no build.rs involved.
+// Node's built-in `fs`. `wasm-pack test --node` emits CommonJS glue, so
+// this resolves to `require('fs')`. Buffers returned by `readFileSync`
+// are Uint8Array subclasses — wasm-bindgen marshals them into `Vec<u8>`
+// via the standard typed-array path. We read from
+// `CARGO_MANIFEST_DIR/../target/libs/` (the bundle `make libs` stages
+// via `scripts/build-libs.sh`), resolved at compile time through
+// `concat!(env!("CARGO_MANIFEST_DIR"), …)` — no build.rs involved.
 #[wasm_bindgen(module = "fs")]
 extern "C" {
     #[wasm_bindgen(js_name = readFileSync)]
@@ -36,12 +39,12 @@ extern "C" {
 // as imports from the JS host (see the `#[wasm_bindgen(js_name = …)]`
 // externs there). The browser installs them on `globalThis`; under
 // `wasm-pack test --node` nothing does, so every call site would
-// ReferenceError. Stub them before `parse_source` reaches any diagnostic,
+// ReferenceError. Stub them before `verify` reaches any diagnostic,
 // `emit_section`, or `time` call site.
 //
 // The `verus_dump` stub accumulates each section's joined block content
 // into `globalThis._sections` so test assertions can look up specific
-// sections by name — `parse_and_verify` no longer returns a dumped
+// sections by name — `verify` no longer returns a dumped
 // String, all pipeline output flows through this callback.
 // `reset_sections` clears the accumulator between parse calls so each
 // run's assertions see only its own output.
@@ -186,7 +189,7 @@ fn pipeline_preserves_ghost_proof_block() {
     for label in ["#1", "#2", "#3"] {
         reset_sections();
         let t = perf_now();
-        verus_explorer::parse_and_verify(src, /* verify */ true, /* expand_errors */ false);
+        verus_explorer::verify(src, /* expand_errors */ false);
         stage_times.push(perf_now() - t);
         let vir = section_body("VIR");
         assert!(!vir.is_empty(), "missing VIR section on {label}");
