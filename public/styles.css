@@ -238,6 +238,20 @@ pre {
   gap: .5em 1em;
   margin-top: .5em;
 }
+/* Prev/next buttons flanking the example dropdown: small chevron pills
+   that sit inline with the dropdown at matching height. */
+.source-nav {
+  padding: .15em .5em;
+  font-size: .85em;
+  line-height: 1;
+}
+/* Reset button: only visible when the current example is dirty (see
+   `source-reset`'s `hidden` attribute, toggled in index.html). Matches
+   the dropdown's font-size so it doesn't tower over the row. */
+.source-reset {
+  padding: .2em .7em;
+  font-size: .85em;
+}
 .hint {
   font-size: .8em;
 }

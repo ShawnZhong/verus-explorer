@@ -102,14 +102,32 @@ $(HOST_VERUS_BIN):
 	./scripts/build-host-verus.sh
 host-verus: $(HOST_VERUS_BIN)
 
-# Stage the wasm32 sysroot (core/alloc/std + their deps via `x.py check`,
-# plus verus_builtin + macro stubs) into target/libs-sysroot/. Must run
-# from a clean shell because x.py's bootstrap tools inherit RUSTFLAGS/
-# CC and break on target-specific linker flags like `-zstack-size`
-# when invoked from within a cargo build-script env. Phony so x.py
-# check's incremental tracking does its own skipping.
-libs-sysroot: $(HOST_RUST_BIN)
+# libs-sysroot: stage1 check rmetas + verus_builtin + macro stubs,
+# staged into target/libs-sysroot/. The heavy step (`x.py check`) is
+# already incremental internally; build-libs-sysroot.sh also does a
+# `rm -rf + repopulate`, so every file in the sysroot lib dir has the
+# same mtime after a successful run — making libcore.rmeta a faithful
+# witness for the whole sysroot layout.
+SYSROOT_LIB := target/libs-sysroot/lib/rustlib/wasm32-unknown-unknown/lib
+SYSROOT_WITNESS := $(SYSROOT_LIB)/libcore.rmeta
+
+# vstd source tree — any edit here forces `libs-vir` to rebuild both
+# std and nostd variants. `$(shell find ...)` evaluates at make parse
+# time, so new files appear as dependencies after they're added.
+VSTD_SOURCES := $(shell find third_party/verus/source/vstd -name '*.rs' 2>/dev/null)
+
+# libs-sysroot's non-x.py inputs: verus_builtin + the two macro stub
+# crates. Edits here trigger a resysroot even when the rust source
+# tree is untouched.
+SYSROOT_EXTRA_SOURCES := $(shell find third_party/verus/source/builtin \
+    third_party/verus/source/builtin_macros \
+    third_party/verus/source/state_machines_macros \
+    -name '*.rs' 2>/dev/null)
+
+$(SYSROOT_WITNESS): $(HOST_RUST_BIN) $(SYSROOT_EXTRA_SOURCES) scripts/build-libs-sysroot.sh
 	./scripts/build-libs-sysroot.sh
+
+libs-sysroot: $(SYSROOT_WITNESS)
 
 # Produce libvstd.rmeta + vstd.vir into target/libs-vir/{std,nostd}/ via
 # rust_verify against the staged sysroot — one run per mode. `std`
@@ -118,9 +136,21 @@ libs-sysroot: $(HOST_RUST_BIN)
 # builds with just `feature="alloc"` (faster verify, smaller bundle).
 # `public/index.html`'s URL-param toggle picks which of the two the
 # browser fetches.
-libs-vir: $(HOST_VERUS_BIN) libs-sysroot
+#
+# Per-mode stamp file witnesses the pair (libvstd.rmeta + vstd.vir).
+# Stamp-based rather than grouped-target (`&:`) so this works on the
+# macOS-shipped GNU Make 3.81 too. The stamp lives inside the mode dir
+# so the script's own `rm -rf "$out"` + `mkdir -p` wipes it on every
+# rebuild, keeping its mtime aligned with the rmeta + vir siblings.
+target/libs-vir/std/.stamp: $(HOST_VERUS_BIN) $(SYSROOT_WITNESS) $(VSTD_SOURCES) scripts/build-libs-vir.sh
 	./scripts/build-libs-vir.sh std
+	@touch $@
+
+target/libs-vir/nostd/.stamp: $(HOST_VERUS_BIN) $(SYSROOT_WITNESS) $(VSTD_SOURCES) scripts/build-libs-vir.sh
 	./scripts/build-libs-vir.sh nostd
+	@touch $@
+
+libs-vir: target/libs-vir/std/.stamp target/libs-vir/nostd/.stamp
 
 # Assemble the browser-shipped bundle at target/libs/. Layout:
 #     target/libs/
@@ -133,11 +163,15 @@ libs-vir: $(HOST_VERUS_BIN) libs-sysroot
 # them (rustc's crate locator walks libstd's declared deps eagerly, so
 # they're eager; nostd mode doesn't pull libstd at all).
 #
-# `cp -Rl` hardlinks (sysroot-built rmetas are immutable, so the link
+# `cp -l` hardlinks (sysroot-built rmetas are immutable, so the link
 # is safe and costs zero disk). `gzip -kf9` keeps the raw files for
 # tests/smoke.rs, overwrites stale `.gz` siblings, picks the smallest
-# output.
+# output. `rm -rf` stays so removing an entry from LIBS_SHARED /
+# LIBS_STD_ONLY doesn't leave stale `.rmeta(.gz)` siblings in place.
+# Stamp witness lives inside $(LIBS_DIR) so it's wiped + recreated on
+# every rebuild, keeping its mtime aligned with the bundle contents.
 LIBS_DIR   := target/libs
+LIBS_STAMP := $(LIBS_DIR)/.stamp
 LIBS_SHARED := libcore.rmeta liballoc.rmeta libcompiler_builtins.rmeta \
                libverus_builtin.rmeta libverus_builtin_macros.rmeta \
                libverus_state_machines_macros.rmeta
@@ -147,8 +181,8 @@ LIBS_STD_ONLY := libstd.rmeta libcfg_if.rmeta libdlmalloc.rmeta \
                  librustc_std_workspace_alloc.rmeta \
                  librustc_std_workspace_core.rmeta libstd_detect.rmeta \
                  libunwind.rmeta
-SYSROOT_LIB := target/libs-sysroot/lib/rustlib/wasm32-unknown-unknown/lib
-libs: libs-sysroot libs-vir
+$(LIBS_STAMP): $(SYSROOT_WITNESS) \
+		target/libs-vir/std/.stamp target/libs-vir/nostd/.stamp
 	rm -rf $(LIBS_DIR)
 	mkdir -p $(LIBS_DIR)/std $(LIBS_DIR)/nostd
 	for f in $(LIBS_SHARED); do cp -l $(SYSROOT_LIB)/$$f $(LIBS_DIR)/$$f; done
@@ -158,6 +192,9 @@ libs: libs-sysroot libs-vir
 	gzip -kf9 $(LIBS_DIR)/*.rmeta \
 	          $(LIBS_DIR)/std/*.rmeta $(LIBS_DIR)/std/vstd.vir \
 	          $(LIBS_DIR)/nostd/*.rmeta $(LIBS_DIR)/nostd/vstd.vir
+	@touch $@
+
+libs: $(LIBS_STAMP)
 
 $(DIST)/z3/z3.%: $(WASM_Z3)/z3.% | $(DIST)
 	mkdir -p $(DIST)/z3
