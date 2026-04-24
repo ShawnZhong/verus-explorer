@@ -267,26 +267,6 @@ label.hint {
 label.hint > input[type="checkbox"] {
   margin: 0;
 }
-kbd {
-  font: inherit;
-  font-size: .85em;
-  background: var(--pre-bg);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 0 .3em;
-}
-/* In-button shortcut hint. Inherits the button's disabled opacity so it
-   dims along with the label while cold-loading / mid-run. */
-#parse-run {
-  display: inline-flex;
-  align-items: center;
-  gap: .5em;
-}
-.shortcut {
-  font-size: .75em;
-  opacity: .7;
-  padding: 0 .25em;
-}
 
 /* Tab strip selecting which IR stage shows in the output CM6 view
    below. Tabs are disabled until the matching section lands in

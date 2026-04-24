@@ -12,6 +12,13 @@
 # absorbed (its members rely on `lints = { workspace = true }` from
 # Verus's own `source/Cargo.toml`).
 [workspace]
+# Pin to resolver 1 explicitly. Our edition-2024 members would normally
+# imply resolver 3, but that switches feature unification semantics and
+# surfaces as E0464 "multiple candidates for rmeta dependency" at link
+# time — the rustc_* workspace crates want one unified feature set, not
+# per-target resolution. Explicit `= "1"` also silences cargo's virtual-
+# workspace-default warning.
+resolver = "1"
 members = ["verus-explorer", "rustc-rlibs"]
 exclude = ["third_party"]
 
