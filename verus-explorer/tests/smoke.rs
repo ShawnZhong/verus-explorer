@@ -55,7 +55,8 @@ extern "C" {
     export function install_pipeline_stubs() {\n\
       globalThis._sections = new Map();\n\
       globalThis.verus_diagnostic = () => {};\n\
-      globalThis.verus_diagnostic_json = () => {};\n\
+      globalThis._verdicts = [];\n\
+      globalThis.verus_verdict = (json) => { globalThis._verdicts.push(json); };\n\
       globalThis.verus_dump = (section, contents, _folds) => {\n\
         let body = '';\n\
         for (let i = 0; i < contents.length; i++) {\n\
@@ -210,6 +211,11 @@ fn pipeline_preserves_ghost_proof_block() {
         );
         let vir_raw = section_body("VIR_RAW");
         assert!(!vir_raw.is_empty(), "missing VIR_RAW section on {label}");
+        let vir_pruned = section_body("VIR_PRUNED");
+        assert!(
+            !vir_pruned.is_empty(),
+            "missing VIR_PRUNED section on {label} — verify_module's walk produced no items"
+        );
         // Section markers embedded via `air_ctx.section(marker, …)`
         // / `section_close()` must reach the outputs, otherwise
         // the browser's fold scanner has no markers to key off of.

@@ -48,19 +48,32 @@ extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = error)]
     pub(crate) fn console_error(msg: &str);
 
-    // Imported from `public/app.js`. Called synchronously from
-    // `DomWriter` so each rustc diagnostic lands in the output panel before
-    // rustc's `abort_if_errors` turns into a wasm `unreachable` trap.
+    // Per-diagnostic JSON object (one call per `\n`-terminated line),
+    // imported from `public/app.js`. Carries rustc's JsonEmitter output:
+    // structured spans (`byte_start`/`byte_end`, `line`/`col`), level,
+    // children, and a pre-rendered human form (`rendered`) — the JS
+    // side feeds spans to CM6 `setDiagnostics` for inline squiggles and
+    // displays `rendered` in the DIAGNOSTICS pane.
+    //
+    // Called synchronously from `DiagnosticWriter` so each diagnostic
+    // reaches the host before rustc's `abort_if_errors` turns into a
+    // wasm `unreachable` trap. We used to have a separate
+    // `verus_diagnostic` text channel for survivability, but rustc's
+    // `JsonEmitter::rendered` already carries the human form, so the
+    // text channel was redundant.
     #[wasm_bindgen(js_name = verus_diagnostic)]
     pub(crate) fn verus_diagnostic(msg: &str);
 
-    // Same survivability reasoning as `verus_diagnostic`, but carries the
-    // structured JsonEmitter output (one diagnostic per line). The JS side
-    // parses it into `byte_start`/`byte_end` + `line`/`col` spans and feeds
-    // CM6 `setDiagnostics` — gives us precise squiggle ranges and
-    // secondary-label spans without scraping the human-readable text.
-    #[wasm_bindgen(js_name = verus_diagnostic_json)]
-    pub(crate) fn verus_diagnostic_json(msg: &str);
+    // Per-query verdict, JSON-encoded (one object per call). Streamed as
+    // each `ValidityResult` lands in `handle_op` so the UI can build a
+    // structured pass/fail table alongside the (text-only) VERDICT tab.
+    // Distinct from `verus_diagnostic_json` because:
+    //   * Verdicts include passes; diagnostics only fire on errors.
+    //   * Verdicts have explorer-specific fields (`kind`, `proved`)
+    //     rustc doesn't know about — overloading the diagnostic channel
+    //     would force the JS side to disambiguate by tag.
+    #[wasm_bindgen(js_name = verus_verdict)]
+    pub(crate) fn verus_verdict(json: &str);
 
     // Streams each completed pipeline section (AST / HIR / VIR /
     // AIR_INITIAL / AIR_MIDDLE / AIR_FINAL / SMT / VERDICT) out to the

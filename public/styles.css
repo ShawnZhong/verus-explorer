@@ -213,8 +213,18 @@ pre {
 /* Source-editor decorations for diagnostics flagged by the loc
    extractor. Errors get a red wash, warnings a softer yellow — same
    severity palette as the diagnostic panes below the editor. */
-.cm-error-line { background-color: var(--bad-bg); }
-.cm-warning-line { background-color: var(--warn-bg); }
+/* Thin left-edge bars instead of full-line washes, so the syntax-
+   highlighted text underneath reads at full contrast. Two layers:
+   diagnostic bars (`cm-error-line` / `cm-warning-line`) anchored at
+   the failing assert/expression line, and verdict bars
+   (`cm-verdict-ok-line` / `cm-verdict-bad-line`) anchored at each
+   verified function's definition line. Together they give an
+   at-a-glance map: green bars next to functions that proved, red
+   bars next to functions and asserts that didn't. */
+.cm-error-line       { box-shadow: inset 3px 0 0 var(--bad-fg); }
+.cm-warning-line     { box-shadow: inset 3px 0 0 var(--warn-fg, #b88500); }
+.cm-verdict-ok-line  { box-shadow: inset 3px 0 0 var(--ok-fg); }
+.cm-verdict-bad-line { box-shadow: inset 3px 0 0 var(--bad-fg); }
 @media (max-width: 900px) {
   body {
     height: auto;
@@ -425,13 +435,47 @@ label.hint > input[type="checkbox"] {
   border: 1px solid var(--bad-border);
 }
 .verdict-status { font-size: 1rem; font-weight: bold; }
-.verdict-status.ok { color: var(--ok-fg); }
-.verdict-status.bad { color: var(--bad-fg); }
-.verdict-detail {
-  font-size: .82em;
+/* Per-span colors keep the ✓ green and ✗ red inside the headline
+   even when the row is bad-state (any failure → bad-bg container).
+   Plain spans (e.g. the trailing error count) inherit the regular
+   foreground. */
+.verdict-status .ok  { color: var(--ok-fg); }
+.verdict-status .bad { color: var(--bad-fg); }
+/* Per-query rows. Listed under the headline status, one per Z3 check.
+   Each row is a thin grid: status icon + function + kind + outcome.
+   Failures get the bad-fg color on the icon + outcome; successes are
+   muted so the eye lands on failures first. `.clickable` rows jump
+   the source editor to the function's span on click. */
+.verdict-list {
   margin-top: .3em;
-  color: var(--fg-muted);
-  white-space: pre-wrap;
+  font-size: .82em;
+  display: flex;
+  flex-direction: column;
+  gap: .15em;
+}
+.verdict-row {
+  display: grid;
+  grid-template-columns: 1.2em auto 1fr auto;
+  gap: .4em;
+  align-items: baseline;
+  padding: .15em .3em;
+  border-radius: 3px;
+}
+.verdict-row.clickable { cursor: pointer; }
+.verdict-row.clickable:hover { background: var(--hover-bg, rgba(127,127,127,.12)); }
+.verdict-icon {
+  font-weight: bold;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.verdict-row.ok  .verdict-icon { color: var(--ok-fg); }
+.verdict-row.bad .verdict-icon { color: var(--bad-fg); }
+.verdict-fn { font-family: var(--mono-font, monospace); }
+.verdict-kind { color: var(--fg-muted); }
+.verdict-outcome {
+  color: var(--bad-fg);
+  font-style: italic;
+  margin-left: auto;
 }
 .subtab-timing {
   margin-left: auto;

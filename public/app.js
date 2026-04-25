@@ -375,14 +375,12 @@ const sectionAutoFolded = new Map();
 // `verify` always produces every IR; bodies are cached here so
 // flipping a tab just swaps the output-view's doc instead of re-parsing.
 const sectionCache = new Map();
-let verdictCache = null;
-// Raw buffers the wasm callbacks push into during `verify`.
-// `_textDiags` holds `HumanEmitter` output (colorized terminal form);
-// `_jsonDiags` holds parsed `JsonEmitter` objects (with `spans[]`
-// carrying rustc-exact line/col ranges). `runVerify` consolidates them
-// into the unified `diagnostics` list below once parsing returns.
-const _textDiags = [];
-const _jsonDiags = [];
+// Raw buffer the wasm `verus_diagnostic` callback pushes into during
+// `verify`. Each entry is a parsed rustc `JsonEmitter` object (with
+// `spans[]` carrying rustc-exact line/col ranges and a `rendered`
+// field carrying the human-formatted form). `runVerify` consolidates
+// these into the unified `diagnostics` list below once parsing returns.
+const _diags = [];
 // Unified diagnostic list consumed by the three renderers (`renderMeta`,
 // `updateErrorDecorations`, `computeInlineDiagnostics`). Each entry:
 //   { rendered: string,                    // text for pane + tooltip
@@ -456,31 +454,35 @@ const errorLineField = StateField.define({
 const errorLineDeco = Decoration.line({ attributes: { class: 'cm-error-line' } });
 const warningLineDeco = Decoration.line({ attributes: { class: 'cm-warning-line' } });
 
-// Rustc's `HumanEmitter` prefixes each top-level diagnostic with the
-// level name: `error[E0432]:`, `error:`, `warning:`, `note:`, `help:`.
-// We key off that first token to pick severity. Anything we don't
-// recognize (rare — e.g., a Verus-side message without the prefix)
-// falls through as an error so it stays visible in red.
-const severity = (msg) => {
-  const m = msg.trimStart().match(/^(error|warning|note|help)\b/);
-  if (!m) return 'error';
-  if (m[1] === 'note' || m[1] === 'help') return 'note';
-  return m[1];
-};
+// ------------------------------------------------------------------
+// Per-function verdict line bars — left-edge stripes anchored at each
+// verified function's definition: green when the function proved,
+// red when it didn't. Lets the reader skim a long file and see at a
+// glance which functions failed without expanding the verdict panel.
+// Mirrors the `cm-error-line` / `cm-warning-line` treatment but
+// keyed off the verdict span (function-level) rather than diagnostic
+// span (assert-level). Multiple verdicts on the same line (body +
+// spec-termination + recommends checks) collapse to one bar — bad if
+// any failed, ok otherwise — same logic as the verdict-panel rows.
+// ------------------------------------------------------------------
+const setVerdictLineDecos = StateEffect.define();
+const verdictLineField = StateField.define({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setVerdictLineDecos)) deco = Decoration.set(e.value, true);
+    }
+    return deco;
+  },
+  provide: f => EditorView.decorations.from(f),
+});
+const verdictOkLineDeco  = Decoration.line({ attributes: { class: 'cm-verdict-ok-line' } });
+const verdictBadLineDeco = Decoration.line({ attributes: { class: 'cm-verdict-bad-line' } });
 
 // ------------------------------------------------------------------
 // Renderers
 // ------------------------------------------------------------------
-// Pull a `line:col` out of a rustc diagnostic so we can make it clickable
-// *and* surface it as a source-editor line mark. The `--> file:N:M` form
-// is rustc's canonical span marker; fallback to any `N:M` occurrence
-// covers formats that don't carry an arrow (e.g., Verus-side errors).
-// Only the first match is used.
-const extractLoc = (msg) => {
-  const m = msg.match(/-->\s*\S*?:(\d+):(\d+)/) ?? msg.match(/:(\d+):(\d+)/);
-  return m ? { line: parseInt(m[1], 10), col: parseInt(m[2], 10) } : null;
-};
-
 // Jump the source editor to the span a diagnostic points at and flash
 // the line so the eye catches the move. Caller is responsible for
 // passing a (line, col) pair that's already bounds-checked against the
@@ -515,32 +517,88 @@ const jumpToLoc = (loc) => {
 const fmtMs = (ms) => ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 const renderMeta = () => {
   metaPanel.textContent = '';
-  if (verdictCache !== null) {
-    const [headline, ...rest] = verdictCache.split('\n');
-    const isOk = headline === 'verified';
-    const div = document.createElement('div');
-    div.className = `verdict ${isOk ? 'ok' : 'bad'}`;
-    const status = document.createElement('div');
-    status.className = `verdict-status ${isOk ? 'ok' : 'bad'}`;
-    // Count errors / warnings straight off the unified diagnostic list
-    // so the verdict headline carries a scan-friendly severity tally.
-    // `note` / `help` entries are ignored — they're additive context,
-    // not distinct findings.
-    const errN = diagnostics.filter(d => d.severity === 'error').length;
-    const warnN = diagnostics.filter(d => d.severity === 'warning').length;
-    const counts = [];
-    if (errN) counts.push(`${errN} ${errN === 1 ? 'error' : 'errors'}`);
-    if (warnN) counts.push(`${warnN} ${warnN === 1 ? 'warning' : 'warnings'}`);
-    const countSuffix = counts.length ? ` · ${counts.join(' · ')}` : '';
-    status.textContent = (isOk ? '✓ verified' : `✗ ${headline}`) + countSuffix;
-    div.appendChild(status);
-    const detail = rest.join('\n').trim();
-    if (detail) {
-      const d = document.createElement('div');
-      d.className = 'verdict-detail';
-      d.textContent = detail;
-      div.appendChild(d);
+  // Verdict block — built from the streaming `_verdicts` JSON array.
+  // Headline reports passed / failed query counts as separate
+  // ✓/✗-prefixed parts (no `N/M` slash, which conflates the two);
+  // diagnostic-level error count is appended only when non-zero,
+  // since the diagnostic and query channels measure different things
+  // (one failed query can fan into multiple diagnostics; some
+  // diagnostics have no associated query).
+  if (_verdicts.length > 0) {
+    const passedN = _verdicts.filter(v => v.proved).length;
+    const failedN = _verdicts.length - passedN;
+    const allProved = failedN === 0;
+    // Each part renders as its own <span> so the ✓ / ✗ inside it can
+    // carry a color independent of the overall row state — e.g. the
+    // ✓ on `1 passed` stays green even when the row is bad-state
+    // because there's also a failure. Diagnostic counts are
+    // intentionally omitted: errors and queries measure different
+    // things (one failed query can fan into multiple errors;
+    // parse/type errors fire with no associated query) and the
+    // diagnostic pane below already enumerates each one.
+    const parts = [];
+    if (allProved) {
+      parts.push({
+        cls: 'ok',
+        text: `✓ verified · ${_verdicts.length} ${_verdicts.length === 1 ? 'query' : 'queries'}`,
+      });
+    } else {
+      if (passedN > 0) parts.push({ cls: 'ok', text: `✓ ${passedN} passed` });
+      parts.push({ cls: 'bad', text: `✗ ${failedN} failed` });
     }
+    const div = document.createElement('div');
+    div.className = `verdict ${allProved ? 'ok' : 'bad'}`;
+    const status = document.createElement('div');
+    status.className = 'verdict-status';
+    parts.forEach((p, i) => {
+      if (i > 0) status.appendChild(document.createTextNode(' · '));
+      const span = document.createElement('span');
+      if (p.cls) span.className = p.cls;
+      span.textContent = p.text;
+      status.appendChild(span);
+    });
+    div.appendChild(status);
+    const list = document.createElement('div');
+    list.className = 'verdict-list';
+    for (const v of _verdicts) {
+      const row = document.createElement('div');
+      row.className = `verdict-row ${v.proved ? 'ok' : 'bad'}`;
+      // Row layout: icon | function | kind | outcome (only on failure).
+      // Span (file:line:col) lives on the row's data attribute and
+      // drives click-to-jump; we don't print it inline because it
+      // duplicates info the rendered diagnostic already shows for
+      // failures, and clutters the row for successes.
+      const icon = document.createElement('span');
+      icon.className = 'verdict-icon';
+      icon.textContent = v.proved ? '✓' : '✗';
+      row.appendChild(icon);
+      const fn = document.createElement('span');
+      fn.className = 'verdict-fn';
+      fn.textContent = v.function || '<top-level>';
+      row.appendChild(fn);
+      const kind = document.createElement('span');
+      kind.className = 'verdict-kind';
+      kind.textContent = v.kind;
+      row.appendChild(kind);
+      if (!v.proved) {
+        const outcome = document.createElement('span');
+        outcome.className = 'verdict-outcome';
+        outcome.textContent = v.outcome;
+        row.appendChild(outcome);
+      }
+      // Span string is `<input.rs>:LINE:COL: ENDLINE:ENDCOL (#…)`.
+      // Pull the leading line:col for cursor placement.
+      const m = v.span?.match(/:(\d+):(\d+)/);
+      if (m) {
+        const loc = { line: parseInt(m[1], 10), col: parseInt(m[2], 10) };
+        if (loc.line >= 1 && loc.line <= view.state.doc.lines) {
+          row.classList.add('clickable');
+          row.addEventListener('click', () => jumpToLoc(loc));
+        }
+      }
+      list.appendChild(row);
+    }
+    div.appendChild(list);
     metaPanel.appendChild(div);
   }
   for (const d of diagnostics) {
@@ -930,16 +988,56 @@ const updateErrorDecorations = () => {
   view.dispatch({ effects: setErrorLines.of(decos) });
 };
 
+// Build verdict gutter markers from `_verdicts`. Each verdict's
+// `span` is `<file>:LINE:COL: ENDLINE:ENDCOL (#…)`; we use only the
+// leading line. Multiple verdicts on the same line collapse into one
+// marker — bad if any failed (so a body-pass + recommends-fail still
+// shows ✗), with the per-kind detail joined into the tooltip.
+const updateVerdictMarkers = () => {
+  const doc = view.state.doc;
+  const byLine = new Map();
+  for (const v of _verdicts) {
+    const m = v.span?.match(/:(\d+):(\d+)/);
+    if (!m) continue;
+    const line = parseInt(m[1], 10);
+    if (line < 1 || line > doc.lines) continue;
+    const detail = `${v.function}: ${v.kind} → ${v.outcome}`;
+    const prev = byLine.get(line);
+    byLine.set(line, prev ? {
+      proved: prev.proved && v.proved,
+      details: [...prev.details, detail],
+    } : { proved: v.proved, details: [detail] });
+  }
+  const sorted = [...byLine.entries()].sort(([a], [b]) => a - b);
+  // One line decoration per verified function: green for proved,
+  // red for failed. Passed + failed verdicts on the same line
+  // collapse to a red bar (any failure wins), matching the panel's
+  // row coloring and "any failure → ✗ headline" rule.
+  const lineDecos = sorted.map(([line, { proved }]) =>
+    (proved ? verdictOkLineDeco : verdictBadLineDeco).range(doc.line(line).from)
+  );
+  view.dispatch({ effects: setVerdictLineDecos.of(lineDecos) });
+};
+
 // ------------------------------------------------------------------
 // Rust → JS bridge. Synchronous during `verify`; JS is
 // single-threaded, so the DOM won't actually repaint between these
 // calls. On a mid-pipeline trap the buffered caches survive the
 // unwind and `finally`-time renderers flush what's there.
 // ------------------------------------------------------------------
-globalThis.verus_diagnostic = (msg) => { _textDiags.push(msg); };
-globalThis.verus_diagnostic_json = (msg) => {
-  try { _jsonDiags.push(JSON.parse(msg)); }
-  catch (e) { console.warn('verus_diagnostic_json: parse failed', e, msg); }
+globalThis.verus_diagnostic = (msg) => {
+  try { _diags.push(JSON.parse(msg)); }
+  catch (e) { console.warn('verus_diagnostic: parse failed', e, msg); }
+};
+// Per-query verdict streaming. Each call carries one JSON object:
+// { function, span, kind, outcome, proved }. `_verdicts` is the sole
+// source of truth for the metaPanel's pass/fail panel — Rust no
+// longer formats a text summary; `renderMeta` builds the headline +
+// per-row table directly from this array.
+const _verdicts = [];
+globalThis.verus_verdict = (msg) => {
+  try { _verdicts.push(JSON.parse(msg)); }
+  catch (e) { console.warn('verus_verdict: parse failed', e, msg); }
 };
 // Rust sends ordered blocks via parallel arrays: `contents[i]` is
 // the block text (already includes a natural `;;` comment on its
@@ -967,14 +1065,10 @@ globalThis.verus_dump = (section, contents, folds) => {
       if (firstNl >= 0) ranges.push({ from: start + firstNl, to: body.length });
     }
   }
-  if (section === 'VERDICT') {
-    verdictCache = body;
-  } else {
-    sectionCache.set(section, body);
-    if (ranges.length > 0) {
-      sectionFolds.set(section, ranges);
-      sectionAutoFolded.set(section, ranges);
-    }
+  sectionCache.set(section, body);
+  if (ranges.length > 0) {
+    sectionFolds.set(section, ranges);
+    sectionAutoFolded.set(section, ranges);
   }
 };
 // Rust side calls `verus_bench(label, ms)` once per timed pipeline
@@ -1007,9 +1101,8 @@ const runVerify = async () => {
   sectionCache.clear();
   sectionFolds.clear();
   sectionAutoFolded.clear();
-  verdictCache = null;
-  _textDiags.length = 0;
-  _jsonDiags.length = 0;
+  _diags.length = 0;
+  _verdicts.length = 0;
   diagnostics.length = 0;
   benchCache.clear();
   // Yield to the browser so the disabled button + "Verify…" label
@@ -1028,8 +1121,17 @@ const runVerify = async () => {
     verus.verify(view.state.doc.toString(), expandErrorsCheckbox.checked);
   } catch (e) {
     if (myRun !== runId) return;
-    if (_textDiags.length === 0 && sectionCache.size === 0 && verdictCache === null) {
-      _textDiags.push('Parse crashed: ' + (e?.message ?? e));
+    if (_diags.length === 0 && sectionCache.size === 0 && _verdicts.length === 0) {
+      // Synthesize a one-off diagnostic so the DIAGNOSTICS pane shows
+      // *something* on a hard wasm trap. Shape matches rustc's
+      // JsonEmitter output minimally — `rendered` is what the renderer
+      // displays, `level` controls severity, no spans → no inline
+      // squiggle (which is correct for a non-source-level crash).
+      _diags.push({
+        rendered: 'Parse crashed: ' + (e?.message ?? e),
+        level: 'error',
+        spans: [],
+      });
       console.error(e);
     }
   } finally {
@@ -1159,32 +1261,24 @@ const runVerify = async () => {
       sectionAutoFolded.set(tab, autoFolded);
     }
   }
-  // Consolidate the raw emission channels into the unified diagnostic
-  // list. JSON wins when rustc produced any (rustc-exact spans + level
-  // tags); otherwise fall back to the human channel so Verus-side or
-  // crash messages still surface. The two channels describe the same
-  // set of diagnostics, so mixing would double-count.
-  if (_jsonDiags.length > 0) {
-    for (const j of _jsonDiags) {
-      // Skip rustc's "aborting due to N previous errors" footer. It's
-      // a summary of the preceding errors, not a distinct finding —
-      // the text channel filters it in `emit_block` but the JSON
-      // channel emits it, so it shows up here without this guard.
-      if ((j.message ?? '').startsWith('aborting due to')) continue;
-      const primary = j.spans?.find(s => s.is_primary) ?? j.spans?.[0];
-      const loc = primary ? {
-        line: primary.line_start, col: primary.column_start,
-        endLine: primary.line_end, endCol: primary.column_end,
-      } : null;
-      const sev = j.level === 'warning' ? 'warning'
-               : (j.level === 'note' || j.level === 'help') ? 'note'
-               : 'error';
-      diagnostics.push({ rendered: j.rendered ?? j.message ?? '', loc, severity: sev });
-    }
-  } else {
-    for (const msg of _textDiags) {
-      diagnostics.push({ rendered: msg, loc: extractLoc(msg), severity: severity(msg) });
-    }
+  // Consolidate the raw `_diags` list into the unified diagnostic
+  // list. Each entry already has rustc-exact spans (`line_start` /
+  // `column_start` etc.) and a pre-rendered human form, so the
+  // mapping is mostly field renaming.
+  for (const j of _diags) {
+    // Skip rustc's "aborting due to N previous errors" footer. It's
+    // a summary of the preceding errors, not a distinct finding —
+    // would otherwise show up redundantly in the DIAGNOSTICS pane.
+    if ((j.message ?? '').startsWith('aborting due to')) continue;
+    const primary = j.spans?.find(s => s.is_primary) ?? j.spans?.[0];
+    const loc = primary ? {
+      line: primary.line_start, col: primary.column_start,
+      endLine: primary.line_end, endCol: primary.column_end,
+    } : null;
+    const sev = j.level === 'warning' ? 'warning'
+             : (j.level === 'note' || j.level === 'help') ? 'note'
+             : 'error';
+    diagnostics.push({ rendered: j.rendered ?? j.message ?? '', loc, severity: sev });
   }
   // Preserve user's tab selection when it survives the new run;
   // otherwise default to the SMT transcript (the unified
@@ -1199,6 +1293,7 @@ const runVerify = async () => {
   renderMeta();
   rerender();
   updateErrorDecorations();
+  updateVerdictMarkers();
   buildInlineDiagnostics();
   // Keep `&t=<TAB>` in sync when the default-pick logic above swapped
   // the tab (e.g. the shared link named a tab that isn't produced by
@@ -1462,6 +1557,7 @@ const view = new EditorView({
     rust(),
     ...(dark ? [oneDark] : []),
     errorLineField,
+    verdictLineField,
     // Pin the search panel to the top so Cmd+F opens it in a spot that
     // isn't clipped by the flex container; basicSetup's searchKeymap
     // already binds Mod-f, we just need the panel installed.

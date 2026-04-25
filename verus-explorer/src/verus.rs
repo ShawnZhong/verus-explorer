@@ -18,7 +18,6 @@
 // `air/src/smt_process.rs` and wired up in `public/app.js`.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -46,7 +45,7 @@ use vir::prelude::PreludeConfig;
 use vir::sst::{AssertId, KrateSst};
 
 use crate::util::{WalkBuilder, emit_section, time};
-use crate::wasm::wasm_libs_vstd_vir;
+use crate::wasm::{verus_verdict, wasm_libs_vstd_vir};
 
 // ==================== Stage 3: HIR → VIR ====================
 
@@ -229,18 +228,49 @@ pub(crate) struct VerifyOutput {
     // from this at `write()` time by stripping those response
     // blocks; SMT_TRANSCRIPT emits the buffer verbatim.
     smt_body: String,
-    verdicts: Vec<Verdict>,
+}
+
+// Minimal JSON string escape — covers the cases that show up in our
+// verdict fields (quotes, backslashes, control chars). serde_json
+// would be cleaner but we don't depend on it elsewhere; one helper
+// + one `format!` is cheaper than pulling the crate.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 struct Verdict {
     function: String,
+    // Function's source span (`<input.rs>:5:1: 5:30 (#0)` style from
+    // `vir::messages::Span::as_string`). Empty when the op had no
+    // associated function (rare — Context-only paths).
+    span: String,
     kind: String,
     outcome: String,
     proved: bool,
 }
 
 impl Verdict {
-    fn from_result(result: &ValidityResult, function: String, op: QueryOp) -> Self {
+    fn from_result(
+        result: &ValidityResult,
+        function: String,
+        span: String,
+        op: QueryOp,
+    ) -> Self {
         let kind = match op {
             QueryOp::SpecTermination => "spec termination".to_string(),
             QueryOp::Body(Style::Normal) => "body".to_string(),
@@ -251,36 +281,35 @@ impl Verdict {
         };
         let (outcome, proved) = match result {
             ValidityResult::Valid(_) => ("valid".to_string(), true),
-            ValidityResult::Invalid(_, _, Some(id)) => {
-                let id_str = id.iter().map(u64::to_string).collect::<Vec<_>>().join(".");
-                (format!("invalid (assert {id_str})"), false)
-            }
-            ValidityResult::Invalid(_, _, None) => ("invalid".to_string(), false),
+            // The `Some(AssertId)` carries an internal AIR-level
+            // assertion identifier (a `Vec<u64>`, e.g. `0` or `0.1.2`)
+            // that's only meaningful when correlated against the
+            // matching `:named` label in the AIR tabs. Not useful to
+            // end users — the diagnostic block below the verdict
+            // panel already pinpoints the failing source line.
+            ValidityResult::Invalid(_, _, _) => ("invalid".to_string(), false),
             ValidityResult::Canceled => ("timeout".to_string(), false),
             ValidityResult::TypeError(_) => ("type error".to_string(), false),
             ValidityResult::UnexpectedOutput(s) => (format!("solver error: {s}"), false),
         };
-        Self { function, kind, outcome, proved }
+        Self { function, span, kind, outcome, proved }
     }
 
-    // Render the verdict list into the body of the `VERDICT` tab.
-    // First line is the module-level summary (`verified` / `no
-    // queries` / `<n>/<m> queries failed`), followed by one line
-    // per verdict as `<function>: <kind> → <outcome>`.
-    fn summary(verdicts: &[Verdict]) -> String {
-        let mut body = String::new();
-        if verdicts.is_empty() {
-            writeln!(body, "no queries").unwrap();
-        } else if verdicts.iter().all(|v| v.proved) {
-            writeln!(body, "verified").unwrap();
-        } else {
-            let n_failed = verdicts.iter().filter(|v| !v.proved).count();
-            writeln!(body, "{}/{} queries failed", n_failed, verdicts.len()).unwrap();
-        }
-        for v in verdicts {
-            writeln!(body, "{}: {} → {}", v.function, v.kind, v.outcome).unwrap();
-        }
-        body
+    // Encode this verdict as a single JSON object — one line per call,
+    // hand-formatted so we don't pull in serde_json. Pairs with the
+    // `verus_verdict` JS extern (see `wasm.rs`). The frontend's
+    // `_verdicts[]` array accumulates these as they arrive and
+    // `renderMeta` builds the per-function pass/fail panel directly
+    // from that stream — no end-of-run text summary round trip.
+    fn to_json(&self) -> String {
+        format!(
+            r#"{{"function":"{}","span":"{}","kind":"{}","outcome":"{}","proved":{}}}"#,
+            json_escape(&self.function),
+            json_escape(&self.span),
+            json_escape(&self.kind),
+            json_escape(&self.outcome),
+            self.proved,
+        )
     }
 }
 
@@ -654,7 +683,7 @@ fn run_queries(
                     _ => 'v',
                 };
                 feeder.air_ctx.section(op_marker, &op.to_air_comment());
-                let r = handle_op(op, &mut function_opgen, feeder, output, mctx);
+                let r = handle_op(op, &mut function_opgen, feeder, mctx);
                 feeder.air_ctx.section_close();
                 r?;
             }
@@ -708,7 +737,6 @@ fn handle_op<'tcx>(
     op: Op,
     function_opgen: &mut FunctionOpGenerator,
     feeder: &mut Feeder<'_, 'tcx>,
-    output: &mut VerifyOutput,
     mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
     // Per-op `;;>`/`;;v` open + `;;<` close are emitted by the
@@ -724,6 +752,11 @@ fn handle_op<'tcx>(
         .as_ref()
         .map(|f| fun_as_friendly_rust_name(&f.x.name))
         .map(|n| n.strip_prefix("crate::").map(str::to_string).unwrap_or(n))
+        .unwrap_or_default();
+    let func_span = op
+        .function
+        .as_ref()
+        .map(|f| f.span.as_string.clone())
         .unwrap_or_default();
     let mut any_invalid = false;
     let mut any_timed_out = false;
@@ -828,11 +861,18 @@ fn handle_op<'tcx>(
                             // keeps `1/N queries failed` meaningful.
                             let push = verdict_is_query && (is_first_check || !proved);
                             if push {
-                                output.verdicts.push(Verdict::from_result(
+                                // Stream the verdict as JSON (one line per
+                                // call) so the frontend can update its
+                                // pass/fail table progressively. No
+                                // Rust-side accumulator — the UI is the
+                                // sole consumer.
+                                let verdict = Verdict::from_result(
                                     &result,
                                     func_name.clone(),
+                                    func_span.clone(),
                                     *query_op,
-                                ));
+                                );
+                                verus_verdict(&verdict.to_json());
                             }
 
                             // `check_valid_again` panics unless the
@@ -918,11 +958,14 @@ fn handle_op<'tcx>(
 }
 
 impl VerifyOutput {
-    // Stream each populated body + the computed verdict summary out
-    // to the browser via `emit_section` → `verus_dump`. Consumes
-    // `self` so the per-field `String`s move directly into the
-    // emission path without extra allocation. Empty bodies skip
-    // emit — saves a tab slot when a stage produced nothing.
+    // Stream each populated body out to the browser via `emit_section` →
+    // `verus_dump`. Consumes `self` so the per-field `String`s move
+    // directly into the emission path without extra allocation. Empty
+    // bodies skip emit — saves a tab slot when a stage produced nothing.
+    //
+    // Verdicts don't go through here — they stream live via the
+    // `verus_verdict` JS extern as each Z3 query lands (see `handle_op`).
+    // The frontend builds its verdict panel from that stream directly.
     pub(crate) fn write(self) {
         // Three views projected from `smt_body`:
         //   * SMT_QUERY     — strip `;;> response …\n…\n;;<` blocks
@@ -948,7 +991,6 @@ impl VerifyOutput {
             }
             emit_section(name, body);
         }
-        emit_section("VERDICT", Verdict::summary(&self.verdicts));
     }
 }
 
