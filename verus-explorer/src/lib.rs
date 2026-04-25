@@ -14,18 +14,21 @@
 // declarations at this crate root propagate to every submodule.
 //
 // Module layout:
-//   externs         — JS externs the host provides.
-//   wasm_libs       — in-memory filesystem for rustc's crate locator,
-//                     backing the `wasm_libs_*` + `set_std_mode`
-//                     wasm-bindgen entry points.
-//   util            — `time`, `emit_section`, `Block` / `Section`,
-//                     `push_item` / `push_banner` — used by every stage.
-//   rustc_stage     — Stage 1-2: `build_rustc_config`, diagnostic
-//                     plumbing, AST / HIR dumpers.
-//   vir_stage       — Stage 3: `build_vir` + vstd deserialize cache.
-//   verify_stage    — Stage 4: SST → AIR → SMT → Z3 driver (the bulk).
-//   pipeline        — `run_pipeline` dispatcher that sequences the four
-//                     stage modules, plus `dump_vir_and_verify` bridge.
+//   wasm    — wasm↔JS boundary: host-provided JS externs + the
+//             in-memory filesystem that backs rustc's crate
+//             locator (`wasm_libs_*` + `set_std_mode` entries).
+//   util    — `time`, `emit_section`, `Block` / `Section`,
+//             `push_item` / `push_banner` — used by every stage.
+//   rust    — Stages 1-2 (rust-side): `build_rustc_config`,
+//             diagnostic plumbing, AST / HIR dumpers.
+//   verus   — Stages 3-4 (verus-side): HIR → VIR (`build_vir` +
+//             vstd deserialize cache) and VIR → SST → AIR → SMT
+//             → Z3 driver (the bulk).
+//
+// `verify` (below) is the single wasm-bindgen entry that sequences
+// the stages: rustc_parse → dump_ast_pre_expansion → (inside
+// create_and_enter_global_ctxt) dump_ast → dump_hir → build_vir →
+// dump_vir → verify_simplified_krate → VerifyOutput::write.
 
 #![feature(rustc_private)]
 
@@ -43,19 +46,16 @@ extern crate rustc_span;
 
 use wasm_bindgen::prelude::*;
 
-mod externs;
-mod pipeline;
-mod rustc_stage;
+mod rust;
 mod util;
-mod verify_stage;
-mod vir_stage;
-mod wasm_libs;
+mod verus;
+mod wasm;
 
-pub use externs::perf_now;
-pub use wasm_libs::{set_std_mode, wasm_libs_add_file, wasm_libs_finalize};
-use externs::console_error;
-use pipeline::run_pipeline;
-use rustc_stage::build_rustc_config;
+pub use wasm::{perf_now, set_std_mode, wasm_libs_add_file, wasm_libs_finalize};
+use rust::{build_rustc_config, dump_ast, dump_ast_pre_expansion, dump_hir};
+use util::time;
+use verus::{VerifyOutput, build_vir, dump_vir, verify_simplified_krate};
+use wasm::console_error;
 
 // `#[wasm_bindgen(start)]` fires when this crate is the final cdylib (the
 // browser build via `wasm-pack build`). Integration tests link us as an
@@ -98,8 +98,49 @@ pub fn verify(src: &str, expand_errors: bool) {
     // Partial state the pipeline already handed off via `verus_dump` /
     // `verus_diagnostic` stays in the host, which is the whole survivability
     // story.
+    //
+    // Errors from `build_vir` / `verify_simplified_krate` have already been
+    // routed through the vendored `build_vir_crate` reporter (verifier.rs
+    // ~L2142) and the per-module reporter → DiagCtxt → HumanEmitter path in
+    // `verify_stage`, so they land in the DIAGNOSTICS section — we just
+    // swallow the `Result`s here and emit whatever we accumulated.
     rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
-        run_pipeline(compiler, expand_errors);
+        let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
+        // Pretty-print the parser output — essentially verbatim source wrapped
+        // in `verus! { ... }` (plus the implicit `no_std` / register_tool
+        // attributes we injected via `-Zcrate-attr`). Dump before
+        // `create_and_enter_global_ctxt` consumes `krate`, so the UI has a
+        // before/after pair against the expanded AST showing what the `verus!`
+        // macro actually rewrites into.
+        dump_ast_pre_expansion(&krate);
+        // `create_and_enter_global_ctxt` itself is cheap (~1ms); the expensive
+        // work runs lazily via `tcx` queries inside the closure. `dump_ast` is
+        // the first thing to call `tcx.resolver_for_lowering()`, which drives
+        // `passes::resolver_for_lowering_raw` → `configure_and_expand` —
+        // i.e., the `verus!` / `requires!` / `ensures!` / `proof!`
+        // proc-macros. That cost lands in `dump.ast`.
+        rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+            dump_ast(tcx);
+            dump_hir(tcx);
+            let Ok((krate, global_ctx, crate_name, spans)) =
+                time("build_vir", || build_vir(compiler, tcx))
+            else {
+                return;
+            };
+            dump_vir(&krate);
+            // `output` threaded in by-ref so dumps from earlier pipeline
+            // stages survive a later failure — upstream Verus bails with `?`
+            // on the first module error, which would otherwise discard every
+            // SST / AIR / SMT section accumulated and leave the UI showing
+            // only VIR.
+            let mut output = VerifyOutput::default();
+            let _ = time("verify", || {
+                verify_simplified_krate(
+                    krate, global_ctx, crate_name, compiler, &spans, expand_errors, &mut output,
+                )
+            });
+            output.write();
+        });
     });
 }
 

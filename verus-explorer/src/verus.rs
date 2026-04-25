@@ -1,30 +1,41 @@
-// Stage 4: VIR → AIR → Z3.
+// Stages 3-4: HIR → VIR → AIR → Z3 — the verus-side pipeline.
 //
-// Drives a fully-simplified Verus VIR krate through prune → Ctx →
-// ast_to_sst → poly → AIR generation → Z3, returning the dumped AIR
-// text and per-query verdicts. Mirrors `Verifier::verify_bucket` in
-// `rust_verify/src/verifier.rs` but skips the bucket / spinoff /
-// recommends / progress-bar / multi-thread machinery — the explorer
-// only needs the core VIR → AIR → SMT pipeline.
+// Stage 3 (`build_vir`, `dump_vir`, `vstd_krate`) drives Verus's
+// HIR-to-VIR lowering, caches the pre-serialized vstd VIR across
+// runs, and emits the VIR output tab.
 //
-// The Z3 backend is `air::context::Context`, which on wasm32 routes
-// through the `Z3_*` shims declared in `air/src/smt_process.rs` and
-// wired up in `public/app.js`.
+// Stage 4 (`verify_simplified_krate`, `write_verify_output`, and
+// the op loop) drives the simplified VIR krate through prune →
+// Ctx → ast_to_sst → poly → AIR → Z3, returning the per-query
+// verdicts and populating `VerifyOutput`. Mirrors
+// `Verifier::verify_bucket` in `rust_verify/src/verifier.rs` but
+// skips the bucket / spinoff / recommends / progress-bar /
+// multi-thread machinery — the explorer only needs the core
+// VIR → AIR → SMT pipeline.
+//
+// The Z3 backend is `air::context::Context`, which on wasm32
+// routes through the `Z3_*` shims declared in
+// `air/src/smt_process.rs` and wired up in `public/app.js`.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use air::ast::{Command, CommandX};
 use air::context::{Context, SmtSolver, ValidityResult};
 use air::messages::{Diagnostics, MessageLevel};
 use rust_verify::buckets::Bucket;
+use rust_verify::cargo_verus_dep_tracker::DepTracker;
 use rust_verify::commands::{FunctionOpGenerator, Op, OpGenerator, OpKind, QueryOp, Style};
+use rust_verify::config::ArgsX;
 use rust_verify::expand_errors_driver::ExpandErrorsResult;
+use rust_verify::import_export::CrateWithMetadata;
 use rust_verify::spans::SpanContext;
-use rust_verify::verifier::Reporter;
+use rust_verify::verifier::{Reporter, Verifier};
 use rustc_interface::interface::Compiler;
+use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::LOCAL_CRATE;
 use vir::ast::{ArchWordBits, Fun, Krate, VirErr};
 use vir::ast_util::fun_as_friendly_rust_name;
 use vir::context::{Ctx, GlobalCtx};
@@ -33,31 +44,100 @@ use vir::messages::{ToAny, VirMessageInterface};
 use vir::prelude::PreludeConfig;
 use vir::sst::{AssertId, KrateSst};
 
-use crate::externs::verus_z3_annotate;
-use crate::util::{Block, Section, emit_section, push_banner, push_item, time};
+use crate::util::{WalkBuilder, emit_section, time};
+use crate::wasm::wasm_libs_vstd_vir;
 
+// ==================== Stage 3: HIR → VIR ====================
+
+
+// Drives Verus's HIR→VIR pipeline. `Verifier::build_vir_crate` (vendored
+// addition) derives the inputs `construct_vir_crate` needs from (tcx, compiler),
+// runs HIR → raw VIR, then the head of `verify_crate_inner` (GlobalCtx +
+// check_traits + ast_simplify), returning both the simplified krate and the
+// (mutated) GlobalCtx so we can drive the downstream prune → Ctx →
+// ast_to_sst → AIR pipeline ourselves.
+pub(crate) fn build_vir<'tcx>(
+    compiler: &Compiler,
+    tcx: TyCtxt<'tcx>,
+) -> Result<(Krate, GlobalCtx, Arc<String>, SpanContext), Vec<VirErr>> {
+    let mut args = ArgsX::new();
+    // `Vstd::Imported` is the default and matches the user's
+    // `extern crate vstd;` injection. The vstd VIR is served out of the
+    // fetched libs bundle (`wasm_libs_vstd_vir()`) and passed straight
+    // in as `other_vir_crates` — `args.import` is path-based and doesn't
+    // work on wasm32, so we bypass the filesystem loader.
+    // Only non-default override: skip the Polonius-based lifetime check
+    // (wasm has no std::thread, and the lifetime pass isn't wasm-friendly).
+    // All other knobs — `no_external_by_default`, `no_auto_recommends_check`,
+    // etc. — stay at `ArgsX::new()` defaults, matching `cargo verify`. That
+    // turns on auto-recommends-on-failure (the `retry_with_recommends` call
+    // in `run_queries` below fires without further flag-wrangling).
+    args.no_lifetime = true;
+    let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
+    let vstd_krate = time("build_vir.vstd_deserialize", || vstd_krate())?;
+    let (krate, global_ctx, spans) = time("build_vir.build_vir_crate", || {
+        Verifier::new(Arc::new(args), None, false, DepTracker::init())
+            .build_vir_crate(compiler, tcx, vec!["vstd".to_string()], vec![vstd_krate])
+    })?;
+    Ok((krate, global_ctx, crate_name, spans))
+}
+
+// Deserialize-once cache for the bundled vstd VIR. `bincode::deserialize` of
+// the ~20 MB `vstd.vir` is the single biggest substage inside `build_vir`
+// (~55% in debug builds, ~135ms of the 244ms steady-state in release).
+// `Krate` is `Arc<KrateX>`, so cloning from the cache is an O(1) refcount
+// bump. Wasm is single-threaded — no contention on the OnceLock.
+static VSTD_KRATE: OnceLock<vir::ast::Krate> = OnceLock::new();
+
+fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
+    if let Some(k) = VSTD_KRATE.get() {
+        return Ok(k.clone());
+    }
+    let CrateWithMetadata { krate, .. } = bincode::deserialize(wasm_libs_vstd_vir())
+        .map_err(|_| vec![vir::messages::error_bare(
+            "failed to deserialize embedded VIR crate — version mismatch?",
+        )])?;
+    let _ = VSTD_KRATE.set(krate.clone());
+    Ok(krate)
+}
+
+// Walk the simplified VIR krate and emit the VIR output tab.
+// Ignores the walk's per-kind section headers (datatypes /
+// functions / …) — `WalkBuilder` emits a `;;> <kind> <name> <span>`
+// banner per item, which subsumes the outline info. External items
+// nest inside a per-crate outer fold; local items flow flat.
+pub(crate) fn dump_vir(krate: &Krate) {
+    time("dump.vir", || {
+        use vir::printer::WalkItem;
+        let mut b = WalkBuilder::new();
+        vir::printer::walk_krate(krate, &vir::printer::COMPACT_TONODEOPTS, |item: WalkItem<'_>| {
+            b.add_item(item.kind, &item.name, item.krate, item.span, item.text);
+        });
+        emit_section("VIR", b.finish());
+    });
+}
+
+// ==================== Stage 4: VIR → AIR → Z3 ====================
+
+// One `String` per output tab. SST entries are populated by `dump_sst`
+// in `verify_module` (one `WalkBuilder` pass per module, appended
+// end-to-end); the AIR / SMT entries are populated by
+// `LogBufs::drain_to` as each pipeline boundary fires (prelude, each
+// op, and for SMT each Z3 round trip). All seven share the same marker
+// conventions (`;;>` / `;;v` / `;;<`) so the browser's
+// `finalizeBannerBody` scanner handles them uniformly.
 #[derive(Default)]
 pub(crate) struct VerifyOutput {
-    /// Right after `ast_to_sst_krate` — VIR AST lowered into SST form
-    /// (still polymorphic; function bodies as SST expressions/statements).
-    /// One block per top-level item (function / datatype / trait / …),
-    /// with `fold: true` on items from external crates so the reader
-    /// can collapse them individually. Appended per module by
-    /// `dump_sst` in `verify_module`.
-    sst_ast_blocks: Vec<Block>,
-    /// After `poly::poly_krate_for_module` — monomorphized SST
-    /// (polymorphism erased; the form the AIR lowerer consumes). Same
-    /// per-item block shape as `sst_ast_blocks`.
-    sst_poly_blocks: Vec<Block>,
-    /// Block stream per AIR/SMT tab in `[AIR_INITIAL, AIR_MIDDLE,
-    /// AIR_FINAL, SMT]` order. `LogBufs::drain_block` pushes one
-    /// block per pipeline boundary (prelude, each op), with
-    /// `fold: true` for prelude and all Context ops, `fold: false`
-    /// for Query ops. Adjacent folded blocks merge into one so the
-    /// prelude + axiom / spec / broadcast / trait-impl setup
-    /// collapses to a single row with the user's query blocks
-    /// expanded beneath.
-    air_blocks: [Vec<Block>; 4],
+    sst_ast_body: String,
+    sst_poly_body: String,
+    air_initial_body: String,
+    air_middle_body: String,
+    air_final_body: String,
+    // Single SMT exchange buffer — `;;> response …\n…\n;;<`
+    // blocks live inline alongside commands. SMT_QUERY is derived
+    // from this at `write()` time by stripping those response
+    // blocks; SMT_TRANSCRIPT emits the buffer verbatim.
+    smt_body: String,
     verdicts: Vec<Verdict>,
 }
 
@@ -91,6 +171,26 @@ impl Verdict {
         };
         Self { function, kind, outcome, proved }
     }
+
+    // Render the verdict list into the body of the `VERDICT` tab.
+    // First line is the module-level summary (`verified` / `no
+    // queries` / `<n>/<m> queries failed`), followed by one line
+    // per verdict as `<function>: <kind> → <outcome>`.
+    fn summary(verdicts: &[Verdict]) -> String {
+        let mut body = String::new();
+        if verdicts.is_empty() {
+            writeln!(body, "no queries").unwrap();
+        } else if verdicts.iter().all(|v| v.proved) {
+            writeln!(body, "verified").unwrap();
+        } else {
+            let n_failed = verdicts.iter().filter(|v| !v.proved).count();
+            writeln!(body, "{}/{} queries failed", n_failed, verdicts.len()).unwrap();
+        }
+        for v in verdicts {
+            writeln!(body, "{}: {} → {}", v.function, v.kind, v.outcome).unwrap();
+        }
+        body
+    }
 }
 
 // Box<dyn Write> needs 'static, but we want to drain the captured bytes back
@@ -120,8 +220,17 @@ impl io::Write for SharedBuf {
     }
 }
 
-// Holds the four shared buffers attached to an AIR `Context` for log capture.
-// `attach` creates them and wires them into the context in one step.
+// Shared buffers attached to an AIR `Context` for log capture.
+// Four destinations:
+//   * air_initial / air_middle / air_final — the three AIR
+//     lowering stages (before/during/after type specialization).
+//   * smt — single buffer attached as `smt_transcript_log`,
+//     which (post-Option-C in `air/src/emitter.rs`) receives
+//     both the command stream + section markers at emission
+//     time *and* the per-response timing banners + Z3 replies
+//     after each round trip. SMT_TRANSCRIPT is the buffer
+//     verbatim; SMT_QUERY / SMT_RESPONSE are projections at
+//     `VerifyOutput::write()` time.
 struct LogBufs {
     air_initial: SharedBuf,
     air_middle: SharedBuf,
@@ -131,8 +240,8 @@ struct LogBufs {
 
 // Attaching each log writer makes the air crate serialize every command to
 // text as it's fed. Cheap per-command work (~8ms total for a tiny program),
-// so we always attach all four; the browser caches the text on the JS side
-// and toggles rendering from the cache instead of re-parsing on every
+// so we always attach all four; the browser caches the text on the JS
+// side and toggles rendering from the cache instead of re-parsing on every
 // checkbox change.
 impl LogBufs {
     fn attach(ctx: &mut Context) -> Self {
@@ -145,37 +254,24 @@ impl LogBufs {
         ctx.set_air_initial_log(Box::new(bufs.air_initial.clone()));
         ctx.set_air_middle_log(Box::new(bufs.air_middle.clone()));
         ctx.set_air_final_log(Box::new(bufs.air_final.clone()));
-        ctx.set_smt_log(Box::new(bufs.smt.clone()));
+        // Single attachment: the transcript writer receives both
+        // halves of the SMT exchange (commands at emission time,
+        // responses after each round trip via `Context::log_smt_
+        // response`). `set_smt_log` would only get the commands
+        // half — we don't need a separate replayable `.smt2` from
+        // the explorer.
+        ctx.set_smt_transcript_log(Box::new(bufs.smt.clone()));
         bufs
     }
 
-    // Drain all four log buffers as one atomic snapshot and push one
-    // block per tab onto `blocks` (indexed [initial, middle, final,
-    // smt]). Adjacent folded blocks merge, so consecutive Context
-    // ops collapse into the prelude's fold row. Skips the push when
-    // the snapshot is empty.
-    fn drain_block(&self, blocks: &mut [Vec<Block>; 4], fold: bool) {
-        let texts: [String; 4] = [
-            self.air_initial.drain_string(),
-            self.air_middle.drain_string(),
-            self.air_final.drain_string(),
-            self.smt.drain_string(),
-        ];
-        if texts.iter().all(|t| t.trim().is_empty()) {
-            return;
-        }
-        for (i, content) in texts.into_iter().enumerate() {
-            if let Some(prev) = blocks[i].last_mut() {
-                if fold && prev.fold {
-                    if !prev.content.ends_with('\n') {
-                        prev.content.push('\n');
-                    }
-                    prev.content.push_str(&content);
-                    continue;
-                }
-            }
-            blocks[i].push(Block { content, fold });
-        }
+    // Drain all five log buffers and append each into the matching
+    // field of `output`. Fold structure is computed JS-side by
+    // scanning markers — no per-op block boundaries or merge logic.
+    fn drain_to(&self, output: &mut VerifyOutput) {
+        output.air_initial_body.push_str(&self.air_initial.drain_string());
+        output.air_middle_body.push_str(&self.air_middle.drain_string());
+        output.air_final_body.push_str(&self.air_final.drain_string());
+        output.smt_body.push_str(&self.smt.drain_string());
     }
 }
 
@@ -209,16 +305,6 @@ impl<'a, 'tcx> Feeder<'a, 'tcx> {
             self.feed(cmd);
         }
     }
-}
-
-// Stamp the op's label into the AIR/SMT logs (via `air_ctx.comment`) and
-// into the Z3 response buffer (via the JS extern). Both tabs then read as
-// per-op stanzas instead of a flat stream. Same payload for each sink so
-// the banners line up across tabs.
-fn emit_op_banner(feeder: &mut Feeder, op: &Op) {
-    let comment = op.to_air_comment();
-    feeder.air_ctx.comment(&comment);
-    verus_z3_annotate(&comment);
 }
 
 // -------- drivers --------
@@ -312,12 +398,13 @@ fn verify_module(
         .map(|f| f.x.name.clone())
         .collect();
 
-    let dump_sst = |blocks: &mut Vec<Block>, k: &KrateSst| {
-        use vir::printer::WalkEvent;
-        vir::printer::walk_krate_sst(k, &vir::printer::COMPACT_TONODEOPTS, |event| match event {
-            WalkEvent::Section(name) => push_banner(blocks, name),
-            WalkEvent::Item { krate, span, text } => push_item(blocks, krate, span, text),
+    let dump_sst = |body: &mut String, k: &KrateSst| {
+        use vir::printer::WalkItem;
+        let mut b = WalkBuilder::new();
+        vir::printer::walk_krate_sst(k, &vir::printer::COMPACT_TONODEOPTS, |item: WalkItem<'_>| {
+            b.add_item(item.kind, &item.name, item.krate, item.span, item.text);
         });
+        body.push_str(&b.finish());
     };
 
     let krate_sst = time("verify.ast_to_sst", || vir::ast_to_sst_crate::ast_to_sst_krate(
@@ -326,29 +413,33 @@ fn verify_module(
         &bucket_funs,
         &pruned,
     ))?;
-    time("dump.sst_ast", || dump_sst(&mut output.sst_ast_blocks, &krate_sst));
+    time("dump.sst_ast", || dump_sst(&mut output.sst_ast_body, &krate_sst));
     let krate_sst = time("verify.poly", || vir::poly::poly_krate_for_module(&mut ctx, &krate_sst));
-    time("dump.sst_poly", || dump_sst(&mut output.sst_poly_blocks, &krate_sst));
+    time("dump.sst_poly", || dump_sst(&mut output.sst_poly_body, &krate_sst));
 
     // `Context::new` calls `SmtProcess::launch` → `Z3_mk_config`+`Z3_mk_context`,
     // which on wasm hops into the Emscripten Z3 runtime and spins up a fresh
     // solver context. That's not free — each context is its own Z3 state.
-    let mut air_ctx = time("verify.air_ctx_new", || {
-        let mut c = Context::new(mctx.msg.clone(), mctx.solver);
-        c.set_z3_param("air_recommended_options", "true");
-        // Cap each Z3 query at ~60 seconds of solver work (`RLIMIT_PER_SECOND`
-        // = 3_000_000 in upstream Verus' `verifier.rs:50`, so 60 * that is
-        // roughly the 60-second budget). Upstream's `ArgsX::new` default
-        // is `f32::INFINITY`, which is only appropriate when a human can
-        // Ctrl-C; a pathological assert in the browser would otherwise
-        // hang the tab with no abort path. Bumped from the `--rlimit=10`
-        // CLI default because heavier examples (e.g. doubly_linked_xor's
-        // bit-vector XOR + quantifier reasoning) hit Z3's "incomplete
-        // theory quant" when they run out of budget mid-instantiation.
-        c.set_rlimit(60 * 3_000_000);
-        c
-    });
+    //
+    // Attach `LogBufs` *before* the `set_z3_param` / `set_rlimit` calls so
+    // the resulting `(set-option …)` lines (and the implicit ones the
+    // `air_recommended_options` macro expands to) flow into the SMT_QUERY
+    // and SMT_TRANSCRIPT tabs. Pre-attach writes would only land in the
+    // pipe buffer and silently drop on the log side, hiding the early
+    // solver-config preamble from the UI.
+    let mut air_ctx = time("verify.air_ctx_new", || Context::new(mctx.msg.clone(), mctx.solver));
     let bufs = LogBufs::attach(&mut air_ctx);
+    air_ctx.set_z3_param("air_recommended_options", "true");
+    // Cap each Z3 query at ~60 seconds of solver work (`RLIMIT_PER_SECOND`
+    // = 3_000_000 in upstream Verus' `verifier.rs:50`, so 60 * that is
+    // roughly the 60-second budget). Upstream's `ArgsX::new` default
+    // is `f32::INFINITY`, which is only appropriate when a human can
+    // Ctrl-C; a pathological assert in the browser would otherwise
+    // hang the tab with no abort path. Bumped from the `--rlimit=10`
+    // CLI default because heavier examples (e.g. doubly_linked_xor's
+    // bit-vector XOR + quantifier reasoning) hit Z3's "incomplete
+    // theory quant" when they run out of budget mid-instantiation.
+    air_ctx.set_rlimit(60 * 3_000_000);
     let mut feeder = Feeder { air_ctx: &mut air_ctx, msg: mctx.msg, reporter: mctx.reporter };
     time("verify.queries", || {
         run_queries(&mut feeder, &bufs, &mut ctx, &krate_sst, bucket_funs, output, mctx)
@@ -413,18 +504,69 @@ fn run_queries(
     // boilerplate the reader rarely wants expanded. Each op below
     // drains into its own expanded block so queries / context ops
     // read linearly beneath the collapsed prelude.
-    verus_z3_annotate("AIR prelude");
+    // `;;> AIR prelude` is emitted upstream at context.rs:415 —
+    // close it here after the prelude decls have been fed.
     time("verify.feed_decls", || feed_module_decls(feeder, ctx, krate_sst, mctx))?;
-    bufs.drain_block(&mut output.air_blocks, /* fold */ true);
+    feeder.air_ctx.section_close();
+    bufs.drain_to(output);
 
     let bucket = Bucket { funs: bucket_funs };
     let mut opgen = OpGenerator::new(ctx, krate_sst, bucket);
-    while let Some(mut function_opgen) = opgen.next()? {
-        while let Some(op) = next_op(&mut function_opgen, feeder.reporter) {
-            handle_op(op, &mut function_opgen, feeder, bufs, output, mctx)?;
+    // Wrap runs of same-external-crate ops in an outer `;;> <crate>`
+    // section so the reader sees one collapsible "vstd" group
+    // instead of ~50 flat sibling sections. Local-crate ops flow
+    // flat at the top level — they're the user's own code and don't
+    // benefit from an extra header. `wrapper_krate` tracks the
+    // currently-open external wrapper (or `None` when we're at the
+    // flat level); rotating wrappers on each crate transition keeps
+    // them balanced even when local ops interleave with external
+    // runs.
+    //
+    // Emit per-op open/close here (not inside `handle_op`) so the
+    // pairing survives any `?`-early-return paths — a bare `?`
+    // inside a manually-paired open/close would leak an open.
+    let mut wrapper_krate: Option<Arc<String>> = None;
+    let result: Result<(), VirErr> = (|| {
+        while let Some(mut function_opgen) = opgen.next()? {
+            while let Some(op) = next_op(&mut function_opgen, feeder.reporter) {
+                let cur_krate = op.function.as_ref().and_then(|f| f.x.name.path.krate.clone());
+                if wrapper_krate != cur_krate {
+                    if wrapper_krate.is_some() {
+                        feeder.air_ctx.section_close();
+                    }
+                    if let Some(k) = &cur_krate {
+                        feeder.air_ctx.section('>', k);
+                    }
+                    wrapper_krate = cur_krate;
+                }
+                // Auto-fold only external-crate Context ops — they're
+                // vstd boilerplate the reader rarely wants open. Local
+                // Context ops (the user's own specs / axioms) stay
+                // expanded, as do all Query ops (the actual check-sat
+                // bodies). Each gets its own gutter marker so the
+                // user can fold individually if they want.
+                let op_marker = match op.kind {
+                    OpKind::Context(..) if wrapper_krate.is_some() => '>',
+                    _ => 'v',
+                };
+                feeder.air_ctx.section(op_marker, &op.to_air_comment());
+                let r = handle_op(op, &mut function_opgen, feeder, output, mctx);
+                feeder.air_ctx.section_close();
+                r?;
+            }
         }
+        Ok(())
+    })();
+    // Close the final crate wrapper (if one was open) whether or not
+    // an op errored — keeps open/close balanced on the error path.
+    if wrapper_krate.is_some() {
+        feeder.air_ctx.section_close();
     }
-    Ok(())
+    // Final drain: catches the per-op section_close emits (they
+    // land in pipe_buffer AFTER handle_op returns) and the closing
+    // crate wrapper above.
+    bufs.drain_to(output);
+    result
 }
 
 // Pull the next op. Preference: first drain any expand-errors sub-query
@@ -462,11 +604,12 @@ fn handle_op<'tcx>(
     op: Op,
     function_opgen: &mut FunctionOpGenerator,
     feeder: &mut Feeder<'_, 'tcx>,
-    bufs: &LogBufs,
     output: &mut VerifyOutput,
     mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
-    emit_op_banner(feeder, &op);
+    // Per-op `;;>`/`;;v` open + `;;<` close are emitted by the
+    // caller (`run_queries`) so the pairing survives any `?` early-
+    // return in this function.
 
     // The explorer always compiles an anonymous crate, so every user
     // function's friendly name starts with `crate::`. Strip it so the
@@ -660,48 +803,96 @@ fn handle_op<'tcx>(
         };
         function_opgen.report_expand_error_result(res);
     }
-    // Drain this op's text. Mirrors `push_item`'s VIR/SST rule: fold
-    // iff the op isn't local user code — context ops for external
-    // crates (vstd function-axioms / specs) and no-function setup ops
-    // (broadcasts, trait-impl axioms) collapse into the prelude row;
-    // context ops for local functions and queries (always tied to a
-    // local function) stay expanded so the reader sees the actual
-    // check-sat bodies and their immediate setup. `drain_block`
-    // merges adjacent folded blocks so vstd runs stay as one row.
-    let fold = op.function.as_ref().is_none_or(|f| f.x.name.path.krate.is_some());
-    bufs.drain_block(&mut output.air_blocks, fold);
+    // Drain this op's text into the AIR bodies. JS computes fold
+    // structure from scanning `;;` banners — see `finalizeBanner-
+    // Body` in `public/app.js`. AIR and Z3 Query / Reply fold in
+    // lockstep because they receive the same section stream
+    // (`air_ctx.section` writes to all four logs). `drain_to` runs
+    // at the end of `run_queries` so per-op section_close emits in
+    // the caller land in `log_bodies` too.
     Ok(())
 }
 
-pub(crate) fn write_verify_output(output: VerifyOutput) {
-    let VerifyOutput {
-        sst_ast_blocks, sst_poly_blocks, air_blocks, verdicts,
-    } = output;
-    let [ai, am, af, smt] = air_blocks;
-    for (name, blocks) in [
-        ("SST_AST", sst_ast_blocks),
-        ("SST_POLY", sst_poly_blocks),
-        ("AIR_INITIAL", ai),
-        ("AIR_MIDDLE", am),
-        ("AIR_FINAL", af),
-        ("SMT", smt),
-    ] {
-        if blocks.iter().all(|b| b.content.trim().is_empty()) {
+impl VerifyOutput {
+    // Stream each populated body + the computed verdict summary out
+    // to the browser via `emit_section` → `verus_dump`. Consumes
+    // `self` so the per-field `String`s move directly into the
+    // emission path without extra allocation. Empty bodies skip
+    // emit — saves a tab slot when a stage produced nothing.
+    pub(crate) fn write(self) {
+        // Three views projected from `smt_body`:
+        //   * SMT_QUERY     — strip `;;> response …\n…\n;;<` blocks
+        //   * SMT_RESPONSE  — keep section markers + response blocks
+        //   * SMT_TRANSCRIPT — verbatim
+        // Build the projections first (borrows self.smt_body), then
+        // move everything into the emission loop.
+        let smt_query_body = project_smt(&self.smt_body, /* keep_responses */ false);
+        let smt_response_body = project_smt(&self.smt_body, /* keep_responses */ true);
+        for (name, body) in [
+            ("SST_AST", self.sst_ast_body),
+            ("SST_POLY", self.sst_poly_body),
+            ("AIR_INITIAL", self.air_initial_body),
+            ("AIR_MIDDLE", self.air_middle_body),
+            ("AIR_FINAL", self.air_final_body),
+            ("SMT_QUERY", smt_query_body),
+            ("SMT_RESPONSE", smt_response_body),
+            ("SMT_TRANSCRIPT", self.smt_body),
+        ] {
+            if body.trim().is_empty() {
+                continue;
+            }
+            emit_section(name, body);
+        }
+        emit_section("VERDICT", Verdict::summary(&self.verdicts));
+    }
+}
+
+// Project an SMT transcript into either:
+//   * `keep_responses = false` → drop the `;;> response …\n…\n;;<`
+//     blocks; keep commands + section markers (the SMT_QUERY view).
+//   * `keep_responses = true`  → drop command lines; keep section
+//     markers and the contents of every response block (the
+//     SMT_RESPONSE view, which the JS scanner further folds away
+//     empty op sections from).
+// Section markers (`;;>`/`;;v`/`;;<`) always pass through so the
+// fold structure is preserved across both views.
+fn project_smt(transcript: &str, keep_responses: bool) -> String {
+    let mut out = String::with_capacity(transcript.len());
+    let mut in_response = false;
+    for line in transcript.lines() {
+        let is_marker = line.starts_with(";;>") || line.starts_with(";;v") || line == ";;<";
+        if line.starts_with(";;> response ") {
+            in_response = true;
+            if keep_responses {
+                out.push_str(line);
+                out.push('\n');
+            }
             continue;
         }
-        emit_section(Section { name, blocks });
+        if in_response && line == ";;<" {
+            in_response = false;
+            if keep_responses {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        // Body line of a response: keep iff we're projecting the
+        // response view; drop iff we're projecting the query view.
+        if in_response {
+            if keep_responses {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        // Outside a response block — keep iff projecting query, OR
+        // it's a section marker (always preserved for fold structure).
+        if !keep_responses || is_marker {
+            out.push_str(line);
+            out.push('\n');
+        }
     }
-    let mut verdict = String::new();
-    if verdicts.is_empty() {
-        writeln!(verdict, "no queries").unwrap();
-    } else if verdicts.iter().all(|v| v.proved) {
-        writeln!(verdict, "verified").unwrap();
-    } else {
-        let n_failed = verdicts.iter().filter(|v| !v.proved).count();
-        writeln!(verdict, "{}/{} queries failed", n_failed, verdicts.len()).unwrap();
-    }
-    for v in &verdicts {
-        writeln!(verdict, "{}: {} → {}", v.function, v.kind, v.outcome).unwrap();
-    }
-    emit_section(Section::single("VERDICT", verdict));
+    out
 }
+

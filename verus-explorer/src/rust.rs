@@ -25,14 +25,14 @@ use rustc_session::config::{self, ErrorOutputType, Input};
 use rustc_span::source_map::{FileLoader, SourceMap};
 use rustc_span::{FileName, Symbol};
 
-use crate::externs::{verus_diagnostic, verus_diagnostic_json};
-use crate::util::{Section, emit_section, time};
-use crate::wasm_libs::std_mode;
+use crate::wasm::{verus_diagnostic, verus_diagnostic_json};
+use crate::util::{emit_section, time};
+use crate::wasm::std_mode;
 
 pub(crate) fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
     time("dump.ast_pre", || {
         let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
-        emit_section(Section::single("AST_PRE", body));
+        emit_section("AST_PRE", body);
     });
 }
 
@@ -334,7 +334,7 @@ pub(crate) fn dump_ast(tcx: TyCtxt<'_>) {
         let borrow = tcx.resolver_for_lowering().borrow();
         let (_, krate) = &*borrow;
         let body = rustc_ast_pretty::pprust::crate_to_string_for_macros(krate);
-        emit_section(Section::single("AST", body));
+        emit_section("AST", body);
     });
 }
 
@@ -362,7 +362,7 @@ pub(crate) fn dump_hir(tcx: TyCtxt<'_>) {
             body.push_str(&rustc_hir_pretty::item_to_string(&tcx, item));
             body.push('\n');
         }
-        emit_section(Section::single("HIR", body));
+        emit_section("HIR", body);
     });
 
     // Typed variant: mirror rustc's `-Zunpretty=hir-typed`
@@ -380,7 +380,7 @@ pub(crate) fn dump_hir(tcx: TyCtxt<'_>) {
                 body.push('\n');
             }
         });
-        emit_section(Section::single("HIR_TYPED", body));
+        emit_section("HIR_TYPED", body);
     });
 }
 

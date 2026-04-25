@@ -56,7 +56,6 @@ extern "C" {
       globalThis._sections = new Map();\n\
       globalThis.verus_diagnostic = () => {};\n\
       globalThis.verus_diagnostic_json = () => {};\n\
-      globalThis.verus_z3_annotate = () => {};\n\
       globalThis.verus_dump = (section, contents, _folds) => {\n\
         let body = '';\n\
         for (let i = 0; i < contents.length; i++) {\n\
@@ -108,6 +107,11 @@ extern "C" {
 // Everything else (set-option, declare-fun, push/pop, assert,
 // get-info :version with `ignore_unexpected_smt=false` and no expected
 // version) produces no output and flows through empty-lines handling.
+//
+// Rust-side capture (smt_log + smt_transcript_log attached as SharedBufs
+// in verify_stage.rs) provides the full query / transcript content via
+// the standard `verus_dump` path, so the test reads them via
+// `section_body("SMT_QUERY")` / `section_body("SMT_TRANSCRIPT")`.
 #[wasm_bindgen(inline_js = "\
     export function install_z3_stubs() {\n\
       let next_id = 1;\n\
@@ -196,6 +200,89 @@ fn pipeline_preserves_ghost_proof_block() {
         assert!(
             vir.contains("AssertAssume"),
             "VIR missing AssertAssume on {label} — proof block was erased before VIR:\n{vir}"
+        );
+        // arch is the very last VIR item (no section wraps it); its
+        // banner + content + close sit at the end of the body. Guard
+        // it explicitly — fold-range bugs tend to show up at EOF.
+        assert!(
+            vir.contains(";;v arch word_bits"),
+            "VIR missing `;;v arch word_bits` on {label}"
+        );
+        // Section markers embedded via `air_ctx.section(marker, …)`
+        // / `section_close()` must reach the outputs, otherwise
+        // the browser's fold scanner has no markers to key off of.
+        // `;;>` on the prelude and Context ops, `;;v` on Query ops,
+        // `;;<` to close. A regression here usually means markers
+        // reverted to plain `;;` or close emits got lost.
+        //
+        // AIR_INITIAL is the canonical source: `run_queries` does
+        // a final `drain_to` after the loop so trailing closes
+        // always land in `air_bodies`. (The Z3 pipe path drops
+        // trailing closes because nothing flushes `pipe_buffer`
+        // after the last `(check-sat)`.)
+        let air = section_body("AIR_INITIAL");
+        let prelude_count = air.matches(";;> AIR prelude").count();
+        assert_eq!(
+            prelude_count, 1,
+            "expected exactly one `;;> AIR prelude` section on {label}, got {prelude_count}"
+        );
+        assert!(
+            air.contains(";;v Function-Def crate::main"),
+            "AIR body missing `;;v Function-Def crate::main` section on {label}"
+        );
+        // Context-op marker depends on the op's source crate:
+        // `;;>` (auto-fold) for external crates, `;;v` (expanded)
+        // for local. This tiny smoke source has no vstd *function*
+        // dependencies so every Context op here is local.
+        assert!(
+            air.contains(";;v Function-Specs crate::main")
+                || air.contains(";;v Function-Axioms crate::main"),
+            "AIR body missing a local Context section on {label}"
+        );
+        assert!(
+            air.contains(";;<"),
+            "AIR body missing `;;<` close markers on {label}"
+        );
+        let is_open = |l: &&str| {
+            (l.starts_with(";;>") && (l.len() == 3 || l.as_bytes()[3] == b' '))
+                || (l.starts_with(";;v") && (l.len() == 3 || l.as_bytes()[3] == b' '))
+        };
+        let is_close = |l: &&str| *l == ";;<" || l.starts_with(";;< ");
+        let opens = air.lines().filter(is_open).count();
+        let closes = air.lines().filter(is_close).count();
+        if opens != closes {
+            let markers: Vec<&str> = air.lines().filter(|l| is_open(l) || is_close(l)).collect();
+            panic!(
+                "open/close balance mismatch in AIR_INITIAL on {label}: \
+                 {opens} opens vs {closes} closes\nmarkers in order:\n{}",
+                markers.join("\n")
+            );
+        }
+        // SMT tabs are fed by Rust-owned `set_smt_log` /
+        // `set_smt_transcript_log` channels — `SMT_QUERY` mirrors
+        // what Verus sends Z3, `SMT_TRANSCRIPT` interleaves it
+        // with the stub Z3's `unsat` / `(:rlimit-count …)` replies.
+        let smt_query = section_body("SMT_QUERY");
+        assert!(
+            smt_query.contains(";;v Function-Def crate::main"),
+            "SMT_QUERY missing `;;v Function-Def crate::main` on {label}"
+        );
+        let smt_transcript = section_body("SMT_TRANSCRIPT");
+        // SMT_TRANSCRIPT mirrors SMT_QUERY's op-level wrappers
+        // (from `Context::section` tee), plus a `;;v <ms>` fold per
+        // Z3 reply. Commands between markers flow as plain content.
+        assert!(
+            smt_transcript.contains(";;v Function-Def crate::main"),
+            "SMT_TRANSCRIPT missing op-level section header on {label}"
+        );
+        assert!(
+            smt_transcript.contains("ms\n"),
+            "SMT_TRANSCRIPT missing per-response timing banner on {label}"
+        );
+        assert!(
+            smt_transcript.contains("unsat"),
+            "SMT_TRANSCRIPT missing Z3 `unsat` reply on {label} — \
+             transcript_log isn't capturing Z3_eval_smtlib2_string output"
         );
     }
 

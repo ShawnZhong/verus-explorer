@@ -103,13 +103,6 @@ const LIBS = [...LIBS_SHARED, ...(stdMode ? LIBS_STD_ONLY : LIBS_NOSTD_ONLY)];
 // The bottom of this script `await`s `wasmReady` to flip the button
 // live and kick off the first verify.
 let verus = null;
-// z3 transcript buffer — hoisted out of the IIFE so `runVerify` (which
-// clears it at the top of each run and reads it at the bottom) sees the
-// same binding the Z3 eval wrapper pushes into. Reassigned (not just
-// cleared) by `runVerify` to `[]` each run; the wrapper's closure
-// captures the *variable*, not the initial array, so the push keeps
-// targeting the live buffer.
-let z3ResponseBuffer = [];
 // Progress counter for cold-load. Each `libs/*.gz` fetch bumps this
 // when it resolves and updates the Verify button label, so the user
 // sees "Loading 3/18 libs…" instead of a static "Loading verifier…"
@@ -142,17 +135,9 @@ const wasmReady = (async () => {
   globalThis.Z3_mk_context = Z3.cwrap('Z3_mk_context', 'number', ['number']);
   globalThis.Z3_del_config = Z3.cwrap('Z3_del_config', null, ['number']);
   globalThis.Z3_del_context = Z3.cwrap('Z3_del_context', null, ['number']);
-  // `Z3_eval_smtlib2_string` returns the solver's textual reply (`sat` /
-  // `unsat` / errors / model output) for each batch of SMT commands sent
-  // from the AIR driver. The AIR log writers capture *input* SMT-LIB2 but
-  // the replies are otherwise opaque; tee them into `z3ResponseBuffer`
-  // here so `runVerify` can stash the transcript as a 'Z3' section.
-  const z3Eval = Z3.cwrap('Z3_eval_smtlib2_string', 'string', ['number', 'string']);
-  globalThis.Z3_eval_smtlib2_string = (ctx, query) => {
-    const reply = z3Eval(ctx, query);
-    z3ResponseBuffer.push(reply);
-    return reply;
-  };
+  globalThis.Z3_eval_smtlib2_string = Z3.cwrap(
+    'Z3_eval_smtlib2_string', 'string', ['number', 'string']
+  );
 
   // One wasm instance, reused for every `verify` call. Each
   // `run_compiler` builds its own Session+CStore; nothing leaks across
@@ -313,27 +298,27 @@ const fetchExample = (file) => fetch(`./examples/${file}`).then(r => r.text());
 // (a key of `optionByFile`), or null if the editor holds custom
 // content (hash-loaded `#code=…`, pasted legacy hash, or edited-off
 // from an example then navigated to custom via some future path).
-// `pristineSource` is the shipped source for `loadedSource`, held
-// so dirty-detection and Reset don't require a refetch.
-// `STORAGE_PREFIX + file` is the per-example localStorage key: the
-// stored value is the editor's source the last time it diverged from
-// pristine. Removed on Reset; refreshed on every edit.
+// `pristineSource` is the shipped source for `loadedSource`, held so
+// Reset doesn't need a refetch.
+// `STORAGE_PREFIX + file` is the per-example localStorage key:
+// refreshed on every edit so switching away + back restores the user's
+// work-in-progress.
 const STORAGE_PREFIX = 've-source:';
 let loadedSource = null;
 let pristineSource = null;
-// Every caller runs post-mount (updateListener fires only on dispatched
-// transactions; the explicit `updateSourceUI()` in the wiring block
-// runs after `const view = …`). So `view` is always defined here.
-const isDirty = () => loadedSource !== null
-  && view.state.doc.toString() !== pristineSource;
-// Rewrites the dropdown selection, Reset-button visibility, and
-// prev/next enabled state from the current values of `loadedSource`
-// + doc contents. Call on every state transition (load / reset /
-// edit / external hash-change). The Reset button alone signals the
-// dirty state; the dropdown labels stay pristine.
+// One-way dirty flag — flips true on the first user-driven edit
+// (or load with a localStorage override that already differs from
+// pristine) and stays true even if the user manually undoes back
+// to pristine. The cost is O(1) per keystroke (a userEvent check)
+// vs O(n) for a `doc.toString() === pristine` compare; for a
+// hand-pasted multi-KB source the saving is real.
+let dirty = false;
+// Rewrites the dropdown selection, Reset visibility, and prev/next
+// enabled state from the current `loadedSource`. Reset shows whenever
+// the loaded example is dirty — see `dirty` above for the semantics.
 const updateSourceUI = () => {
   sourceSelect.value = loadedSource ?? '';
-  resetBtn.hidden = !isDirty();
+  resetBtn.hidden = loadedSource === null || !dirty;
   const idx = loadedSource === null
     ? -1
     : EXAMPLES.findIndex(e => e.file === loadedSource);
@@ -352,13 +337,13 @@ const TAB_GROUPS = [
   { id: 'Rust',  label: 'Rust IR',     variants: ['AST_PRE', 'AST', 'HIR', 'HIR_TYPED'] },
   { id: 'VIR',   label: 'Verus IR',    variants: ['VIR', 'SST_AST', 'SST_POLY'] },
   { id: 'AIR',   label: 'Assert IR',   variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
-  { id: 'Z3',    label: 'Z3 Solver',   variants: ['SMT', 'Z3'] },
+  { id: 'Z3',    label: 'Z3 Solver',   variants: ['SMT_TRANSCRIPT', 'SMT_QUERY', 'SMT_RESPONSE'] },
 ];
 const VARIANT_LABEL = {
   AST_PRE: 'AST', AST: 'Expanded AST', HIR: 'HIR', HIR_TYPED: 'Typed HIR',
   VIR: 'AST', SST_AST: 'SST', SST_POLY: 'Mono',
   AIR_INITIAL: 'Blocks', AIR_MIDDLE: 'SSA', AIR_FINAL: 'Flat',
-  SMT: 'Query', Z3: 'Response',
+  SMT_TRANSCRIPT: 'Log', SMT_QUERY: 'Query', SMT_RESPONSE: 'Result',
 };
 // Flat section order + section → group lookup, both derived from
 // TAB_GROUPS so adding a new variant is a one-line change.
@@ -369,13 +354,23 @@ const GROUP_OF = new Map(TAB_GROUPS.flatMap(g => g.variants.map(v => [v, g.id]))
 // they left it rather than snapping back to the first variant.
 const lastVariantInGroup = new Map();
 
-// Rust-declared fold ranges per section — populated by `verus_dump`
-// when it receives a block flagged `fold: 1` (e.g. the vstd appendix
-// on VIR / SST_AST / SST_POLY). Each entry is `[{from, to}, …]` with
-// absolute offsets into the rendered body. `renderOutputView` auto-
-// applies them on cold render; `sectionFold` below re-offers them
-// to the fold gutter so the user can refold after expanding.
+// Fold state per section, split into two Maps to match CM6's
+// foldable-vs-folded distinction:
+//
+// - `sectionFolds` — every range the gutter should offer a ▾ marker
+//   for (i.e. "foldable"). Feeds `sectionFold` (the foldService) so
+//   the user can collapse on demand and re-collapse after expanding.
+// - `sectionAutoFolded` — the subset that `renderOutputView` applies
+//   via `foldEffect` on cold render (i.e. "folded by default").
+//
+// For AIR / VIR / SST tabs, `verus_dump` populates both Maps from the
+// same Rust-declared `fold: 1` flag — every declared fold is both
+// foldable and auto-folded. For the JS-sourced Z3 Query / Reply tabs,
+// `finalizeZ3Body` registers every `;;` banner as foldable but only
+// auto-folds context / prelude stanzas (Query tab) or nothing
+// (Reply tab).
 const sectionFolds = new Map();
+const sectionAutoFolded = new Map();
 
 // `verify` always produces every IR; bodies are cached here so
 // flipping a tab just swaps the output-view's doc instead of re-parsing.
@@ -724,7 +719,7 @@ const LANGUAGE_FOR_SECTION = {
   AST_PRE: rust(), AST: rust(), HIR: rust(), HIR_TYPED: rust(),
   VIR: sexpLanguage, SST_AST: sexpLanguage, SST_POLY: sexpLanguage,
   AIR_INITIAL: sexpLanguage, AIR_MIDDLE: sexpLanguage, AIR_FINAL: sexpLanguage,
-  SMT: sexpLanguage, Z3: sexpLanguage,
+  SMT_QUERY: sexpLanguage, SMT_RESPONSE: sexpLanguage, SMT_TRANSCRIPT: sexpLanguage,
 };
 // Compartment lets us hot-swap the output editor's language on tab
 // flips without re-creating the view (which would drop scroll + lose
@@ -732,17 +727,23 @@ const LANGUAGE_FOR_SECTION = {
 const outputLanguage = new Compartment();
 
 // Fold service — basicSetup's foldGutter asks this per line; non-
-// foldable lines return null. All foldable ranges are Rust-declared
-// (VIR user/vstd split, AIR/SMT prelude + per-query blocks) and
-// stored in `sectionFolds`: JS never scans the body to decide what
-// folds. `renderOutputView` applies the same ranges on initial
-// render; this service just re-offers them so the user can refold
-// after expanding.
+// foldable lines return null. Foldable ranges come from two
+// sources: `verus_dump` populates them for AIR / VIR / SST tabs
+// (Rust-declared via the `fold: 1` flag), and `finalizeZ3Body`
+// populates them for the JS-sourced Z3 tabs (one range per `;;`
+// banner). Whether a range *auto-collapses* on render is a separate
+// decision tracked in `sectionAutoFolded` — see `renderOutputView`.
 const sectionFold = foldService.of((state, lineStart, lineEnd) => {
+  // `finalizeZ3Body` may register multiple fold ranges sharing the
+  // same `from` — one for the individual stanza and one for the
+  // merged run of consecutive auto-folded stanzas that started on
+  // this line. Offer the largest so a single click re-collapses
+  // the whole outer fold the user just expanded.
+  let best = null;
   for (const f of sectionFolds.get(currentTab) ?? []) {
-    if (f.from === lineEnd) return f;
+    if (f.from === lineEnd && (!best || f.to > best.to)) best = f;
   }
-  return null;
+  return best;
 });
 
 // Style `;; …` comment lines as section banners (`.cm-banner-line`).
@@ -826,16 +827,17 @@ const spanLinks = ViewPlugin.fromClass(class {
 // is what buys back the "pick up where I left off" feel.
 //
 // The whole-doc replacement wipes any prior fold state (folds over a
-// deleted range collapse to zero width), so Rust-declared folds are
-// re-applied from `sectionFolds` on every render. JS owns no body
-// scanning — every fold range came from `verus_dump`.
+// deleted range collapse to zero width), so auto-folded ranges are
+// re-applied from `sectionAutoFolded` on every render. Foldable-but-
+// not-auto-folded ranges (see `sectionFolds`) stay expanded here and
+// are only collapsed if the user clicks the gutter marker.
 const renderOutputView = () => {
   const body = currentTab && sectionCache.has(currentTab) ? sectionCache.get(currentTab) : '';
   outputView.dispatch({
     changes: { from: 0, to: outputView.state.doc.length, insert: body },
     effects: outputLanguage.reconfigure(LANGUAGE_FOR_SECTION[currentTab] ?? []),
   });
-  for (const { from, to } of sectionFolds.get(currentTab) ?? []) {
+  for (const { from, to } of sectionAutoFolded.get(currentTab) ?? []) {
     outputView.dispatch({ effects: foldEffect.of({ from, to }) });
   }
   outputView.scrollDOM.scrollTop = tabScrolls.get(currentTab) ?? 0;
@@ -938,12 +940,13 @@ globalThis.verus_diagnostic_json = (msg) => {
 // Rust sends ordered blocks via parallel arrays: `contents[i]` is
 // the block text (already includes a natural `;;` comment on its
 // first line — `;; AIR prelude`, `;; Function-Def foo`, `;; vstd`,
-// etc.), `folds[i] === 1` asks JS to auto-fold the block on render.
-// Concatenate with `\n` between blocks; fold range is
-// [end-of-first-line, end-of-block] so the natural comment line
-// stays visible as the fold's label. `sectionFolds` feeds both the
-// initial render (in `renderOutputView`) and the manual-refold path
-// (in `sectionFold`).
+// etc.), `folds[i] === 1` asks JS to both mark the block foldable
+// AND auto-fold it on cold render. Concatenate with `\n` between
+// blocks; fold range is [end-of-first-line, end-of-block] so the
+// natural comment line stays visible as the fold's label. For
+// AIR / VIR / SST tabs the two fold states coincide — Rust's
+// `fold: 1` flag controls both. The JS-sourced Z3 tabs split them
+// (see `finalizeZ3Body`).
 globalThis.verus_dump = (section, contents, folds) => {
   let body = '';
   const ranges = [];
@@ -964,7 +967,10 @@ globalThis.verus_dump = (section, contents, folds) => {
     verdictCache = body;
   } else {
     sectionCache.set(section, body);
-    if (ranges.length > 0) sectionFolds.set(section, ranges);
+    if (ranges.length > 0) {
+      sectionFolds.set(section, ranges);
+      sectionAutoFolded.set(section, ranges);
+    }
   }
 };
 // Rust side calls `verus_bench(label, ms)` once per timed pipeline
@@ -975,16 +981,6 @@ globalThis.verus_dump = (section, contents, folds) => {
 globalThis.verus_bench = (label, ms) => {
   benchCache.set(label, (benchCache.get(label) ?? 0) + ms);
 };
-// `run_queries` calls this once per op (and once for the prelude) so
-// the Z3 tab — which otherwise concatenates Z3's raw replies into a
-// positional stream — carries the same `;; Function-Def ...` banner
-// headers as the SMT tab. A banner with no reply beneath it means
-// the op only sent declarations / axioms (no `(check-sat)`), which
-// is the common case for Context ops.
-globalThis.verus_z3_annotate = (label) => {
-  z3ResponseBuffer.push(`;; ${label}`);
-};
-
 // Declared here (before `runVerify`) so `runVerify` can cancel any
 // pending auto-verify at its top — otherwise an explicit verify
 // (Verify click, example load) races with a pending 500 ms auto-
@@ -1006,12 +1002,12 @@ const runVerify = async () => {
   verifyButtonLabel.textContent = 'Verify…';
   sectionCache.clear();
   sectionFolds.clear();
+  sectionAutoFolded.clear();
   verdictCache = null;
   _textDiags.length = 0;
   _jsonDiags.length = 0;
   diagnostics.length = 0;
   benchCache.clear();
-  z3ResponseBuffer = [];
   // Yield to the browser so the disabled button + "Verify…" label
   // actually paint before `verify` pegs the main thread. rAF
   // schedules the callback for the next pre-paint hook; the nested
@@ -1038,10 +1034,126 @@ const runVerify = async () => {
       verifyButtonLabel.textContent = 'Verify';
     }
   }
-  // Z3 transcript lives on the JS side (wrapped cwrap), so it's installed
-  // after `verify` returns rather than via `verus_dump`.
-  if (z3ResponseBuffer.length) {
-    sectionCache.set('Z3', z3ResponseBuffer.join('\n'));
+  // Scan a body for Rust-declared section markers and build a
+  // cleaned body + foldable / auto-folded ranges. Three markers
+  // come from Verus via `Emitter::section` / `section_close`
+  // (patched in `third_party/verus/source/air/src/emitter.rs`):
+  //
+  //   `;;> <label>` — open a section, auto-fold by default (▸)
+  //   `;;v <label>` — open a section, foldable but expanded (▾)
+  //   `;;<`         — close the innermost open section
+  //
+  // The open-marker char mirrors the CM6 fold-gutter glyph.
+  // Sections nest — an open inside another open creates a child
+  // whose fold is independent of its parent.
+  //
+  // `;;<` is a structural hint only: we use it to compute the
+  // fold's end position, then drop the line from the rendered
+  // body. The banner above already conveys "this section ends"
+  // to the reader, so a visible close is redundant chrome.
+  //
+  // The `>` / `v` discriminator on the open line is structural too
+  // (selects the gutter glyph + auto-fold default); after the fold
+  // is registered the char is stripped, so `;;> foo` / `;;v foo`
+  // both render as `;; foo` — the user reads a comment, not a
+  // marker syntax.
+  //
+  // Empty sections (open with no content before its close) are
+  // stripped from the body regardless of marker kind — an op that
+  // emits no content in a given tab shouldn't leave its banner
+  // behind as noise (e.g., a `;;v Spec-Termination …` that
+  // produced no VIR output). Applies to both `;;>` and `;;v`.
+  //
+  // Plain `;; …` comments (span annotations like
+  // `;; <input.rs>:L:C:…`, Verus's `;; recommendation not met`,
+  // etc.) stay nested inside whatever section they belong to —
+  // no structural effect. JS has zero knowledge of op kinds or
+  // label strings; all fold intent lives in the Rust emitter.
+  //
+  // Single-pass algorithm — walks raw lines, maintaining a stack
+  // of open sections and incrementally building `cleaned`:
+  //   - open  → push {cleanedLenAtOpen, openLineEnd, autoFold}
+  //             and append the banner with the marker char stripped
+  //   - close → pop; if the stack top saw no content since its
+  //             open (cleaned.length === openLineEnd), rewind
+  //             `cleaned` to the pre-banner length (strip empty
+  //             `;;>`), else emit a fold range covering content.
+  //             The `;;<` line is never appended.
+  //   - other → append the line
+  // Unbalanced opens at EOF fold to cleaned.length.
+  const isOpen = (line) =>
+    line.startsWith(';;') && 'v>'.includes(line[2]) && (line.length === 3 || line[3] === ' ');
+  const isClose = (line) => line === ';;<' || line.startsWith(';;< ');
+  // Drop the `>` / `v` from `;;> foo` / `;;v foo` so the rendered
+  // banner reads `;; foo`. `;;>` / `;;v` (no label) render as `;;`.
+  const stripMarker = (line) => ';;' + line.slice(3);
+  const finalizeBannerBody = (body) => {
+    let cleaned = '';
+    const foldable = [];
+    const autoFolded = [];
+    const stack = [];
+    const appendLine = (line) => {
+      if (cleaned.length > 0) cleaned += '\n';
+      cleaned += line;
+    };
+    const emitRange = (open, to) => {
+      if (to > open.openLineEnd) {
+        const range = { from: open.openLineEnd, to };
+        foldable.push(range);
+        if (open.autoFold) autoFolded.push(range);
+      }
+    };
+    for (const l of body.split('\n')) {
+      if (isOpen(l)) {
+        const cleanedLenAtOpen = cleaned.length;
+        appendLine(stripMarker(l));
+        stack.push({
+          cleanedLenAtOpen,
+          openLineEnd: cleaned.length,
+          autoFold: l[2] === '>',
+        });
+      } else if (isClose(l)) {
+        const open = stack.pop();
+        if (!open) continue;
+        if (cleaned.length === open.openLineEnd) {
+          // Empty section — rewind to before the banner so the whole
+          // open/close pair disappears (no banner, no close, no fold).
+          cleaned = cleaned.slice(0, open.cleanedLenAtOpen);
+        } else {
+          // `;;<` is never appended; the fold range covers the
+          // section's content lines, ending at the last one's
+          // newline. Folded view shows just the banner.
+          emitRange(open, cleaned.length);
+        }
+      } else {
+        appendLine(l);
+      }
+    }
+    while (stack.length) emitRange(stack.pop(), cleaned.length);
+    return { body: cleaned, foldable, autoFolded };
+  };
+  // Every banner-driven tab (VIR, SST, AIR, SMT) comes from Rust as
+  // one blob via `verus_dump`. Rust doesn't compute fold ranges —
+  // this scanner does, keyed off the `;;>`/`;;v`/`;;<` markers that
+  // `air_ctx.section(...)` / `section_close()` embedded in the body
+  // (for AIR/SMT) or `WalkBuilder` stamped in (for VIR/SST).
+  for (const tab of [
+    'VIR', 'SST_AST', 'SST_POLY',
+    'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL',
+    'SMT_QUERY', 'SMT_RESPONSE', 'SMT_TRANSCRIPT',
+  ]) {
+    const raw = sectionCache.get(tab);
+    if (!raw) continue;
+    const { body, foldable, autoFolded } = finalizeBannerBody(raw);
+    sectionCache.set(tab, body);
+    if (foldable.length) sectionFolds.set(tab, foldable);
+    // Reply tab opens fully expanded — replies are short (one-line
+    // `unsat` / `sat` / model dumps), and the user opens this tab
+    // specifically to read them. Sections stay clickable-foldable
+    // via `sectionFolds`, just not collapsed by default.
+    if (autoFolded.length && tab !== 'SMT_RESPONSE') {
+      sectionAutoFolded.set(tab, autoFolded);
+    }
   }
   // Consolidate the raw emission channels into the unified diagnostic
   // list. JSON wins when rustc produced any (rustc-exact spans + level
@@ -1071,11 +1183,12 @@ const runVerify = async () => {
     }
   }
   // Preserve user's tab selection when it survives the new run;
-  // otherwise default to SMT (the actual solver input — most useful
-  // for debugging why a query failed) or whichever stage made it
-  // the furthest if SMT wasn't reached.
+  // otherwise default to the SMT transcript (the unified
+  // commands-plus-replies stream — most useful for debugging why a
+  // query failed) or whichever stage made it the furthest if the
+  // query stage wasn't reached.
   if (!currentTab || !sectionCache.has(currentTab)) {
-    currentTab = sectionCache.has('SMT') ? 'SMT'
+    currentTab = sectionCache.has('SMT_TRANSCRIPT') ? 'SMT_TRANSCRIPT'
       : (SECTION_ORDER.find(n => sectionCache.has(n)) ?? null);
   }
   if (currentTab) lastVariantInGroup.set(GROUP_OF.get(currentTab), currentTab);
@@ -1137,13 +1250,12 @@ const decodeSrc = async (hash) => {
 // it — prevents a slow in-flight encode from overwriting a newer
 // one when saves overlap.
 //
-// Hash layout (three shapes; `&t=<TAB>` is optional on all three):
-//   * `#source=<file>[&t=<TAB>]`  — shipped example, unmodified.
-//     Shortest form; preferred when the editor matches `pristineSource`.
-//   * `#code=<b64>[&t=<TAB>]`      — arbitrary source (current form for
-//     modified examples / user-pasted snippets / typed-from-scratch docs).
-//   * `#<b64>[&t=<TAB>]`           — legacy bare-b64 form; still parsed
-//     on load so old shared links keep working, but never written.
+// Hash layout (`&t=<TAB>` is optional on both shapes):
+//   * `#code=<b64>[&t=<TAB>]`   — the current write shape, used for
+//     every doc. gzipped + base64url-encoded source.
+//   * `#source=<file>[&t=<TAB>]` — legacy short form; still parsed on
+//     load for any existing shared links, but no longer written.
+//   * `#<b64>[&t=<TAB>]`        — legacy bare-b64 form; same story.
 // `parseHash` returns the same shape whichever form it saw, so the
 // hash-load path doesn't branch on layout.
 let hashSaveGen = 0;
@@ -1154,13 +1266,11 @@ let hashSaveGen = 0;
 // behavior stable if a code path ever flips to `location.hash = …`.
 let lastWrittenHash = location.hash;
 const buildHashTabSuffix = () => currentTab ? `&t=${currentTab}` : '';
-// Pristine shipped example → short-link form. Otherwise re-encode
-// the doc. `pristineSource` is known at this point (set during
-// init / loadSource before any save fires).
+// Always encode the live doc into the hash. A `#source=<file>` short
+// form would be nicer for unmodified examples but requires a dirty
+// check on every save; we'd rather skip that work and always write
+// `#code=<b64>` — copy-link still yields a working URL.
 const buildHash = async () => {
-  if (loadedSource !== null && !isDirty()) {
-    return '#source=' + loadedSource + buildHashTabSuffix();
-  }
   const encoded = await encodeSrc(view.state.doc.toString());
   return '#code=' + encoded + buildHashTabSuffix();
 };
@@ -1227,7 +1337,7 @@ const EXT_FOR_TAB = {
   AST_PRE: 'rs', AST: 'rs', HIR: 'rs', HIR_TYPED: 'rs',
   VIR: 'vir', SST_AST: 'vir', SST_POLY: 'vir',
   AIR_INITIAL: 'smt2', AIR_MIDDLE: 'smt2', AIR_FINAL: 'smt2',
-  SMT: 'smt2', Z3: 'smt2',
+  SMT_QUERY: 'smt2', SMT_RESPONSE: 'smt2', SMT_TRANSCRIPT: 'smt2',
 };
 // `rust-ir-expanded-ast.rs` reads better than `verus-AST.rs`. Joins
 // the group label and the variant label (both user-facing) as
@@ -1283,7 +1393,8 @@ const initialDoc = await (async () => {
     loadedSource = parsed.sourceFile;
     pristineSource = await fetchExample(parsed.sourceFile);
     const stored = localStorage.getItem(STORAGE_PREFIX + parsed.sourceFile);
-    return stored !== null && stored !== pristineSource ? stored : pristineSource;
+    dirty = stored !== null && stored !== pristineSource;
+    return stored ?? pristineSource;
   }
   if (parsed && parsed.src !== null) {
     // Custom content — no shipped example to diff against.
@@ -1294,7 +1405,8 @@ const initialDoc = await (async () => {
   loadedSource = first;
   pristineSource = await fetchExample(first);
   const stored = localStorage.getItem(STORAGE_PREFIX + first);
-  return stored !== null && stored !== pristineSource ? stored : pristineSource;
+  dirty = stored !== null && stored !== pristineSource;
+  return stored ?? pristineSource;
 })();
 
 // ------------------------------------------------------------------
@@ -1359,19 +1471,22 @@ const view = new EditorView({
     linter(v => computeInlineDiagnostics(v.state.doc)),
     EditorView.updateListener.of(u => {
       if (u.docChanged) {
+        // CM6 tags real edits with a `userEvent` (`input.*` /
+        // `delete.*` / `move.*` etc.); programmatic dispatches from
+        // `setEditorText` carry none. Filtering on it means example
+        // loads / resets don't flip `dirty` themselves — those paths
+        // set `dirty` explicitly to the right post-state.
+        if (!dirty && u.transactions.some(tr => tr.isUserEvent('input') || tr.isUserEvent('delete'))) {
+          dirty = true;
+        }
         scheduleAutoVerify();
-        // No hash save here — `runVerify` fires `saveHashNow()` at the
-        // tail end on a successful return, so the URL only captures
-        // source that verify has proven non-hanging. Local per-example
-        // persistence still mirrors every keystroke below for within-
-        // session continuity.
+        // URL hash is updated from `runVerify`'s tail (not here), so
+        // it only captures source a `verify` call has reached the end
+        // of — the hang-on-reload loop stays closed. localStorage
+        // mirrors every keystroke so switching examples and coming
+        // back preserves work-in-progress.
         if (loadedSource !== null) {
-          const src = view.state.doc.toString();
-          if (src === pristineSource) {
-            localStorage.removeItem(STORAGE_PREFIX + loadedSource);
-          } else {
-            localStorage.setItem(STORAGE_PREFIX + loadedSource, src);
-          }
+          localStorage.setItem(STORAGE_PREFIX + loadedSource, view.state.doc.toString());
         }
         updateSourceUI();
       }
@@ -1435,9 +1550,14 @@ const loadSource = async (file) => {
   if (!optionByFile.has(file)) return;
   pristineSource = await fetchExample(file);
   const stored = localStorage.getItem(STORAGE_PREFIX + file);
-  const src = stored !== null && stored !== pristineSource ? stored : pristineSource;
+  const src = stored ?? pristineSource;
   loadedSource = file;
   setEditorText(src);
+  // A localStorage override restores prior edits; if it differs from
+  // pristine the doc is already "edited" the moment we mount it, so
+  // Reset should show without waiting for a fresh keystroke. Otherwise
+  // start clean.
+  dirty = stored !== null && stored !== pristineSource;
   updateSourceUI();
   // Write the URL immediately on example switch so Copy-link right
   // after the switch doesn't carry over the previous doc's hash.
@@ -1453,6 +1573,7 @@ const resetSource = () => {
   if (loadedSource === null) return;
   localStorage.removeItem(STORAGE_PREFIX + loadedSource);
   setEditorText(pristineSource);
+  dirty = false;
   updateSourceUI();
   saveHashNow();
   runVerify();
@@ -1475,9 +1596,8 @@ sourceSelect.addEventListener('change', () => {
 prevBtn.addEventListener('click', () => navSource(-1));
 nextBtn.addEventListener('click', () => navSource(+1));
 resetBtn.addEventListener('click', resetSource);
-// Reflect the resolved initial state in the UI. Couldn't call this
-// from the init block above because the view wasn't constructed
-// yet and `isDirty` reads its doc.
+// Reflect the resolved initial state in the UI (deferred from the
+// init block above because the view wasn't constructed yet).
 updateSourceUI();
 verifyButton.addEventListener('click', runVerify);
 // External hash changes (user pastes a different link into the address
