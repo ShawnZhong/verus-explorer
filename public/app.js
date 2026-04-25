@@ -335,13 +335,13 @@ const updateSourceUI = () => {
 // spelled out so newcomers don't need to know what HIR/VIR/AIR stand for.
 const TAB_GROUPS = [
   { id: 'Rust',  label: 'Rust IR',     variants: ['AST_PRE', 'AST', 'HIR', 'HIR_TYPED'] },
-  { id: 'VIR',   label: 'Verus IR',    variants: ['VIR', 'SST_AST', 'SST_POLY'] },
+  { id: 'VIR',   label: 'Verus IR',    variants: ['VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY'] },
   { id: 'AIR',   label: 'Assert IR',   variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
   { id: 'Z3',    label: 'Z3 Solver',   variants: ['SMT_TRANSCRIPT', 'SMT_QUERY', 'SMT_RESPONSE'] },
 ];
 const VARIANT_LABEL = {
   AST_PRE: 'AST', AST: 'Expanded AST', HIR: 'HIR', HIR_TYPED: 'Typed HIR',
-  VIR: 'AST', SST_AST: 'SST', SST_POLY: 'Mono',
+  VIR_RAW: 'Raw', VIR_SIMPLE: 'Simple', VIR_PRUNED: 'Pruned', SST_AST: 'SST', SST_POLY: 'Mono',
   AIR_INITIAL: 'Blocks', AIR_MIDDLE: 'SSA', AIR_FINAL: 'Flat',
   SMT_TRANSCRIPT: 'Log', SMT_QUERY: 'Query', SMT_RESPONSE: 'Result',
 };
@@ -408,7 +408,10 @@ const BENCH_GROUP = {
   'dump.ast_pre': 'Rust', 'dump.ast': 'Rust',
   'dump.hir': 'Rust', 'dump.hir_typed': 'Rust',
   build_vir: 'VIR', 'build_vir.vstd_deserialize': 'VIR',
-  'build_vir.build_vir_crate': 'VIR', 'dump.vir': 'VIR',
+  'build_vir.construct_vir_crate': 'VIR',
+  'build_vir.global_ctx': 'VIR', 'build_vir.check_traits': 'VIR',
+  'build_vir.simplify_krate': 'VIR',
+  'dump.vir_raw': 'VIR', 'dump.vir_simple': 'VIR', 'dump.vir_pruned': 'VIR',
   'verify.ast_to_sst': 'VIR', 'dump.sst_ast': 'VIR',
   'verify.poly': 'VIR', 'dump.sst_poly': 'VIR',
   'verify.prune': 'AIR', 'verify.ctx_new': 'AIR',
@@ -717,7 +720,8 @@ const sexpLanguage = StreamLanguage.define(sexpParser);
 // (VIR/SST also pretty-print as parenthesized trees, close enough).
 const LANGUAGE_FOR_SECTION = {
   AST_PRE: rust(), AST: rust(), HIR: rust(), HIR_TYPED: rust(),
-  VIR: sexpLanguage, SST_AST: sexpLanguage, SST_POLY: sexpLanguage,
+  VIR_RAW: sexpLanguage, VIR_SIMPLE: sexpLanguage, VIR_PRUNED: sexpLanguage,
+  SST_AST: sexpLanguage, SST_POLY: sexpLanguage,
   AIR_INITIAL: sexpLanguage, AIR_MIDDLE: sexpLanguage, AIR_FINAL: sexpLanguage,
   SMT_QUERY: sexpLanguage, SMT_RESPONSE: sexpLanguage, SMT_TRANSCRIPT: sexpLanguage,
 };
@@ -1138,7 +1142,7 @@ const runVerify = async () => {
   // `air_ctx.section(...)` / `section_close()` embedded in the body
   // (for AIR/SMT) or `WalkBuilder` stamped in (for VIR/SST).
   for (const tab of [
-    'VIR', 'SST_AST', 'SST_POLY',
+    'VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY',
     'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL',
     'SMT_QUERY', 'SMT_RESPONSE', 'SMT_TRANSCRIPT',
   ]) {

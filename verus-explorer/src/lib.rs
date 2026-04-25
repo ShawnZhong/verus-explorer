@@ -122,12 +122,12 @@ pub fn verify(src: &str, expand_errors: bool) {
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             dump_ast(tcx);
             dump_hir(tcx);
-            let Ok((krate, global_ctx, crate_name, spans)) =
+            let Ok((raw_krate, krate, global_ctx, crate_name, spans)) =
                 time("build_vir", || build_vir(compiler, tcx))
             else {
                 return;
             };
-            dump_vir(&krate);
+            dump_vir(&raw_krate, &krate);
             // `output` threaded in by-ref so dumps from earlier pipeline
             // stages survive a later failure — upstream Verus bails with `?`
             // on the first module error, which would otherwise discard every

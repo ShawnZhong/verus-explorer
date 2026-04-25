@@ -31,8 +31,9 @@ use rust_verify::commands::{FunctionOpGenerator, Op, OpGenerator, OpKind, QueryO
 use rust_verify::config::ArgsX;
 use rust_verify::expand_errors_driver::ExpandErrorsResult;
 use rust_verify::import_export::CrateWithMetadata;
-use rust_verify::spans::SpanContext;
+use rust_verify::spans::{SpanContext, SpanContextX};
 use rust_verify::verifier::{Reporter, Verifier};
+use rust_verify::verus_items;
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::LOCAL_CRATE;
@@ -50,16 +51,31 @@ use crate::wasm::wasm_libs_vstd_vir;
 // ==================== Stage 3: HIR → VIR ====================
 
 
-// Drives Verus's HIR→VIR pipeline. `Verifier::build_vir_crate` (vendored
-// addition) derives the inputs `construct_vir_crate` needs from (tcx, compiler),
-// runs HIR → raw VIR, then the head of `verify_crate_inner` (GlobalCtx +
-// check_traits + ast_simplify), returning both the simplified krate and the
-// (mutated) GlobalCtx so we can drive the downstream prune → Ctx →
-// ast_to_sst → AIR pipeline ourselves.
+// Drives Verus's HIR→VIR pipeline. Sets up the Verus-side context
+// (`SpanContext`, `VerusItems`, `Reporter`, `Verifier`), then walks
+// the same sequence upstream's driver runs:
+//   1. `Verifier::construct_vir_crate` — HIR → raw VIR (stashed on
+//      `verifier.vir_crate`); also stamps `verifier.air_no_span`.
+//   2. `GlobalCtx::new` — global VIR context.
+//   3. `recursive_types::check_traits` — coherence pass.
+//   4. `ast_simplify::simplify_krate` — sugar lowering, returns a
+//      fresh krate. `raw_krate` is left untouched as the pre-simplify
+//      form so the explorer can dump VIR_RAW.
+// Returns both krates and the GlobalCtx + crate_name + SpanContext
+// for the downstream prune → Ctx → ast_to_sst → AIR pipeline.
+//
+// Why force `tcx.resolver_for_lowering()` first: the explorer enters
+// rustc via `create_and_enter_global_ctxt` without the upstream
+// driver's `after_expansion` callback, so the resolver hasn't run
+// yet. Calling `all_diagnostic_items` (inside `construct_vir_crate`
+// via `from_diagnostic_items`) freezes the cstore via
+// `all_crate_nums`; if resolution fires after that, its first
+// `cstore_mut()` call panics against the frozen lock.
 pub(crate) fn build_vir<'tcx>(
     compiler: &Compiler,
     tcx: TyCtxt<'tcx>,
-) -> Result<(Krate, GlobalCtx, Arc<String>, SpanContext), Vec<VirErr>> {
+) -> Result<(Krate, Krate, GlobalCtx, Arc<String>, SpanContext), Vec<VirErr>> {
+    let _ = tcx.resolver_for_lowering();
     let mut args = ArgsX::new();
     // `Vstd::Imported` is the default and matches the user's
     // `extern crate vstd;` injection. The vstd VIR is served out of the
@@ -75,11 +91,74 @@ pub(crate) fn build_vir<'tcx>(
     args.no_lifetime = true;
     let crate_name = Arc::new(tcx.crate_name(LOCAL_CRATE).as_str().to_owned());
     let vstd_krate = time("build_vir.vstd_deserialize", || vstd_krate())?;
-    let (krate, global_ctx, spans) = time("build_vir.build_vir_crate", || {
-        Verifier::new(Arc::new(args), None, false, DepTracker::init())
-            .build_vir_crate(compiler, tcx, vec!["vstd".to_string()], vec![vstd_krate])
+    let verus_items = Arc::new(verus_items::from_diagnostic_items(
+        &tcx.all_diagnostic_items(()),
+    ));
+    let spans = SpanContextX::new(
+        tcx,
+        tcx.stable_crate_id(LOCAL_CRATE),
+        compiler.sess.source_map(),
+        std::collections::HashMap::new(),
+        None,
+    );
+    let reporter = Reporter::new(&spans, compiler);
+    let args_arc = Arc::new(args);
+    let mut verifier = Verifier::new(args_arc.clone(), None, false, DepTracker::init());
+    let raw_krate = time("build_vir.construct_vir_crate", || {
+        match verifier.construct_vir_crate(
+            tcx, verus_items, &spans,
+            vec!["vstd".to_string()], vec![vstd_krate],
+            &reporter, (*crate_name).clone(),
+        ) {
+            Ok(true) => Ok(verifier.vir_crate.clone().expect("vir_crate set")),
+            // `construct_vir_crate` returns `Ok(false)` when rustc raised
+            // diagnostics through `DiagCtxt` — bail with empty errs so
+            // the caller stops without double-emitting.
+            Ok(false) => Err(vec![]),
+            Err((errs, diagnostics)) => {
+                // Span every VirErr through the reporter so the explorer
+                // UI shows source-located diagnostics instead of bare
+                // notes. Mirrors the upstream driver's `after_expansion`
+                // error-spanning pass.
+                for diag in diagnostics {
+                    let (level, err) = match diag {
+                        vir::ast::VirErrAs::Warning(e) => (MessageLevel::Warning, e),
+                        vir::ast::VirErrAs::Note(e) => (MessageLevel::Note, e),
+                        vir::ast::VirErrAs::NonBlockingError(e, _)
+                        | vir::ast::VirErrAs::NonFatalError(e, _) => (MessageLevel::Error, e),
+                    };
+                    reporter.report_as(&err.to_any(), level);
+                }
+                for err in &errs {
+                    reporter.report_as(&err.clone().to_any(), MessageLevel::Error);
+                }
+                Err(errs)
+            }
+        }
     })?;
-    Ok((krate, global_ctx, crate_name, spans))
+    let air_no_span = verifier.air_no_span.clone().expect("air_no_span set");
+    let mut global_ctx = time("build_vir.global_ctx", || vir::context::GlobalCtx::new(
+        &raw_krate,
+        crate_name.clone(),
+        air_no_span,
+        args_arc.rlimit,
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(None)),
+        args_arc.solver,
+        false,
+        args_arc.check_api_safety,
+        args_arc.axiom_usage_info,
+        args_arc.new_mut_ref,
+        args_arc.no_bv_simplify,
+        args_arc.report_long_running,
+    ).map_err(|e| vec![e]))?;
+    time("build_vir.check_traits", || {
+        vir::recursive_types::check_traits(&raw_krate, &global_ctx).map_err(|e| vec![e])
+    })?;
+    let krate = time("build_vir.simplify_krate", || {
+        vir::ast_simplify::simplify_krate(&mut global_ctx, &raw_krate).map_err(|e| vec![e])
+    })?;
+    Ok((raw_krate, krate, global_ctx, crate_name, spans))
 }
 
 // Deserialize-once cache for the bundled vstd VIR. `bincode::deserialize` of
@@ -101,20 +180,27 @@ fn vstd_krate() -> Result<vir::ast::Krate, Vec<VirErr>> {
     Ok(krate)
 }
 
-// Walk the simplified VIR krate and emit the VIR output tab.
-// Ignores the walk's per-kind section headers (datatypes /
-// functions / …) — `WalkBuilder` emits a `;;> <kind> <name> <span>`
-// banner per item, which subsumes the outline info. External items
-// nest inside a per-crate outer fold; local items flow flat.
-pub(crate) fn dump_vir(krate: &Krate) {
-    time("dump.vir", || {
+// Walk the VIR krate(s) and emit the Verus IR tabs. Two stages:
+//   * VIR_RAW    — direct output of `rust_to_vir` (HIR → VIR), before
+//                  `ast_simplify::simplify_krate` lowers sugar (chained
+//                  comparisons, struct-update tails, pattern matching,
+//                  CoerceMode, tuple types, etc.).
+//   * VIR_SIMPLE — what gets fed downstream to SST → AIR → Z3.
+// Ignores the walk's per-kind section headers — `WalkBuilder` emits a
+// `;;> <kind> <name> <span>` banner per item, which subsumes the
+// outline info. External items nest inside a per-crate outer fold;
+// local items flow flat.
+pub(crate) fn dump_vir(raw: &Krate, simple: &Krate) {
+    let dump_one = |krate: &Krate| -> String {
         use vir::printer::WalkItem;
         let mut b = WalkBuilder::new();
         vir::printer::walk_krate(krate, &vir::printer::COMPACT_TONODEOPTS, |item: WalkItem<'_>| {
             b.add_item(item.kind, &item.name, item.krate, item.span, item.text);
         });
-        emit_section("VIR", b.finish());
-    });
+        b.finish()
+    };
+    time("dump.vir_raw", || emit_section("VIR_RAW", dump_one(raw)));
+    time("dump.vir_simple", || emit_section("VIR_SIMPLE", dump_one(simple)));
 }
 
 // ==================== Stage 4: VIR → AIR → Z3 ====================
@@ -128,6 +214,11 @@ pub(crate) fn dump_vir(krate: &Krate) {
 // `finalizeBannerBody` scanner handles them uniformly.
 #[derive(Default)]
 pub(crate) struct VerifyOutput {
+    // Per-module pruned VIR (post `prune_krate_for_module_or_krate`).
+    // Each module appends its own walk into this single body —
+    // `WalkBuilder`'s per-crate banners keep the modules visually
+    // separated. Useful for "what did module X actually pull in?".
+    vir_pruned_body: String,
     sst_ast_body: String,
     sst_poly_body: String,
     air_initial_body: String,
@@ -371,6 +462,19 @@ fn verify_module(
         true,
         true,
     ));
+    // Per-module pruned VIR: walk the (per-module) pruned krate and
+    // append into the shared body. Each module gets its own item set
+    // so the reader can see exactly which deps were pulled in for
+    // this verify pass. `WalkBuilder`'s crate-grouped banners keep
+    // multiple modules' walks visually separated in one stream.
+    time("dump.vir_pruned", || {
+        use vir::printer::WalkItem;
+        let mut b = WalkBuilder::new();
+        vir::printer::walk_krate(&pruned, &vir::printer::COMPACT_TONODEOPTS, |item: WalkItem<'_>| {
+            b.add_item(item.kind, &item.name, item.krate, item.span, item.text);
+        });
+        output.vir_pruned_body.push_str(&b.finish());
+    });
     let module = pruned
         .modules
         .iter()
@@ -829,6 +933,7 @@ impl VerifyOutput {
         let smt_query_body = project_smt(&self.smt_body, /* keep_responses */ false);
         let smt_response_body = project_smt(&self.smt_body, /* keep_responses */ true);
         for (name, body) in [
+            ("VIR_PRUNED", self.vir_pruned_body),
             ("SST_AST", self.sst_ast_body),
             ("SST_POLY", self.sst_poly_body),
             ("AIR_INITIAL", self.air_initial_body),

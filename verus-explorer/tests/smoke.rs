@@ -195,19 +195,21 @@ fn pipeline_preserves_ghost_proof_block() {
         let t = perf_now();
         verus_explorer::verify(src, /* expand_errors */ false);
         stage_times.push(perf_now() - t);
-        let vir = section_body("VIR");
-        assert!(!vir.is_empty(), "missing VIR section on {label}");
+        let vir = section_body("VIR_SIMPLE");
+        assert!(!vir.is_empty(), "missing VIR_SIMPLE section on {label}");
         assert!(
             vir.contains("AssertAssume"),
-            "VIR missing AssertAssume on {label} — proof block was erased before VIR:\n{vir}"
+            "VIR_SIMPLE missing AssertAssume on {label} — proof block was erased before VIR:\n{vir}"
         );
         // arch is the very last VIR item (no section wraps it); its
         // banner + content + close sit at the end of the body. Guard
         // it explicitly — fold-range bugs tend to show up at EOF.
         assert!(
             vir.contains(";;v arch word_bits"),
-            "VIR missing `;;v arch word_bits` on {label}"
+            "VIR_SIMPLE missing `;;v arch word_bits` on {label}"
         );
+        let vir_raw = section_body("VIR_RAW");
+        assert!(!vir_raw.is_empty(), "missing VIR_RAW section on {label}");
         // Section markers embedded via `air_ctx.section(marker, …)`
         // / `section_close()` must reach the outputs, otherwise
         // the browser's fold scanner has no markers to key off of.
