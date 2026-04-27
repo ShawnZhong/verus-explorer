@@ -228,7 +228,7 @@ const outputSubtabsEl = document.getElementById('output-subtabs');
 const outputViewEl = document.getElementById('output-view');
 const sourceSelect = document.getElementById('source-select');
 const autoVerifyCheckbox = document.getElementById('auto-verify');
-const expandErrorsCheckbox = document.getElementById('expand-errors');
+const compileModeCheckbox = document.getElementById('compile-mode');
 // std toggle: initial state reflects the URL param (`?std=1` opts
 // in; default is nostd). Flipping it rewrites the URL and reloads,
 // because the libs bundle is picked up at wasm instance init and
@@ -851,9 +851,7 @@ const spanLinks = ViewPlugin.fromClass(class {
     const b = new RangeSetBuilder();
     for (const { from, to } of view.visibleRanges) {
       const text = view.state.doc.sliceString(from, to);
-      SPAN_LINK_RE.lastIndex = 0;
-      let m;
-      while ((m = SPAN_LINK_RE.exec(text))) {
+      for (const m of text.matchAll(SPAN_LINK_RE)) {
         const start = from + m.index;
         b.add(start, start + m[0].length, Decoration.mark({
           class: 'cm-span-link',
@@ -1118,7 +1116,7 @@ const runVerify = async () => {
   // — the later one will do its own fresh work.
   if (myRun !== runId) return;
   try {
-    verus.verify(view.state.doc.toString(), expandErrorsCheckbox.checked);
+    verus.verify(view.state.doc.toString(), compileModeCheckbox.checked);
   } catch (e) {
     if (myRun !== runId) return;
     if (_diags.length === 0 && sectionCache.size === 0 && _verdicts.length === 0) {
@@ -1434,7 +1432,7 @@ const parseHash = async (hash) => {
 // `.vir` keeps editors from assuming Rust syntax.
 const EXT_FOR_TAB = {
   AST_PRE: 'rs', AST: 'rs', HIR: 'rs', HIR_TYPED: 'rs',
-  VIR: 'vir', SST_AST: 'vir', SST_POLY: 'vir',
+  VIR_RAW: 'vir', VIR_SIMPLE: 'vir', VIR_PRUNED: 'vir', SST_AST: 'vir', SST_POLY: 'vir',
   AIR_INITIAL: 'smt2', AIR_MIDDLE: 'smt2', AIR_FINAL: 'smt2',
   SMT_QUERY: 'smt2', SMT_RESPONSE: 'smt2', SMT_TRANSCRIPT: 'smt2',
 };
@@ -1524,15 +1522,27 @@ autoVerifyCheckbox.addEventListener('change', () => {
   // kick off a run. Flipping off is silent; we only cancel pending work.
   if (autoVerifyCheckbox.checked) runVerify();
 });
-// Expand-errors: always default off — runs per-conjunct sub-queries on a
-// failed body, which doubles-to-triples verify time but pinpoints which
-// sub-assertion broke. Not persisted: starting clean each page load keeps
-// the slower path opt-in rather than sticky.
-expandErrorsCheckbox.checked = false;
-expandErrorsCheckbox.addEventListener('change', () => {
+// Compile mode: opt-in second `run_compiler` pass that re-expands the
+// source with ghost code stripped, overwriting the Rust IR tabs
+// (AST_PRE / AST / HIR / HIR_TYPED) with what Verus's `--compile` pass
+// would feed rustc. Adds parse + macro time. Persisted in the URL
+// (`?compile=1`) — `history.replaceState` keeps the toggle in the
+// address bar across reloads / share-link without forcing a page
+// reload (the wasm module is already loaded; we only need a re-verify).
+compileModeCheckbox.checked = new URLSearchParams(location.search).get('compile') === '1';
+compileModeCheckbox.addEventListener('change', () => {
+  const params = new URLSearchParams(location.search);
+  // delete-then-set so `compile=1` always ends up as the last query
+  // param, regardless of where it was before. URLSearchParams.set
+  // preserves position when the key already exists, which would
+  // otherwise leave a stale order like `?compile=1&std=1`.
+  params.delete('compile');
+  if (compileModeCheckbox.checked) params.set('compile', '1');
+  const qs = params.toString();
+  history.replaceState(null, '', (qs ? `?${qs}` : location.pathname) + location.hash);
   // The flag is only read by `verify`, so a re-run is required to
-  // see the effect — do it eagerly instead of waiting for the next edit
-  // or manual Verify click.
+  // see the effect — kick off eagerly instead of waiting for the
+  // next edit or manual Verify click.
   runVerify();
 });
 // `autoVerifyTimer` is declared up beside `runVerify` so the explicit

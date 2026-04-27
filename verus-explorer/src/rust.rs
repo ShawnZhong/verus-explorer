@@ -40,7 +40,20 @@ pub(crate) fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
 // `wasm_libs_finalize` — rustc's crate locator finds `libcore.rmeta` (and
 // friends), plus our prebuilt `libverus_builtin.rmeta`, in the libs bundle
 // instead of on disk. `#![no_std]` keeps std out (only `core` is needed).
-pub(crate) fn build_rustc_config(src: String) -> rustc_interface::interface::Config {
+//
+// `keep_ghost` picks between the two Verus operating modes (mirroring
+// the cfg pairs upstream's `rust_verify::driver` sets per pass):
+//   * `true`  → Verification mode: inserts both `verus_keep_ghost` and
+//     `verus_keep_ghost_body` (driver.rs:270-272). `cfg_erase()` returns
+//     `EraseGhost::Keep` — full ghost code survives parse → AST → HIR
+//     → VIR → AIR → SMT.
+//   * `false` → Compile mode: inserts only `verus_keep_ghost`
+//     (driver.rs:162). `cfg_erase()` returns `EraseGhost::Erase` — bodies
+//     of `spec` / `proof` items erase, but stubs (signatures) survive,
+//     matching what `verus --compile` hands rustc for codegen. We don't
+//     use `EraseGhost::EraseAll` (neither cfg set) because that path is
+//     for third-party deps Verus never touched, not for the user's crate.
+pub(crate) fn build_rustc_config(src: String, keep_ghost: bool) -> rustc_interface::interface::Config {
     // Put `vstd` and `verus_builtin` in the edition-2018+ extern prelude so
     // user code can `use vstd::prelude::*;` / `use verus_builtin::*;` directly
     // — same flags native Verus's driver and test harness pass. We used to
@@ -139,8 +152,12 @@ pub(crate) fn build_rustc_config(src: String) -> rustc_interface::interface::Con
             //    like `#[cfg_attr(verus_only, verus::loop_isolation(false))]`.
             //    Omit and pasted Verus snippets silently hit the
             //    `not(verus_only)` branch.
+            // `verus_keep_ghost` is set in both modes — only the body cfg
+            // differs. See doc comment on `build_rustc_config`.
             psess.config.insert((Symbol::intern("verus_keep_ghost"), None));
-            psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
+            if keep_ghost {
+                psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
+            }
             psess.config.insert((Symbol::intern("verus_only"), None));
         })),
         hash_untracked_state: None,

@@ -404,7 +404,6 @@ struct ModuleCtx<'a, 'tcx> {
     reporter: &'a Reporter<'tcx>,
     solver: SmtSolver,
     arch_word_bits: ArchWordBits,
-    expand_errors: bool,
 }
 
 // Bundles the per-module driver state. `feed`/`feed_all` send each command to
@@ -435,7 +434,6 @@ pub(crate) fn verify_simplified_krate<'tcx>(
     crate_name: Arc<String>,
     compiler: &'tcx Compiler,
     spans: &SpanContext,
-    expand_errors: bool,
     output: &mut VerifyOutput,
 ) -> Result<(), VirErr> {
     let msg = Arc::new(VirMessageInterface {});
@@ -451,7 +449,6 @@ pub(crate) fn verify_simplified_krate<'tcx>(
         reporter: &reporter,
         solver: SmtSolver::Z3,
         arch_word_bits: krate.arch.word_bits,
-        expand_errors,
     };
     // After `build_vir_crate` merges vstd into the local krate, `krate.modules`
     // is ~155 entries; of those only the user's modules need verification.
@@ -683,7 +680,7 @@ fn run_queries(
                     _ => 'v',
                 };
                 feeder.air_ctx.section(op_marker, &op.to_air_comment());
-                let r = handle_op(op, &mut function_opgen, feeder, mctx);
+                let r = handle_op(op, &mut function_opgen, feeder);
                 feeder.air_ctx.section_close();
                 r?;
             }
@@ -737,7 +734,6 @@ fn handle_op<'tcx>(
     op: Op,
     function_opgen: &mut FunctionOpGenerator,
     feeder: &mut Feeder<'_, 'tcx>,
-    mctx: &ModuleCtx,
 ) -> Result<(), VirErr> {
     // Per-op `;;>`/`;;v` open + `;;<` close are emitted by the
     // caller (`run_queries`) so the pairing survives any `?` early-
@@ -918,21 +914,6 @@ fn handle_op<'tcx>(
         )
     {
         function_opgen.retry_with_recommends(&op, /* from_error */ true)?;
-    }
-    // Arm expand-errors on a failed Normal body. Driver starts here;
-    // subsequent loop iterations feed its sub-queries in via
-    // `expand_errors_next` at the top. Gated by the user-facing
-    // "Expand errors" toggle — skipping the sub-queries shaves a
-    // couple hundred ms per failed query in the browser.
-    if mctx.expand_errors
-        && matches!(retry_kind, Some(QueryOp::Body(Style::Normal)))
-        && any_invalid
-        && !default_prover_failed_assert_ids.is_empty()
-    {
-        function_opgen.start_expand_errors_if_possible(
-            &op,
-            default_prover_failed_assert_ids[0].clone(),
-        );
     }
     // Report the outcome of each Expanded sub-query so the driver
     // advances through the conjunct tree. Pass/Fail/Timeout controls

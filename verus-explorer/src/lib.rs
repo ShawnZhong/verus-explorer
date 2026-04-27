@@ -87,7 +87,7 @@ pub fn init() {
 /// `verus_dump` / `verus_diagnostic*` / `verus_bench` JS externs — no
 /// return value is threaded through.
 #[wasm_bindgen]
-pub fn verify(src: &str, expand_errors: bool) {
+pub fn verify(src: &str, compile_mode: bool) {
     // vstd is wired into the extern prelude via `--extern=vstd` in
     // `build_rustc_config`, so the user's source is passed through unmodified.
     // Keeping the source 1:1 with what the editor shows is what lets
@@ -104,7 +104,17 @@ pub fn verify(src: &str, expand_errors: bool) {
     // ~L2142) and the per-module reporter → DiagCtxt → HumanEmitter path in
     // `verify_stage`, so they land in the DIAGNOSTICS section — we just
     // swallow the `Result`s here and emit whatever we accumulated.
-    rustc_interface::interface::run_compiler(build_rustc_config(src), |compiler| {
+    // Two mutually exclusive modes:
+    //   * Verification mode (default): full HIR → VIR → AIR → SMT pipeline,
+    //     populates every IR tab. `verus_keep_ghost{,_body}` cfgs are set
+    //     so the `verus!` proc-macro's `cfg_erase()` returns `EraseGhost::Keep`
+    //     and ghost code survives lowering.
+    //   * Compile mode: only the Rust IR tabs (AST_PRE / AST / HIR / HIR_TYPED),
+    //     showing the post-erasure view. The `verus_keep_ghost{,_body}` cfgs
+    //     are unset so `cfg_erase()` returns `EraseGhost::EraseAll`. No VIR /
+    //     AIR / SMT pipeline runs — those tabs simply won't appear. Useful
+    //     for "what does rustc see when Verus compiles this?".
+    rustc_interface::interface::run_compiler(build_rustc_config(src, /* keep_ghost */ !compile_mode), |compiler| {
         let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
         // Pretty-print the parser output — essentially verbatim source wrapped
         // in `verus! { ... }` (plus the implicit `no_std` / register_tool
@@ -122,6 +132,9 @@ pub fn verify(src: &str, expand_errors: bool) {
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             dump_ast(tcx);
             dump_hir(tcx);
+            if compile_mode {
+                return;
+            }
             let Ok((raw_krate, krate, global_ctx, crate_name, spans)) =
                 time("build_vir", || build_vir(compiler, tcx))
             else {
@@ -136,7 +149,7 @@ pub fn verify(src: &str, expand_errors: bool) {
             let mut output = VerifyOutput::default();
             let _ = time("verify", || {
                 verify_simplified_krate(
-                    krate, global_ctx, crate_name, compiler, &spans, expand_errors, &mut output,
+                    krate, global_ctx, crate_name, compiler, &spans, &mut output,
                 )
             });
             output.write();
