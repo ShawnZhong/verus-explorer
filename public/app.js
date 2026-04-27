@@ -335,7 +335,7 @@ const updateSourceUI = () => {
 // spelled out so newcomers don't need to know what HIR/VIR/AIR stand for.
 const TAB_GROUPS = [
   { id: 'Rust',  label: 'Rust IR',     variants: ['AST_PRE', 'AST', 'HIR', 'HIR_TYPED'] },
-  { id: 'VIR',   label: 'Verus IR',    variants: ['VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY'] },
+  { id: 'VIR',   label: 'Verify IR',   variants: ['VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY'] },
   { id: 'AIR',   label: 'Assert IR',   variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
   { id: 'Z3',    label: 'Z3 Solver',   variants: ['SMT_TRANSCRIPT', 'SMT_QUERY', 'SMT_RESPONSE'] },
 ];
