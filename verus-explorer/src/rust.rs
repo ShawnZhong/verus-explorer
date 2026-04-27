@@ -41,23 +41,33 @@ pub(crate) fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
 // friends), plus our prebuilt `libverus_builtin.rmeta`, in the libs bundle
 // instead of on disk. `#![no_std]` keeps std out (only `core` is needed).
 //
-// `keep_ghost` picks between the two Verus operating modes (mirroring
-// the cfg pairs upstream's `rust_verify::driver` sets per pass):
-//   * `true`  → Verification mode: inserts both `verus_keep_ghost` and
-//     `verus_keep_ghost_body` (driver.rs:270-272). `cfg_erase()` returns
-//     `EraseGhost::Keep` — full ghost code survives parse → AST → HIR
-//     → VIR → AIR → SMT.
-//   * `false` → Compile mode: inserts only `verus_keep_ghost`
-//     (driver.rs:162). `cfg_erase()` returns `EraseGhost::Erase` — bodies
-//     of `spec` / `proof` items erase, but stubs (signatures) survive,
-//     matching what `verus --compile` hands rustc for codegen. We don't
-//     use `EraseGhost::EraseAll` (neither cfg set) because that path is
-//     for third-party deps Verus never touched, not for the user's crate.
-//
-// `crate_type_bin` flips `--crate-type` between `lib` (verify / compile-
-// mode) and `bin` (run-mode, where Miri needs `tcx.entry_fn()` to
-// resolve the user's `fn main`).
-pub(crate) fn build_rustc_config(src: String, keep_ghost: bool, crate_type_bin: bool) -> rustc_interface::interface::Config {
+// `Mode` picks between the two pipelines we expose:
+//   * `Verify`  — preserves ghost code through HIR/VIR/AIR for the
+//     verifier. Inserts both `verus_keep_ghost` and `verus_keep_ghost_body`
+//     (mirroring `rust_verify::driver` line 270-272). `cfg_erase()`
+//     returns `EraseGhost::Keep` — full ghost surface survives parse →
+//     AST → HIR → VIR → AIR → SMT. `--crate-type=lib`.
+//   * `Execute` — erases ghost bodies before MIR-building so Miri only
+//     interprets run-mode logic. Inserts only `verus_keep_ghost`
+//     (driver.rs:162); `cfg_erase()` returns `EraseGhost::Erase`. Sets
+//     `--crate-type=bin` (so Miri finds `tcx.entry_fn()` for `fn main`)
+//     plus `--emit=metadata` (short-circuits the bin path before link,
+//     since our sysroot ships rmetas and Miri uses tcx queries directly).
+//     Forces libstd available regardless of the no_std toggle because
+//     Miri needs the `start` lang item and most run-mode programs use
+//     `println!` / `eprintln!`.
+// Verus has a third upstream "EraseGhost::EraseAll" mode for third-party
+// deps Verus never touched; we don't expose it.
+#[derive(Copy, Clone)]
+pub(crate) enum Mode { Verify, Execute }
+
+pub(crate) fn build_rustc_config(src: String, mode: Mode) -> rustc_interface::interface::Config {
+    let exec_mode = matches!(mode, Mode::Execute);
+    let keep_ghost = !exec_mode;
+    // libstd is shipped in std-mode (verify) and always in execute mode;
+    // the JS side mirrors this via `LIBS_VARIANT`. Drives both the
+    // `#![no_std]` injection below and the `feature = "std"` cfg.
+    let libstd_available = std_mode() || exec_mode;
     // Put `vstd` and `verus_builtin` in the edition-2018+ extern prelude so
     // user code can `use vstd::prelude::*;` / `use verus_builtin::*;` directly
     // — same flags native Verus's driver and test harness pass. We used to
@@ -65,7 +75,7 @@ pub(crate) fn build_rustc_config(src: String, keep_ghost: bool, crate_type_bin: 
     // diagnostic's line number by one, breaking the editor's error-line
     // highlight. No `=PATH` needed: rustc's crate locator finds the rmetas
     // via the libs sysroot bundle.
-    let crate_type = if crate_type_bin { "--crate-type=bin" } else { "--crate-type=lib" };
+    let crate_type = if exec_mode { "--crate-type=bin" } else { "--crate-type=lib" };
     let mut argv: Vec<String> = ["--edition=2021", crate_type, "--crate-name=v",
         "--sysroot=/virtual", "--extern=vstd", "--extern=verus_builtin"]
         .into_iter().map(String::from).collect();
@@ -73,7 +83,7 @@ pub(crate) fn build_rustc_config(src: String, keep_ghost: bool, crate_type_bin: 
     // codegen + link, which fails because our sysroot ships rmetas (not
     // rlibs). Miri uses tcx queries directly — it doesn't need linked
     // output — so `--emit=metadata` short-circuits before codegen.
-    if crate_type_bin {
+    if exec_mode {
         argv.push("--emit=metadata".into());
     }
     // Feature gates, `register_tool(...)`, and the native subset of lint
@@ -103,17 +113,10 @@ pub(crate) fn build_rustc_config(src: String, keep_ghost: bool, crate_type_bin: 
     // Nostd mode: inject `#![no_std]` at the crate root so rustc bypasses
     // the std prelude. The JS loader fetches a vstd variant built with
     // `feature="alloc"` but NOT `feature="std"`, so user code can still
-    // `use vstd::prelude::*` but can't reach into std::*. Std mode
-    // (default) omits the attr; rustc then injects the std prelude and
-    // the full-fat vstd bundle is active.
-    //
-    // Run mode (`crate_type_bin = true`) forces std regardless of the
-    // toggle: Miri needs the `start` lang item (in libstd), and user
-    // programs typically use `println!` / `eprintln!` (in libstd's
-    // prelude). The std libs are loaded by JS only in std mode, so a
-    // nostd-mode page that hits Run will still fail at libcore/libstd
-    // resolution — the JS side surfaces a clearer message there.
-    if !std_mode() && !crate_type_bin {
+    // `use vstd::prelude::*` but can't reach into std::*. With libstd
+    // available, the attr is omitted; rustc then injects the std prelude
+    // and the full-fat vstd bundle is active.
+    if !libstd_available {
         argv.push("-Zcrate-attr=no_std".into());
     }
 
@@ -180,6 +183,14 @@ pub(crate) fn build_rustc_config(src: String, keep_ghost: bool, crate_type_bin: 
                 psess.config.insert((Symbol::intern("verus_keep_ghost_body"), None));
             }
             psess.config.insert((Symbol::intern("verus_only"), None));
+            // Match vstd's own feature flags so user code can gate on
+            // `#[cfg(feature = "std")]` / `#[cfg(feature = "alloc")]`
+            // the way Cargo would. `alloc` is always on (every variant
+            // ships liballoc); `std` follows `libstd_available`.
+            psess.config.insert((Symbol::intern("feature"), Some(Symbol::intern("alloc"))));
+            if libstd_available {
+                psess.config.insert((Symbol::intern("feature"), Some(Symbol::intern("std"))));
+            }
         })),
         hash_untracked_state: None,
         register_lints: None,

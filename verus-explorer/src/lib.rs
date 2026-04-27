@@ -61,7 +61,7 @@ mod verus;
 mod wasm;
 
 pub use wasm::{perf_now, set_std_mode, wasm_libs_add_file, wasm_libs_finalize};
-use rust::{build_rustc_config, dump_ast, dump_ast_pre_expansion, dump_hir, dump_mir};
+use rust::{build_rustc_config, dump_ast, dump_ast_pre_expansion, dump_hir, dump_mir, Mode};
 use util::time;
 use verus::{VerifyOutput, build_vir, dump_vir, verify_simplified_krate};
 use wasm::console_error;
@@ -113,7 +113,7 @@ pub fn verify(src: &str) {
     // ~L2142) and the per-module reporter → DiagCtxt → HumanEmitter path in
     // `verify_stage`, so they land in the DIAGNOSTICS section — we just
     // swallow the `Result`s here and emit whatever we accumulated.
-    rustc_interface::interface::run_compiler(build_rustc_config(src, /* keep_ghost */ true, /* crate_type_bin */ false), |compiler| {
+    rustc_interface::interface::run_compiler(build_rustc_config(src, Mode::Verify), |compiler| {
         let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
         // Pretty-print the parser output — essentially verbatim source wrapped
         // in `verus! { ... }` (plus the implicit `no_std` / register_tool
@@ -170,7 +170,7 @@ pub fn run(src: &str) {
     // The verify / compile-mode passes use `lib` because we never want
     // rustc to require an entry function for those.
     rustc_interface::interface::run_compiler(
-        build_rustc_config(src, /* keep_ghost */ false, /* crate_type_bin */ true),
+        build_rustc_config(src, Mode::Execute),
         |compiler| {
             let krate = time("run.parse", || rustc_interface::passes::parse(&compiler.sess));
             // Populate the Rust IR tabs (AST_PRE / AST / HIR / HIR_TYPED)

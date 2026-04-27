@@ -9,14 +9,32 @@
        HTML parse, before the module script below executes. `as="fetch"
        crossorigin` matches the default mode/credentials of the later
        `fetch(url)` calls so the preloaded response is reused, not
-       duplicated. Only the always-loaded pieces appear here — mode-
-       specific libs (std vs nostd vstd/vstd.vir) stay off the list
-       because we don't know stdMode until JS reads the URL param. -->
+       duplicated. The two wasm blobs are variant-independent; the
+       libs live under `./libs/<variant>/` so an inline script picks
+       the variant from URL params and injects matching preloads. We
+       only preload the heavy hitters (~22 MB of the bundle's ~25 MB
+       gzipped) — small files don't repay the head-bytes. -->
   <link rel="preload" as="fetch" href="./verus_explorer_bg.wasm" crossorigin>
   <link rel="preload" as="fetch" href="./z3/z3.wasm" crossorigin>
-  <link rel="preload" as="fetch" href="./libs/libcore.rmeta.gz" crossorigin>
-  <link rel="preload" as="fetch" href="./libs/liballoc.rmeta.gz" crossorigin>
-  <link rel="preload" as="fetch" href="./libs/libcompiler_builtins.rmeta.gz" crossorigin>
+  <script>
+    (() => {
+      const p = new URLSearchParams(location.search);
+      const variant = p.get('mode') === 'execute' ? 'exec'
+                    : p.get('std') === '1' ? 'std' : 'nostd';
+      const files = ['libcore.rmeta.gz', 'liballoc.rmeta.gz',
+                     'libcompiler_builtins.rmeta.gz',
+                     'libvstd.rmeta.gz', 'vstd.vir.gz'];
+      if (variant !== 'nostd') files.push('libstd.rmeta.gz');
+      for (const f of files) {
+        const l = document.createElement('link');
+        l.rel = 'preload';
+        l.as = 'fetch';
+        l.crossOrigin = '';
+        l.href = `./libs/${variant}/${f}`;
+        document.head.appendChild(l);
+      }
+    })();
+  </script>
 </head>
 
 <body>
