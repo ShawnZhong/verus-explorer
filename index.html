@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <title>Verus Explorer — every stage of Verus, from source to solver</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <!-- Hint the browser to start the heaviest cold-load fetches during
+       HTML parse, before the module script below executes. `as="fetch"
+       crossorigin` matches the default mode/credentials of the later
+       `fetch(url)` calls so the preloaded response is reused, not
+       duplicated. The two wasm blobs are variant-independent; the
+       libs live under `./libs/<variant>/` so an inline script picks
+       the variant from URL params and injects matching preloads. We
+       only preload the heavy hitters (~22 MB of the bundle's ~25 MB
+       gzipped) — small files don't repay the head-bytes. -->
+  <link rel="preload" as="fetch" href="./verus_explorer_bg.wasm" crossorigin>
+  <link rel="preload" as="fetch" href="./z3/z3.wasm" crossorigin>
+  <script>
+    (() => {
+      const p = new URLSearchParams(location.search);
+      const variant = p.get('mode') === 'execute' ? 'exec'
+                    : p.get('std') === '1' ? 'std' : 'nostd';
+      const files = ['libcore.rmeta.gz', 'liballoc.rmeta.gz',
+                     'libcompiler_builtins.rmeta.gz',
+                     'libvstd.rmeta.gz', 'vstd.vir.gz'];
+      if (variant !== 'nostd') files.push('libstd.rmeta.gz');
+      for (const f of files) {
+        const l = document.createElement('link');
+        l.rel = 'preload';
+        l.as = 'fetch';
+        l.crossOrigin = '';
+        l.href = `./libs/${variant}/${f}`;
+        document.head.appendChild(l);
+      }
+    })();
+  </script>
+</head>
+
+<body>
+
+  <header>
+    <h1>
+      <span><a href="https://shawnzhong.github.io/verus-explorer/">Verus Explorer</a> <span class="muted">Every stage of Verus, from source to solver, running live in your local browser.</span></span>
+      <a class="header-link" href="https://github.com/ShawnZhong/verus-explorer/tree/49ad464" target="_blank" rel="noopener">Code</a>
+    </h1>
+  </header>
+
+  <main id="workbench">
+    <section class="pane" id="left-pane">
+      <div class="pane-header">
+        <label class="hint muted" for="source-select">Source:</label>
+        <select id="source-select"></select>
+        <button id="source-prev" class="source-nav" type="button"
+                title="Previous example" aria-label="Previous example">◀</button>
+        <button id="source-next" class="source-nav" type="button"
+                title="Next example" aria-label="Next example">▶</button>
+        <button id="source-reset" class="source-reset" type="button"
+                title="Revert to the shipped example source" hidden>Reset</button>
+      </div>
+      <div id="source-input"></div>
+      <div id="left-resizer" title="Drag to resize"></div>
+      <div id="meta-panel"></div>
+      <div class="controls">
+        <button id="action-run" disabled>
+          <span id="action-run-label">Loading verifier…</span>
+        </button>
+        <span class="hint muted" title="Pick the action the trigger button + auto-fire perform. Verify drives the full HIR → VIR → AIR → SMT pipeline; Execute drives Miri on the user's `fn main`.">
+          <label><input type="radio" name="action-mode" value="verify" checked /> Verify</label>
+          <label><input type="radio" name="action-mode" value="execute" /> Execute</label>
+        </span>
+        <span class="controls-right">
+          <label class="hint muted" title="Re-trigger the selected mode after each edit (debounce adapts to last action's duration, 150 ms floor)">
+            <input type="checkbox" id="auto-action" /> Auto run
+          </label>
+          <label class="hint muted" title="Default: no_std + alloc-only vstd. Uncheck to enable libstd + std-flavored vstd (unlocks println!, HashMap, PPtr::new at ~20% slower verify). Toggle reloads the page.">
+            <input type="checkbox" id="nostd-mode" /> no_std
+          </label>
+        </span>
+      </div>
+    </section>
+
+    <div id="col-resizer" title="Drag to resize"></div>
+
+    <section class="pane" id="right-pane">
+      <!-- Stage tab buttons are appended into `#output-tabs` by `renderTabs`;
+           the static `.tab-actions` block lives in markup so its buttons
+           aren't torn down on every tab switch, only their disabled state
+           changes. `margin-left: auto` (CSS) pins it right. -->
+      <div class="output-tabs" id="output-tabs" role="tablist">
+        <div class="tab-actions">
+          <button class="tab-action" id="download-btn" type="button"
+                  title="Download the current IR tab" disabled>Download</button>
+          <button class="tab-action" id="share-btn" type="button"
+                  title="Copy the current URL to clipboard">Copy link</button>
+        </div>
+      </div>
+      <div class="output-subtabs" id="output-subtabs" role="tablist"></div>
+      <div id="output-view"></div>
+    </section>
+  </main>
+
+  <!-- Emscripten MODULARIZE output: defines globalThis.initZ3(config).
+       Lives under ./z3/ so wasm-pack's post-build wasm-opt pass (which
+       scans every top-level *.wasm in its --out-dir) doesn't try to
+       re-optimize z3.wasm and abort on its exception-handling tags. -->
+  <script src="./z3/z3.js"></script>
+
+  <script type="module" src="./app.js"></script>
+
+</body>
+
+</html>
