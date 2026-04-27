@@ -38,6 +38,19 @@ bincode = "1.0.1"
 # shared `deps/` dir, which surfaces as rust-lld "duplicate symbol" errors.
 [target.wasm32-unknown-unknown.dependencies]
 rustc-rlibs = { path = "../rustc-rlibs" }
+# Miri (MIR interpreter). `default-features = false` strips `native-lib`
+# (libffi/libloading/capstone/ipc-channel/nix — all unix-only) and
+# `genmc`. The vendored Miri has small wasm-host patches in
+# `src/shims/{unix/fs,windows/foreign_items,os_str}.rs` to handle the
+# `cfg(not(any(unix, windows)))` host case, and a `[target.wasm32...]`
+# rustc-rlibs dep in its Cargo.toml so cargo serializes its compile
+# after the rustc_* rlibs are in deps/.
+miri = { path = "../third_party/rust/src/tools/miri", default-features = false, features = ["stack-cache"] }
+# Linked here so we can name `getrandom::Error` in the
+# `__getrandom_v03_custom` stub in `src/wasm.rs`. The custom backend is
+# enabled via the `getrandom_backend="custom"` rustflag in
+# `.cargo/config.toml`, not via a Cargo feature.
+getrandom = { version = "0.3" }
 
 [target.wasm32-unknown-unknown.dev-dependencies]
 wasm-bindgen-test = "0.3"

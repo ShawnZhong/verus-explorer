@@ -44,18 +44,21 @@
       <div id="left-resizer" title="Drag to resize"></div>
       <div id="meta-panel"></div>
       <div class="controls">
-        <button id="verify-run" disabled>
-          <span id="verify-run-label">Loading verifier…</span>
+        <button id="action-run" disabled>
+          <span id="action-run-label">Loading verifier…</span>
         </button>
-        <label class="hint muted" title="Re-verify 500ms after each edit">
-          <input type="checkbox" id="auto-verify" /> Auto verify
-        </label>
-        <label class="hint muted" title="Check to enable libstd + std-flavored vstd (unlocks println!, HashMap, PPtr::new at ~20% slower verify). Unchecked is the default: no_std + alloc-only vstd. Toggle reloads the page.">
-          <input type="checkbox" id="std-mode" /> Use std
-        </label>
-        <label class="hint muted" title="Switch to Verus's compilation pass: shows only the Rust IR tabs (AST / HIR / Typed HIR) with ghost code erased at macro expansion. Skips verification — no VIR / AIR / SMT.">
-          <input type="checkbox" id="compile-mode" /> Compile mode
-        </label>
+        <span class="hint muted" title="Pick the action the trigger button + auto-fire perform. Verify drives the full HIR → VIR → AIR → SMT pipeline; Execute drives Miri on the user's `fn main`.">
+          <label><input type="radio" name="action-mode" value="verify" checked /> Verify</label>
+          <label><input type="radio" name="action-mode" value="execute" /> Execute</label>
+        </span>
+        <span class="controls-right">
+          <label class="hint muted" title="Re-trigger the selected mode after each edit (debounce adapts to last action's duration, 150 ms floor)">
+            <input type="checkbox" id="auto-action" /> Auto run
+          </label>
+          <label class="hint muted" title="Default: no_std + alloc-only vstd. Uncheck to enable libstd + std-flavored vstd (unlocks println!, HashMap, PPtr::new at ~20% slower verify). Toggle reloads the page.">
+            <input type="checkbox" id="nostd-mode" /> no_std
+          </label>
+        </span>
       </div>
     </section>
 

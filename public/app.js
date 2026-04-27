@@ -50,48 +50,68 @@ import {
 //                     Unlocks PPtr::new / HashMap / println!. ~16
 //                     MB gzipped, ~30-50 ms slower per warm verify.
 //                     Opt in via `?std=1` or the toolbar checkbox.
-// Dropped from both lists despite being declared libstd deps:
-// libpanic_{abort,unwind} — rustc doesn't fetch panic runtimes
-// under `--emit=metadata` since no linking happens (measured).
-// Backtrace crates (gimli, object, addr2line, miniz_oxide, adler2,
-// memchr) don't appear because we disabled `rust.backtrace` in
-// `third_party/rust/bootstrap.toml` so libstd itself stops
-// declaring them. libtest, libproc_macro, libgetopts, libsysroot,
-// and librustc_std_workspace_std are x.py by-products libstd
-// doesn't depend on.
+// Three lib bundles staged by `scripts/build-libs.sh`, one per
+// `(mode, std-flag)` combo:
+//   * `nostd` — verify, no_std. Lean (no-MIR) sysroot rmetas +
+//                alloc-flavor vstd. Smallest cold load.
+//   * `std`   — verify, libstd. Lean (no-MIR) sysroot + std-flavor
+//                vstd + libstd's wasm32 dep chain.
+//   * `exec`  — execute mode (always with libstd). MIR-encoded
+//                sysroot + libpanic_abort + std-flavor vstd (no MIR
+//                — rust_verify doesn't thread `-Zalways-encode-mir`,
+//                so Miri calls into vstd fns would trap; rare for
+//                run-mode programs). Only fetched in execute mode.
+//
+// Notes on what's *not* fetched:
+// libpanic_unwind — rustc doesn't fetch the unwind panic runtime
+// under `--emit=metadata` (measured). Backtrace crates (gimli,
+// object, addr2line, miniz_oxide, adler2, memchr) don't appear
+// because we disabled `rust.backtrace` in
+// `third_party/rust/bootstrap.toml` so libstd itself stops declaring
+// them. libtest, libproc_macro, libgetopts, libsysroot, and
+// librustc_std_workspace_std are x.py by-products libstd doesn't
+// depend on.
 const stdMode = new URLSearchParams(location.search).get('std') === '1';
-const LIBS_SHARED = [
-  'liballoc.rmeta',
-  'libcompiler_builtins.rmeta',
-  'libcore.rmeta',
-  'libverus_builtin.rmeta',
-  'libverus_builtin_macros.rmeta',
-  'libverus_state_machines_macros.rmeta',
-];
-// Mode-specific fetches. Paths are relative to `./libs/`. The
-// `libvstd.rmeta` / `vstd.vir` entries under std/ and nostd/ have
-// the same *logical* names on the rustc side — we register them
-// with those names via `wasm_libs_add_file` — but the bytes come
-// from the mode's subdir.
-const LIBS_STD_ONLY = [
-  'std/libstd.rmeta',
-  'std/libcfg_if.rmeta',
-  'std/libdlmalloc.rmeta',
-  'std/libhashbrown.rmeta',
-  'std/liblibc.rmeta',
-  'std/librustc_demangle.rmeta',
-  'std/librustc_std_workspace_alloc.rmeta',
-  'std/librustc_std_workspace_core.rmeta',
-  'std/libstd_detect.rmeta',
-  'std/libunwind.rmeta',
-  'std/libvstd.rmeta',
-  'std/vstd.vir',
-];
-const LIBS_NOSTD_ONLY = [
-  'nostd/libvstd.rmeta',
-  'nostd/vstd.vir',
-];
-const LIBS = [...LIBS_SHARED, ...(stdMode ? LIBS_STD_ONLY : LIBS_NOSTD_ONLY)];
+const execMode = new URLSearchParams(location.search).get('mode') === 'execute';
+// Variant subdir is just `(execMode ? 'exec' : (stdMode ? 'std' : 'nostd'))`.
+// `exec` implies libstd (Miri's `start` lang item lives there + most
+// programs use `println!`); we don't ship a `nostd-exec` variant.
+const LIBS_VARIANT = execMode ? 'exec' : (stdMode ? 'std' : 'nostd');
+// Each variant's bundle is a flat list of `lib<name>.rmeta` (+ vstd.vir
+// for the verify variants). Built by `scripts/build-libs.sh`. Listed
+// out here so the cold-load progress bar knows the count up front
+// — the file names in `target/libs/<variant>/` are the source of truth
+// if these ever drift.
+const LIBS_BY_VARIANT = {
+  nostd: [
+    'liballoc.rmeta', 'libcompiler_builtins.rmeta', 'libcore.rmeta',
+    'libverus_builtin.rmeta', 'libverus_builtin_macros.rmeta',
+    'libverus_state_machines_macros.rmeta',
+    'libvstd.rmeta', 'vstd.vir',
+  ],
+  std: [
+    'liballoc.rmeta', 'libcompiler_builtins.rmeta', 'libcore.rmeta',
+    'libverus_builtin.rmeta', 'libverus_builtin_macros.rmeta',
+    'libverus_state_machines_macros.rmeta',
+    'libstd.rmeta', 'libcfg_if.rmeta', 'libdlmalloc.rmeta',
+    'libhashbrown.rmeta', 'liblibc.rmeta', 'librustc_demangle.rmeta',
+    'librustc_std_workspace_alloc.rmeta', 'librustc_std_workspace_core.rmeta',
+    'libstd_detect.rmeta', 'libunwind.rmeta',
+    'libvstd.rmeta', 'vstd.vir',
+  ],
+  exec: [
+    'liballoc.rmeta', 'libcompiler_builtins.rmeta', 'libcore.rmeta',
+    'libverus_builtin.rmeta', 'libverus_builtin_macros.rmeta',
+    'libverus_state_machines_macros.rmeta',
+    'libstd.rmeta', 'libcfg_if.rmeta', 'libdlmalloc.rmeta',
+    'libhashbrown.rmeta', 'liblibc.rmeta', 'libpanic_abort.rmeta',
+    'librustc_demangle.rmeta', 'librustc_std_workspace_alloc.rmeta',
+    'librustc_std_workspace_core.rmeta', 'libstd_detect.rmeta',
+    'libunwind.rmeta',
+    'libvstd.rmeta', 'vstd.vir',
+  ],
+};
+const LIBS = LIBS_BY_VARIANT[LIBS_VARIANT];
 
 // Kick off wasm loading in the background (Z3 init, Verus wasm compile,
 // libs fetch+decompress — all independent, so fire as one Promise.all;
@@ -116,15 +136,15 @@ const wasmReady = (async () => {
   const [Z3, verusModule, wasmLibs] = await Promise.all([
     globalThis.initZ3(),
     WebAssembly.compileStreaming(fetch('./verus_explorer_bg.wasm')),
-    Promise.all(LIBS.map(async path => {
-      const res = await fetch(`./libs/${path}.gz`);
+    Promise.all(LIBS.map(async name => {
+      // Files live under `./libs/<variant>/` on disk; rustc's in-wasm
+      // crate locator sees them by their bare name (no variant
+      // prefix), set up by `wasm_libs_finalize` below.
+      const res = await fetch(`./libs/${LIBS_VARIANT}/${name}.gz`);
       const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
       const buf = await new Response(stream).arrayBuffer();
       wasmLibsLoaded++;
       verifyButtonLabel.textContent = `Loading ${wasmLibsLoaded}/${LIBS.length} libs…`;
-      // Strip the mode subdir prefix ('std/' or 'nostd/') so the
-      // in-wasm crate locator sees plain `libvstd.rmeta` etc.
-      const name = path.replace(/^(std|nostd)\//, '');
       return [name, new Uint8Array(buf)];
     })),
   ]);
@@ -157,8 +177,16 @@ const wasmReady = (async () => {
 // ------------------------------------------------------------------
 // DOM refs + tiny state
 // ------------------------------------------------------------------
-const verifyButton = document.getElementById('verify-run');
-const verifyButtonLabel = document.getElementById('verify-run-label');
+const actionButton = document.getElementById('action-run');
+const actionButtonLabel = document.getElementById('action-run-label');
+const actionModeRadios = document.querySelectorAll('input[name="action-mode"]');
+const getActionMode = () => {
+  for (const r of actionModeRadios) if (r.checked) return r.value;
+  return 'verify';
+};
+// Aliases preserved for the existing cold-load progress code path.
+const verifyButton = actionButton;
+const verifyButtonLabel = actionButtonLabel;
 const metaPanel = document.getElementById('meta-panel');
 // Drag the splitter above the diagnostics pane to reshape the left
 // column. Adjusts `#meta-panel`'s flex-basis; the editor (flex: 1)
@@ -227,21 +255,38 @@ const outputTabsEl = document.getElementById('output-tabs');
 const outputSubtabsEl = document.getElementById('output-subtabs');
 const outputViewEl = document.getElementById('output-view');
 const sourceSelect = document.getElementById('source-select');
-const autoVerifyCheckbox = document.getElementById('auto-verify');
-const compileModeCheckbox = document.getElementById('compile-mode');
+const autoVerifyCheckbox = document.getElementById('auto-action');
 // std toggle: initial state reflects the URL param (`?std=1` opts
 // in; default is nostd). Flipping it rewrites the URL and reloads,
 // because the libs bundle is picked up at wasm instance init and
 // can't be swapped mid-session without rebuilding the cstore.
-const stdModeCheckbox = document.getElementById('std-mode');
-stdModeCheckbox.checked = stdMode;
-stdModeCheckbox.addEventListener('change', () => {
-  const params = new URLSearchParams(location.search);
-  if (stdModeCheckbox.checked) params.set('std', '1');
-  else params.delete('std');
-  const qs = params.toString();
-  location.search = qs ? `?${qs}` : '';
-});
+// Checkbox semantics inverted from the URL param: `?std=1` means std
+// mode is on, but the visible label is `no_std` (= the default), so
+// checked = no_std (no `?std=1`) and unchecked = std mode (sets it).
+// This matches what the user actually sees: most sessions are no_std,
+// so the box starts checked.
+const nostdCheckbox = document.getElementById('nostd-mode');
+// Execute mode always uses libstd (Miri's `start` lang item lives
+// there + most snippets call `println!`); the checkbox is meaningless,
+// disable it. The shipped exec-flavor libs bundle wouldn't fit a
+// nostd config anyway.
+if (execMode) {
+  nostdCheckbox.checked = false;
+  nostdCheckbox.disabled = true;
+} else {
+  // Inverted semantics: `?std=1` means std mode, but the visible
+  // label is `no_std` (= the default), so checked = no_std (no
+  // `?std=1`) and unchecked = std mode (sets it). Most sessions are
+  // no_std, so the box starts checked.
+  nostdCheckbox.checked = !stdMode;
+  nostdCheckbox.addEventListener('change', () => {
+    const params = new URLSearchParams(location.search);
+    if (nostdCheckbox.checked) params.delete('std');
+    else params.set('std', '1');
+    const qs = params.toString();
+    location.search = qs ? `?${qs}` : '';
+  });
+}
 const downloadBtn = document.getElementById('download-btn');
 const shareBtn = document.getElementById('share-btn');
 
@@ -331,19 +376,30 @@ const updateSourceUI = () => {
 // Two-level nav for the output pane: top tabs pick the pipeline stage,
 // subtabs pick the variant within that stage. Single-variant groups
 // render no subtab row. `id` is the stable internal key (URL hash,
-// bench bucket, state maps); `label` is the user-facing tab text —
-// spelled out so newcomers don't need to know what HIR/VIR/AIR stand for.
+// bench bucket, state maps); `label` is the user-facing tab text.
+//
+// Layout follows the lowering pipeline: AST → HIR → (MIR → Miri | VIR
+// → AIR → Z3). The first two stages are shared; mode picks the tail.
+// Verify mode skips MIR (sysroot rmetas are MIR-stripped in
+// verify-flavor libs); execute mode skips the Verus pipeline.
 const TAB_GROUPS = [
-  { id: 'Rust',  label: 'Rust IR',     variants: ['AST_PRE', 'AST', 'HIR', 'HIR_TYPED'] },
-  { id: 'VIR',   label: 'Verify IR',   variants: ['VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY'] },
-  { id: 'AIR',   label: 'Assert IR',   variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
-  { id: 'Z3',    label: 'Z3 Solver',   variants: ['SMT_TRANSCRIPT', 'SMT_QUERY', 'SMT_RESPONSE'] },
+  { id: 'AST', label: 'AST', variants: ['AST_PRE', 'AST'] },
+  { id: 'HIR', label: 'HIR', variants: ['HIR', 'HIR_TYPED'] },
+  ...(execMode ? [
+    { id: 'MIR', label: 'MIR', variants: ['MIR_BUILT', 'MIR_DROPS', 'MIR_OPT'] },
+  ] : [
+    { id: 'VIR', label: 'Verify IR', variants: ['VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY'] },
+    { id: 'AIR', label: 'Assert IR', variants: ['AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL'] },
+    { id: 'Z3',  label: 'Z3',        variants: ['SMT_TRANSCRIPT', 'SMT_QUERY', 'SMT_RESPONSE'] },
+  ]),
 ];
 const VARIANT_LABEL = {
-  AST_PRE: 'AST', AST: 'Expanded AST', HIR: 'HIR', HIR_TYPED: 'Typed HIR',
-  VIR_RAW: 'Raw', VIR_SIMPLE: 'Simple', VIR_PRUNED: 'Pruned', SST_AST: 'SST', SST_POLY: 'Mono',
-  AIR_INITIAL: 'Blocks', AIR_MIDDLE: 'SSA', AIR_FINAL: 'Flat',
-  SMT_TRANSCRIPT: 'Log', SMT_QUERY: 'Query', SMT_RESPONSE: 'Result',
+  AST_PRE: 'Raw',     AST: 'Expanded',
+  HIR: 'Untyped',     HIR_TYPED: 'Typed',
+  MIR_BUILT: 'Built', MIR_DROPS: 'Drop Elab', MIR_OPT: 'Optimized',
+  VIR_RAW: 'Raw',     VIR_SIMPLE: 'Simple',   VIR_PRUNED: 'Pruned', SST_AST: 'SST', SST_POLY: 'Mono',
+  AIR_INITIAL: 'Blocks', AIR_MIDDLE: 'SSA',   AIR_FINAL: 'Flat',
+  SMT_TRANSCRIPT: 'Log', SMT_QUERY: 'Query',  SMT_RESPONSE: 'Result',
 };
 // Flat section order + section → group lookup, both derived from
 // TAB_GROUPS so adding a new variant is a one-line change.
@@ -395,33 +451,30 @@ const diagnostics = [];
 // from Rust (one entry per `time(label, ||...)` wrapper in `src/lib.rs`).
 // Rendered by `renderMeta` as a grouped breakdown under the verdict.
 const benchCache = new Map();
-// Collapse the raw Rust-side labels (`rustc_parse`, `verify.queries`,
-// `dump.hir_typed`, …) into a handful of user-facing buckets that
-// match the tab groups. Unknown labels fall through (ignored) so new
-// Rust-side timers don't surprise the user until we classify them.
-// `verify` / `verify.module` are wrapper labels (skipped here to
-// avoid double-counting their downstream `verify.*` children).
-const BENCH_GROUP = {
-  rustc_parse: 'Rust',
-  'dump.ast_pre': 'Rust', 'dump.ast': 'Rust',
-  'dump.hir': 'Rust', 'dump.hir_typed': 'Rust',
-  build_vir: 'VIR', 'build_vir.vstd_deserialize': 'VIR',
-  'build_vir.construct_vir_crate': 'VIR',
-  'build_vir.global_ctx': 'VIR', 'build_vir.check_traits': 'VIR',
-  'build_vir.simplify_krate': 'VIR',
-  'dump.vir_raw': 'VIR', 'dump.vir_simple': 'VIR', 'dump.vir_pruned': 'VIR',
-  'verify.ast_to_sst': 'VIR', 'dump.sst_ast': 'VIR',
-  'verify.poly': 'VIR', 'dump.sst_poly': 'VIR',
-  'verify.prune': 'AIR', 'verify.ctx_new': 'AIR',
-  'verify.air_ctx_new': 'AIR', 'verify.feed_decls': 'AIR',
-  'verify.ctx_free': 'AIR', 'verify.reporter_new': 'AIR',
-  'verify.queries': 'Z3',
-};
-// Which pipeline-timing bucket each top-level tab group maps to, so
-// the subtab row can surface the bucket matching the current view.
-const TAB_GROUP_BENCH = {
-  Rust: 'Rust', VIR: 'VIR', AIR: 'AIR', Z3: 'Z3',
-};
+// Map raw Rust-side time-labels (`rustc_parse`, `verify.queries`, …)
+// to the user-facing tab-group ids (`AST`, `HIR`, `MIR`, `VIR`, `AIR`,
+// `Z3`). Authored bucket-first because that's how a reader thinks
+// ("which timers belong to VIR?"); inverted into the `label → bucket`
+// lookup `renderSubtabs` reads. Unknown labels fall through and are
+// ignored so a newly-added Rust-side timer doesn't crash the row until
+// it's classified here.
+//
+// `verify` / `verify.module` are wrapper labels (skipped to avoid
+// double-counting their downstream `verify.*` children).
+const BENCH_GROUP = Object.fromEntries(
+  [
+    ['AST', ['rustc_parse', 'dump.ast_pre', 'dump.ast']],
+    ['HIR', ['dump.hir', 'dump.hir_typed']],
+    ['MIR', ['dump.mir', 'run.parse', 'run.miri']],
+    ['VIR', ['build_vir', 'build_vir.vstd_deserialize', 'build_vir.construct_vir_crate',
+             'build_vir.global_ctx', 'build_vir.check_traits', 'build_vir.simplify_krate',
+             'dump.vir_raw', 'dump.vir_simple', 'dump.vir_pruned',
+             'verify.ast_to_sst', 'dump.sst_ast', 'verify.poly', 'dump.sst_poly']],
+    ['AIR', ['verify.prune', 'verify.ctx_new', 'verify.air_ctx_new', 'verify.feed_decls',
+             'verify.ctx_free', 'verify.reporter_new']],
+    ['Z3',  ['verify.queries']],
+  ].flatMap(([bucket, labels]) => labels.map(l => [l, bucket]))
+);
 // Which IR the output view currently shows; preserved across runVerify
 // calls so the user doesn't lose their tab selection on every edit.
 // Null until the first successful parse; `renderTabs` picks a default.
@@ -601,6 +654,35 @@ const renderMeta = () => {
     div.appendChild(list);
     metaPanel.appendChild(div);
   }
+  // Run output: lives alongside the verdict so the user sees both
+  // verification results and execution results in one place. `runOutput`
+  // is a list of `{stream, text}` chunks pushed by the
+  // `verus_run_stdout` / `_stderr` callbacks (each chunk is one
+  // syscall). `renderMeta` collapses adjacent same-stream chunks into
+  // one `<pre>` so a single `print!` doesn't fragment visually.
+  // Timings (run.parse / dump.mir / run.miri) flow through the same
+  // bench bucket as verify timings — surfaced once on the right-panel
+  // subtab row, not duplicated here.
+  if (runOutput.length > 0) {
+    const div = document.createElement('div');
+    div.className = 'verdict';
+    // Collapse runs of same-stream chunks into one block (`<pre>`)
+    // so the rendering matches what `cat | program` would show in a
+    // terminal: one stream's continuous output stays together.
+    let cursor = 0;
+    while (cursor < runOutput.length) {
+      const stream = runOutput[cursor].stream;
+      let end = cursor + 1;
+      while (end < runOutput.length && runOutput[end].stream === stream) end++;
+      const text = runOutput.slice(cursor, end).map(c => c.text).join('');
+      const pre = document.createElement('pre');
+      pre.className = `run-output run-output-${stream}`;
+      pre.textContent = text.replace(/\n+$/, '');
+      div.appendChild(pre);
+      cursor = end;
+    }
+    metaPanel.appendChild(div);
+  }
   for (const d of diagnostics) {
     const pre = document.createElement('pre');
     pre.className = `diagnostic ${d.severity}`;
@@ -685,13 +767,14 @@ const renderSubtabs = () => {
   }
   // Right-of-subtabs status line: `stageMs / totalMs` — this tab's
   // stage vs the full pipeline, so proportion is visible at a glance.
-  const benchBucket = TAB_GROUP_BENCH[currentGroup];
+  // Tab group ids (`Rust`, `VIR`, `AIR`, `Z3`) match the bench-bucket
+  // labels by construction — no separate map needed.
   let stageMs = 0, totalMs = 0;
   for (const [label, v] of benchCache) {
     const g = BENCH_GROUP[label];
     if (!g) continue;
     totalMs += v;
-    if (g === benchBucket) stageMs += v;
+    if (g === currentGroup) stageMs += v;
   }
   if (totalMs > 0) {
     const timing = document.createElement('div');
@@ -778,6 +861,7 @@ const sexpLanguage = StreamLanguage.define(sexpParser);
 // (VIR/SST also pretty-print as parenthesized trees, close enough).
 const LANGUAGE_FOR_SECTION = {
   AST_PRE: rust(), AST: rust(), HIR: rust(), HIR_TYPED: rust(),
+  MIR_BUILT: rust(), MIR_DROPS: rust(), MIR_OPT: rust(),
   VIR_RAW: sexpLanguage, VIR_SIMPLE: sexpLanguage, VIR_PRUNED: sexpLanguage,
   SST_AST: sexpLanguage, SST_POLY: sexpLanguage,
   AIR_INITIAL: sexpLanguage, AIR_MIDDLE: sexpLanguage, AIR_FINAL: sexpLanguage,
@@ -1077,6 +1161,16 @@ globalThis.verus_dump = (section, contents, folds) => {
 globalThis.verus_bench = (label, ms) => {
   benchCache.set(label, (benchCache.get(label) ?? 0) + ms);
 };
+// Stdout / stderr from a Miri-interpreted run, fed by the patched
+// `impl FileDescription for io::Stdout/Stderr` in
+// `third_party/rust/src/tools/miri/src/shims/files.rs`. Each call is
+// one syscall — typically a `print!` / `println!` chunk. `runOutput`
+// accumulates them as `{stream, text}` chunks (preserving order
+// across stdout/stderr interleaving) so `renderMeta` can render
+// stderr distinctly. Cleared at the start of each `runProgram`.
+let runOutput = [];
+globalThis.verus_run_stdout = (text) => { runOutput.push({ stream: 'stdout', text }); };
+globalThis.verus_run_stderr = (text) => { runOutput.push({ stream: 'stderr', text }); };
 // Declared here (before `runVerify`) so `runVerify` can cancel any
 // pending auto-verify at its top — otherwise an explicit verify
 // (Verify click, example load) races with a pending 500 ms auto-
@@ -1085,17 +1179,34 @@ globalThis.verus_bench = (label, ms) => {
 // `scheduleAutoVerify` further down.
 let autoVerifyTimer;
 let runId = 0;
-const runVerify = async () => {
+// Shared scaffolding for `runVerify` / `runProgram`. Mode-specific
+// pieces are passed in via `opts`:
+//   - `fn`            : the wasm call (e.g. `verus.verify(src)`).
+//   - `onError(e)`    : called on a wasm trap. Should push an entry
+//                       into `_diags` or `runOutput` to surface the
+//                       failure to the user.
+//   - `finalize()`    : optional post-wasm-call mutation of caches
+//                       (verify-mode runs the banner-fold scanner
+//                       over VIR/AIR/SMT here; run-mode skips).
+//   - `preferredTab`  : tab name to fall back to when the prior
+//                       selection isn't in the new cache state.
+//                       `SMT_TRANSCRIPT` for verify, `MIR` for run.
+//
+// Centralizing this means `scheduleAutoVerify` (timer-driven) and the
+// click handler share one entry path — no risk of "auto-fires verify
+// but click runs execute" drift.
+const runWith = async (opts) => {
   // Wasm not ready yet — silently no-op. Reached only through
-  // `scheduleAutoVerify` firing during cold-load (the Verify button
+  // `scheduleAutoVerify` firing during cold-load (the action button
   // is disabled until `wasmReady` resolves, so the click path can't
   // land here). The final `await wasmReady` at the bottom of this
-  // script runs the first real verify once wasm is live.
+  // script runs the first real action once wasm is live.
   if (!verus) return;
   clearTimeout(autoVerifyTimer);
   const myRun = ++runId;
-  verifyButton.disabled = true;
-  verifyButtonLabel.textContent = 'Verify…';
+  const t0 = performance.now();
+  actionButton.disabled = true;
+  actionButton.classList.add('busy');
   sectionCache.clear();
   sectionFolds.clear();
   sectionAutoFolded.clear();
@@ -1103,188 +1214,41 @@ const runVerify = async () => {
   _verdicts.length = 0;
   diagnostics.length = 0;
   benchCache.clear();
-  // Yield to the browser so the disabled button + "Verify…" label
-  // actually paint before `verify` pegs the main thread. rAF
+  runOutput = [];
+  // Yield to the browser so the disabled button + busy spinner
+  // actually paint before the wasm call pegs the main thread. rAF
   // schedules the callback for the next pre-paint hook; the nested
   // `setTimeout(_, 0)` defers the resume until *after* that paint has
   // committed. Without this, the DOM mutations above stay invisible —
   // the sync wasm call runs to completion, then the `finally` below
-  // flips the button back to "Verify" before any frame lands.
+  // flips the button back before any frame lands.
   await new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
-  // If a newer runVerify fired while we were yielding (rapid ⌘↵ mashing,
-  // or auto-verify firing during an explicit click), abandon this one
+  // If a newer action fired while we were yielding (rapid ⌘↵ mashing,
+  // or auto-fire firing during an explicit click), abandon this one
   // — the later one will do its own fresh work.
   if (myRun !== runId) return;
   try {
-    verus.verify(view.state.doc.toString(), compileModeCheckbox.checked);
+    opts.fn();
   } catch (e) {
     if (myRun !== runId) return;
-    if (_diags.length === 0 && sectionCache.size === 0 && _verdicts.length === 0) {
-      // Synthesize a one-off diagnostic so the DIAGNOSTICS pane shows
-      // *something* on a hard wasm trap. Shape matches rustc's
-      // JsonEmitter output minimally — `rendered` is what the renderer
-      // displays, `level` controls severity, no spans → no inline
-      // squiggle (which is correct for a non-source-level crash).
-      _diags.push({
-        rendered: 'Parse crashed: ' + (e?.message ?? e),
-        level: 'error',
-        spans: [],
-      });
-      console.error(e);
-    }
+    opts.onError?.(e);
+    console.error(e);
   } finally {
     if (myRun === runId) {
-      verifyButton.disabled = false;
-      verifyButtonLabel.textContent = 'Verify';
+      actionButton.disabled = false;
+      actionButton.classList.remove('busy');
+      updateActionLabel();
+      // Feed the adaptive debounce so the next auto-fire waits at
+      // least as long as this run took (clamped to the floor in
+      // `scheduleAutoVerify`).
+      lastActionMs = performance.now() - t0;
     }
   }
-  // Scan a body for Rust-declared section markers and build a
-  // cleaned body + foldable / auto-folded ranges. Three markers
-  // come from Verus via `Emitter::section` / `section_close`
-  // (patched in `third_party/verus/source/air/src/emitter.rs`):
-  //
-  //   `;;> <label>` — open a section, auto-fold by default (▸)
-  //   `;;v <label>` — open a section, foldable but expanded (▾)
-  //   `;;<`         — close the innermost open section
-  //
-  // The open-marker char mirrors the CM6 fold-gutter glyph.
-  // Sections nest — an open inside another open creates a child
-  // whose fold is independent of its parent.
-  //
-  // `;;<` is a structural hint only: we use it to compute the
-  // fold's end position, then drop the line from the rendered
-  // body. The banner above already conveys "this section ends"
-  // to the reader, so a visible close is redundant chrome.
-  //
-  // The `>` / `v` discriminator on the open line is structural too
-  // (selects the gutter glyph + auto-fold default); after the fold
-  // is registered the char is stripped, so `;;> foo` / `;;v foo`
-  // both render as `;; foo` — the user reads a comment, not a
-  // marker syntax.
-  //
-  // Empty sections (open with no content before its close) are
-  // stripped from the body regardless of marker kind — an op that
-  // emits no content in a given tab shouldn't leave its banner
-  // behind as noise (e.g., a `;;v Spec-Termination …` that
-  // produced no VIR output). Applies to both `;;>` and `;;v`.
-  //
-  // Plain `;; …` comments (span annotations like
-  // `;; <input.rs>:L:C:…`, Verus's `;; recommendation not met`,
-  // etc.) stay nested inside whatever section they belong to —
-  // no structural effect. JS has zero knowledge of op kinds or
-  // label strings; all fold intent lives in the Rust emitter.
-  //
-  // Single-pass algorithm — walks raw lines, maintaining a stack
-  // of open sections and incrementally building `cleaned`:
-  //   - open  → push {cleanedLenAtOpen, openLineEnd, autoFold}
-  //             and append the banner with the marker char stripped
-  //   - close → pop; if the stack top saw no content since its
-  //             open (cleaned.length === openLineEnd), rewind
-  //             `cleaned` to the pre-banner length (strip empty
-  //             `;;>`), else emit a fold range covering content.
-  //             The `;;<` line is never appended.
-  //   - other → append the line
-  // Unbalanced opens at EOF fold to cleaned.length.
-  const isOpen = (line) =>
-    line.startsWith(';;') && 'v>'.includes(line[2]) && (line.length === 3 || line[3] === ' ');
-  const isClose = (line) => line === ';;<' || line.startsWith(';;< ');
-  // Drop the `>` / `v` from `;;> foo` / `;;v foo` so the rendered
-  // banner reads `;; foo`. `;;>` / `;;v` (no label) render as `;;`.
-  const stripMarker = (line) => ';;' + line.slice(3);
-  const finalizeBannerBody = (body) => {
-    let cleaned = '';
-    const foldable = [];
-    const autoFolded = [];
-    const stack = [];
-    const appendLine = (line) => {
-      if (cleaned.length > 0) cleaned += '\n';
-      cleaned += line;
-    };
-    const emitRange = (open, to) => {
-      if (to > open.openLineEnd) {
-        const range = { from: open.openLineEnd, to };
-        foldable.push(range);
-        if (open.autoFold) autoFolded.push(range);
-      }
-    };
-    for (const l of body.split('\n')) {
-      if (isOpen(l)) {
-        const cleanedLenAtOpen = cleaned.length;
-        appendLine(stripMarker(l));
-        stack.push({
-          cleanedLenAtOpen,
-          openLineEnd: cleaned.length,
-          autoFold: l[2] === '>',
-        });
-      } else if (isClose(l)) {
-        const open = stack.pop();
-        if (!open) continue;
-        if (cleaned.length === open.openLineEnd) {
-          // Empty section — rewind to before the banner so the whole
-          // open/close pair disappears (no banner, no close, no fold).
-          cleaned = cleaned.slice(0, open.cleanedLenAtOpen);
-        } else {
-          // `;;<` is never appended; the fold range covers the
-          // section's content lines, ending at the last one's
-          // newline. Folded view shows just the banner.
-          emitRange(open, cleaned.length);
-        }
-      } else {
-        appendLine(l);
-      }
-    }
-    while (stack.length) emitRange(stack.pop(), cleaned.length);
-    return { body: cleaned, foldable, autoFolded };
-  };
-  // Every banner-driven tab (VIR, SST, AIR, SMT) comes from Rust as
-  // one blob via `verus_dump`. Rust doesn't compute fold ranges —
-  // this scanner does, keyed off the `;;>`/`;;v`/`;;<` markers that
-  // `air_ctx.section(...)` / `section_close()` embedded in the body
-  // (for AIR/SMT) or `WalkBuilder` stamped in (for VIR/SST).
-  for (const tab of [
-    'VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY',
-    'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL',
-    'SMT_QUERY', 'SMT_RESPONSE', 'SMT_TRANSCRIPT',
-  ]) {
-    const raw = sectionCache.get(tab);
-    if (!raw) continue;
-    const { body, foldable, autoFolded } = finalizeBannerBody(raw);
-    sectionCache.set(tab, body);
-    if (foldable.length) sectionFolds.set(tab, foldable);
-    // Reply tab opens fully expanded — replies are short (one-line
-    // `unsat` / `sat` / model dumps), and the user opens this tab
-    // specifically to read them. Sections stay clickable-foldable
-    // via `sectionFolds`, just not collapsed by default.
-    if (autoFolded.length && tab !== 'SMT_RESPONSE') {
-      sectionAutoFolded.set(tab, autoFolded);
-    }
-  }
-  // Consolidate the raw `_diags` list into the unified diagnostic
-  // list. Each entry already has rustc-exact spans (`line_start` /
-  // `column_start` etc.) and a pre-rendered human form, so the
-  // mapping is mostly field renaming.
-  for (const j of _diags) {
-    // Skip rustc's "aborting due to N previous errors" footer. It's
-    // a summary of the preceding errors, not a distinct finding —
-    // would otherwise show up redundantly in the DIAGNOSTICS pane.
-    if ((j.message ?? '').startsWith('aborting due to')) continue;
-    const primary = j.spans?.find(s => s.is_primary) ?? j.spans?.[0];
-    const loc = primary ? {
-      line: primary.line_start, col: primary.column_start,
-      endLine: primary.line_end, endCol: primary.column_end,
-    } : null;
-    const sev = j.level === 'warning' ? 'warning'
-             : (j.level === 'note' || j.level === 'help') ? 'note'
-             : 'error';
-    diagnostics.push({ rendered: j.rendered ?? j.message ?? '', loc, severity: sev });
-  }
-  // Preserve user's tab selection when it survives the new run;
-  // otherwise default to the SMT transcript (the unified
-  // commands-plus-replies stream — most useful for debugging why a
-  // query failed) or whichever stage made it the furthest if the
-  // query stage wasn't reached.
+  if (myRun !== runId) return;
+  opts.finalize?.();
+  if (_diags.length) consolidateDiags();
   if (!currentTab || !sectionCache.has(currentTab)) {
-    currentTab = sectionCache.has('SMT_TRANSCRIPT') ? 'SMT_TRANSCRIPT'
+    currentTab = sectionCache.has(opts.preferredTab) ? opts.preferredTab
       : (SECTION_ORDER.find(n => sectionCache.has(n)) ?? null);
   }
   if (currentTab) lastVariantInGroup.set(GROUP_OF.get(currentTab), currentTab);
@@ -1293,18 +1257,28 @@ const runVerify = async () => {
   updateErrorDecorations();
   updateVerdictMarkers();
   buildInlineDiagnostics();
-  // Keep `&t=<TAB>` in sync when the default-pick logic above swapped
-  // the tab (e.g. the shared link named a tab that isn't produced by
-  // this source). Cheap — just rewrites the suffix.
   writeTabToUrl();
-  // Save the URL whenever `runVerify` reaches its tail — whether verify
-  // said "proof OK", Verus emitted errors, or rustc's abort_if_errors
-  // trapped on a syntax error. All three return fast, so the URL
-  // tracks the latest finished state. A true hang never reaches here
-  // at all, so the hang-on-reload loop stays closed. Stale runs
-  // (superseded by a newer edit) skip; the newer run will save.
   if (myRun === runId) saveHashNow();
 };
+const runVerify = () => runWith({
+  fn: () => verus.verify(view.state.doc.toString()),
+  onError: (e) => {
+    // Synthesize a one-off diagnostic so DIAGNOSTICS shows *something*
+    // on a hard wasm trap that bypassed the JsonEmitter path. Shape
+    // matches rustc's emitter output minimally — `rendered` is what
+    // the renderer displays, `level` controls severity, no spans → no
+    // inline squiggle (correct for a non-source-level crash).
+    if (_diags.length === 0 && sectionCache.size === 0 && _verdicts.length === 0) {
+      _diags.push({
+        rendered: 'Parse crashed: ' + (e?.message ?? e),
+        level: 'error',
+        spans: [],
+      });
+    }
+  },
+  finalize: finalizeBannerSections,
+  preferredTab: 'SMT_TRANSCRIPT',
+});
 
 // ------------------------------------------------------------------
 // URL hash sync: gzip + base64url-encode the doc into `location.hash`
@@ -1336,7 +1310,7 @@ const decodeSrc = async (hash) => {
   const stream = new Blob([b64urlDecode(hash)]).stream().pipeThrough(new DecompressionStream('gzip'));
   return await new Response(stream).text();
 };
-// URL writer. `saveHashNow` fires from `runVerify`'s tail on a
+// URL writer. `saveHashNow` fires from `runWith`'s tail on a
 // successful `verify` return and from user-initiated flows
 // (loadSource / resetSource / copyLink). No keystroke-debounced
 // path — the URL deliberately lags the editor by one verify so a
@@ -1432,6 +1406,7 @@ const parseHash = async (hash) => {
 // `.vir` keeps editors from assuming Rust syntax.
 const EXT_FOR_TAB = {
   AST_PRE: 'rs', AST: 'rs', HIR: 'rs', HIR_TYPED: 'rs',
+  MIR_BUILT: 'mir', MIR_DROPS: 'mir', MIR_OPT: 'mir',
   VIR_RAW: 'vir', VIR_SIMPLE: 'vir', VIR_PRUNED: 'vir', SST_AST: 'vir', SST_POLY: 'vir',
   AIR_INITIAL: 'smt2', AIR_MIDDLE: 'smt2', AIR_FINAL: 'smt2',
   SMT_QUERY: 'smt2', SMT_RESPONSE: 'smt2', SMT_TRANSCRIPT: 'smt2',
@@ -1520,38 +1495,22 @@ autoVerifyCheckbox.addEventListener('change', () => {
   // Flipping the checkbox on is effectively a request to verify now —
   // the user just expressed "yes, I want verification running" — so
   // kick off a run. Flipping off is silent; we only cancel pending work.
-  if (autoVerifyCheckbox.checked) runVerify();
+  if (autoVerifyCheckbox.checked) runAction();
 });
 // Compile mode: opt-in second `run_compiler` pass that re-expands the
-// source with ghost code stripped, overwriting the Rust IR tabs
-// (AST_PRE / AST / HIR / HIR_TYPED) with what Verus's `--compile` pass
-// would feed rustc. Adds parse + macro time. Persisted in the URL
-// (`?compile=1`) — `history.replaceState` keeps the toggle in the
-// address bar across reloads / share-link without forcing a page
-// reload (the wasm module is already loaded; we only need a re-verify).
-compileModeCheckbox.checked = new URLSearchParams(location.search).get('compile') === '1';
-compileModeCheckbox.addEventListener('change', () => {
-  const params = new URLSearchParams(location.search);
-  // delete-then-set so `compile=1` always ends up as the last query
-  // param, regardless of where it was before. URLSearchParams.set
-  // preserves position when the key already exists, which would
-  // otherwise leave a stale order like `?compile=1&std=1`.
-  params.delete('compile');
-  if (compileModeCheckbox.checked) params.set('compile', '1');
-  const qs = params.toString();
-  history.replaceState(null, '', (qs ? `?${qs}` : location.pathname) + location.hash);
-  // The flag is only read by `verify`, so a re-run is required to
-  // see the effect — kick off eagerly instead of waiting for the
-  // next edit or manual Verify click.
-  runVerify();
-});
-// `autoVerifyTimer` is declared up beside `runVerify` so the explicit
-// verify path can preempt a pending auto-fire; this function just
-// arms it after each doc change.
+// Adaptive auto-fire debounce: `max(lastActionMs, AUTO_DEBOUNCE_FLOOR)`.
+// Snappy when actions are quick (150 ms floor — under typical
+// typing-cadence so the user doesn't feel a lag) and patient when
+// they're slow (a 2 s verify won't re-fire after 150 ms; the user's
+// next edit arrives mid-run and we'd just queue noise). Lowering
+// further than 150 ms doesn't help on cold-load (action time dwarfs
+// debounce) and risks doubling work during burst-typing.
+const AUTO_DEBOUNCE_FLOOR = 150;
+let lastActionMs = AUTO_DEBOUNCE_FLOOR;
 const scheduleAutoVerify = () => {
   clearTimeout(autoVerifyTimer);
   if (!autoVerifyCheckbox.checked) return;
-  autoVerifyTimer = setTimeout(runVerify, 500);
+  autoVerifyTimer = setTimeout(runAction, Math.max(lastActionMs, AUTO_DEBOUNCE_FLOOR));
 };
 
 // ------------------------------------------------------------------
@@ -1674,7 +1633,7 @@ const loadSource = async (file) => {
   // `runVerify` will also saveHashNow on success — harmless double
   // write, URL is stable in between.
   saveHashNow();
-  runVerify();
+  runAction();
 };
 // Revert the editor to the shipped source and drop the localStorage
 // override. Only meaningful while an example is loaded and dirty —
@@ -1686,7 +1645,7 @@ const resetSource = () => {
   dirty = false;
   updateSourceUI();
   saveHashNow();
-  runVerify();
+  runAction();
 };
 // Walk the flat `EXAMPLES` list by `step` (±1). From custom content,
 // `step < 0` jumps to the last example and `step > 0` to the first,
@@ -1709,7 +1668,166 @@ resetBtn.addEventListener('click', resetSource);
 // Reflect the resolved initial state in the UI (deferred from the
 // init block above because the view wasn't constructed yet).
 updateSourceUI();
-verifyButton.addEventListener('click', runVerify);
+// `;;>` / `;;v` / `;;<` are Verus-emitted section markers (see
+// `third_party/verus/source/air/src/emitter.rs` patches and the
+// `WalkBuilder` stamping in `verus-explorer/src/util.rs`). The browser
+// scans them post-dump to compute fold ranges and strip the marker
+// chars from the rendered text — Rust owns intent (open/close/auto-
+// fold), JS owns presentation.
+//
+// Plain `;; …` comments (span annotations like `;; <input.rs>:L:C:…`,
+// Verus's `;; recommendation not met`, etc.) stay nested inside
+// whatever section they belong to — no structural effect. JS has zero
+// knowledge of op kinds or label strings; all fold intent lives in
+// the Rust emitter.
+const isOpen = (line) =>
+  line.startsWith(';;') && 'v>'.includes(line[2]) && (line.length === 3 || line[3] === ' ');
+const isClose = (line) => line === ';;<' || line.startsWith(';;< ');
+// Drop the `>` / `v` from `;;> foo` / `;;v foo` so the rendered
+// banner reads `;; foo`. `;;>` / `;;v` (no label) render as `;;`.
+const stripMarker = (line) => ';;' + line.slice(3);
+// Single-pass scanner — walks raw lines, maintains a stack of open
+// sections, builds a `cleaned` text buffer + lists of foldable /
+// auto-folded ranges:
+//   - open  → push {cleanedLenAtOpen, openLineEnd, autoFold} and
+//             append the banner with the marker char stripped
+//   - close → pop; if the stack top saw no content since its open
+//             (cleaned.length === openLineEnd), rewind `cleaned` to
+//             the pre-banner length (strip empty `;;>`), else emit
+//             a fold range covering content. The `;;<` line is
+//             never appended (its job is structural, not visual).
+//   - other → append the line
+// Unbalanced opens at EOF fold to cleaned.length.
+const finalizeBannerBody = (body) => {
+  let cleaned = '';
+  const foldable = [];
+  const autoFolded = [];
+  const stack = [];
+  const appendLine = (line) => {
+    if (cleaned.length > 0) cleaned += '\n';
+    cleaned += line;
+  };
+  const emitRange = (open, to) => {
+    if (to > open.openLineEnd) {
+      const range = { from: open.openLineEnd, to };
+      foldable.push(range);
+      if (open.autoFold) autoFolded.push(range);
+    }
+  };
+  for (const l of body.split('\n')) {
+    if (isOpen(l)) {
+      const cleanedLenAtOpen = cleaned.length;
+      appendLine(stripMarker(l));
+      stack.push({
+        cleanedLenAtOpen,
+        openLineEnd: cleaned.length,
+        autoFold: l[2] === '>',
+      });
+    } else if (isClose(l)) {
+      const open = stack.pop();
+      if (!open) continue;
+      if (cleaned.length === open.openLineEnd) {
+        // Empty section — rewind to before the banner so the whole
+        // open/close pair disappears (no banner, no close, no fold).
+        cleaned = cleaned.slice(0, open.cleanedLenAtOpen);
+      } else {
+        emitRange(open, cleaned.length);
+      }
+    } else {
+      appendLine(l);
+    }
+  }
+  while (stack.length) emitRange(stack.pop(), cleaned.length);
+  return { body: cleaned, foldable, autoFolded };
+};
+// Banner-fold-tagged tabs (VIR / SST / AIR / SMT). `runVerify`'s
+// finalize sweeps these post-dump; `runProgram` doesn't populate any
+// of them, so the loop is a no-op there but cheap to call uniformly.
+const BANNER_FOLD_TABS = [
+  'VIR_RAW', 'VIR_SIMPLE', 'VIR_PRUNED', 'SST_AST', 'SST_POLY',
+  'AIR_INITIAL', 'AIR_MIDDLE', 'AIR_FINAL',
+  'SMT_QUERY', 'SMT_RESPONSE', 'SMT_TRANSCRIPT',
+];
+const finalizeBannerSections = () => {
+  for (const tab of BANNER_FOLD_TABS) {
+    const raw = sectionCache.get(tab);
+    if (!raw) continue;
+    const { body, foldable, autoFolded } = finalizeBannerBody(raw);
+    sectionCache.set(tab, body);
+    if (foldable.length) sectionFolds.set(tab, foldable);
+    // Reply tab opens fully expanded — replies are short (one-line
+    // `unsat` / `sat` / model dumps), and the user opens this tab
+    // specifically to read them. Sections stay clickable-foldable
+    // via `sectionFolds`, just not collapsed by default.
+    if (autoFolded.length && tab !== 'SMT_RESPONSE') {
+      sectionAutoFolded.set(tab, autoFolded);
+    }
+  }
+};
+// Consolidate the raw `_diags` JSON entries (pushed by the
+// `verus_diagnostic` callback during a wasm call) into the unified
+// `diagnostics` list `renderMeta` reads. Each entry already has
+// rustc-exact spans (`line_start` / `column_start` etc.) and a
+// pre-rendered human form, so the mapping is mostly field renaming.
+const consolidateDiags = () => {
+  for (const j of _diags) {
+    // Skip rustc's "aborting due to N previous errors" footer. It's
+    // a summary of the preceding errors, not a distinct finding —
+    // would otherwise show up redundantly in the DIAGNOSTICS pane.
+    if ((j.message ?? '').startsWith('aborting due to')) continue;
+    const primary = j.spans?.find(s => s.is_primary) ?? j.spans?.[0];
+    const loc = primary ? {
+      line: primary.line_start, col: primary.column_start,
+      endLine: primary.line_end, endCol: primary.column_end,
+    } : null;
+    const sev = j.level === 'warning' ? 'warning'
+             : (j.level === 'note' || j.level === 'help') ? 'note'
+             : 'error';
+    diagnostics.push({ rendered: j.rendered ?? j.message ?? '', loc, severity: sev });
+  }
+};
+// Mode-driven dispatcher. The single trigger button + auto-fire both
+// route here; the radio group picks which pass actually runs.
+// Centralizing this means `scheduleAutoVerify` (timer-driven) and the
+// click handler share one entry point — no risk of "auto-fires verify
+// but click runs execute" drift.
+const runAction = async () => {
+  if (getActionMode() === 'execute') return runProgram();
+  return runVerify();
+};
+const runProgram = () => runWith({
+  fn: () => verus.run(view.state.doc.toString()),
+  onError: (e) => {
+    runOutput.push({ stream: 'stderr', text: `\n[run aborted: ${e?.message ?? e}]\n` });
+  },
+  preferredTab: 'MIR',
+});
+actionButton.addEventListener('click', runAction);
+// Mode switch: persisted via `?mode=execute`. Each variant loads a
+// different libs bundle (verify-flavor lean rmetas vs execute-flavor
+// MIR-encoded rmetas), and those bundles are pinned at wasm-instance
+// init via `wasm_libs_finalize` — so flipping the mode requires a
+// page reload to refetch + re-finalize. We write the URL and let the
+// browser navigation kick off the reload.
+const ACTION_MODE_KEY = 'mode';
+const initialMode = new URLSearchParams(location.search).get(ACTION_MODE_KEY);
+for (const r of actionModeRadios) r.checked = r.value === (initialMode === 'execute' ? 'execute' : 'verify');
+// Single label for both modes — the radio group already conveys which
+// pass will fire; making the button text follow the mode just makes
+// the click feel like two distinct buttons that aren't really there.
+const updateActionLabel = () => {
+  actionButtonLabel.textContent = 'Run';
+};
+updateActionLabel();
+for (const r of actionModeRadios) {
+  r.addEventListener('change', () => {
+    const params = new URLSearchParams(location.search);
+    if (getActionMode() === 'execute') params.set(ACTION_MODE_KEY, 'execute');
+    else params.delete(ACTION_MODE_KEY);
+    const qs = params.toString();
+    location.search = qs ? `?${qs}` : '';
+  });
+}
 // External hash changes (user pastes a different link into the address
 // bar, edits the fragment, hits back/forward on a history entry we
 // wrote) should reload the editor. Our own `replaceState` calls don't
@@ -1729,7 +1847,7 @@ window.addEventListener('hashchange', async () => {
     setEditorText(parsed.src);
     updateSourceUI();
     saveHashNow();
-    runVerify();
+    runAction();
     return;
   }
   // Empty / unparseable hash — fall back to the first example.
@@ -1746,6 +1864,6 @@ renderSubtabs();
 // Hold here until the wasm chain resolves; editor + tabs are already
 // live above so the left pane has been interactive the whole time.
 await wasmReady;
-verifyButtonLabel.textContent = 'Verify';
-verifyButton.disabled = false;
-runVerify();
+updateActionLabel();
+actionButton.disabled = false;
+runAction();

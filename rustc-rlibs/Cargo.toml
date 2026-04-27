@@ -59,3 +59,16 @@ rustc_type_ir = { path = "../third_party/rust/compiler/rustc_type_ir" }
 # *adds* `verus_provide`, and rust_verify calls it explicitly in verifier.rs
 # to override `thir_body` at provider-registration time.
 rustc_mir_build = { path = "../third_party/rust/compiler/rustc_mir_build" }
+
+# Additional rustc crates required by Miri (`extern crate rustc_*;` in
+# `third_party/rust/src/tools/miri/src/lib.rs`). Not used by the verify
+# pipeline; built here so the wasm32 rlibs land in the same deps/ dir
+# that Miri (declared in `verus-explorer/Cargo.toml`) reads via the
+# rustc-wrapper.sh `-L` injection. `rustc_apfloat` is published as a
+# standalone crate, not in the vendored compiler tree.
+rustc_apfloat = "0.2"
+rustc_codegen_ssa = { path = "../third_party/rust/compiler/rustc_codegen_ssa" }
+rustc_const_eval = { path = "../third_party/rust/compiler/rustc_const_eval" }
+rustc_log = { path = "../third_party/rust/compiler/rustc_log" }
+rustc_symbol_mangling = { path = "../third_party/rust/compiler/rustc_symbol_mangling" }
+rustc_target = { path = "../third_party/rust/compiler/rustc_target" }

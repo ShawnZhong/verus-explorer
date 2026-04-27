@@ -62,10 +62,10 @@ dev release: $(DIST)/public.stamp $(DIST)/editor.js $(DIST)/z3/z3.js $(DIST)/z3/
 	wasm-pack build verus-explorer --$@ --target web --out-dir $(CURDIR)/$(DIST) --no-typescript
 	rm -f $(DIST)/package.json $(DIST)/.gitignore
 	rm -rf $(DIST)/libs
-	mkdir -p $(DIST)/libs/std $(DIST)/libs/nostd
-	cp $(LIBS_DIR)/*.gz $(DIST)/libs/
-	cp $(LIBS_DIR)/std/*.gz $(DIST)/libs/std/
+	mkdir -p $(DIST)/libs/nostd $(DIST)/libs/std $(DIST)/libs/exec
 	cp $(LIBS_DIR)/nostd/*.gz $(DIST)/libs/nostd/
+	cp $(LIBS_DIR)/std/*.gz   $(DIST)/libs/std/
+	cp $(LIBS_DIR)/exec/*.gz  $(DIST)/libs/exec/
 
 # Build the patched stage1 rustc. Slow (~10 min first time, rare beyond
 # that). File target rather than phony, because the script's staging

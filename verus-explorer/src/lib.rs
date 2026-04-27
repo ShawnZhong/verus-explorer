@@ -25,10 +25,13 @@
 //             vstd deserialize cache) and VIR → SST → AIR → SMT
 //             → Z3 driver (the bulk).
 //
-// `verify` (below) is the single wasm-bindgen entry that sequences
-// the stages: rustc_parse → dump_ast_pre_expansion → (inside
-// create_and_enter_global_ctxt) dump_ast → dump_hir → build_vir →
-// dump_vir → verify_simplified_krate → VerifyOutput::write.
+// Two wasm-bindgen entries below sequence the per-mode stages:
+//   * `verify` — rustc_parse → dump_ast_pre_expansion → (inside
+//     create_and_enter_global_ctxt) dump_ast → dump_hir → build_vir
+//     → dump_vir → verify_simplified_krate → VerifyOutput::write.
+//   * `run`    — rustc_parse → dump_ast_pre_expansion → (inside
+//     create_and_enter_global_ctxt) dump_ast → dump_hir → dump_mir
+//     → eval_entry (Miri).
 
 #![feature(rustc_private)]
 
@@ -43,6 +46,12 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+// Miri's library entry — `eval_entry(tcx, def_id, entry_type, &config, None)`.
+// `getrandom` is dragged in transitively by Miri's `rand` dep; the
+// `__getrandom_v03_custom` stub in `wasm.rs` wires the custom backend
+// (cfg-selected in `.cargo/config.toml`).
+extern crate miri;
+extern crate getrandom;
 
 use wasm_bindgen::prelude::*;
 
@@ -52,7 +61,7 @@ mod verus;
 mod wasm;
 
 pub use wasm::{perf_now, set_std_mode, wasm_libs_add_file, wasm_libs_finalize};
-use rust::{build_rustc_config, dump_ast, dump_ast_pre_expansion, dump_hir};
+use rust::{build_rustc_config, dump_ast, dump_ast_pre_expansion, dump_hir, dump_mir};
 use util::time;
 use verus::{VerifyOutput, build_vir, dump_vir, verify_simplified_krate};
 use wasm::console_error;
@@ -87,7 +96,7 @@ pub fn init() {
 /// `verus_dump` / `verus_diagnostic*` / `verus_bench` JS externs — no
 /// return value is threaded through.
 #[wasm_bindgen]
-pub fn verify(src: &str, compile_mode: bool) {
+pub fn verify(src: &str) {
     // vstd is wired into the extern prelude via `--extern=vstd` in
     // `build_rustc_config`, so the user's source is passed through unmodified.
     // Keeping the source 1:1 with what the editor shows is what lets
@@ -104,17 +113,7 @@ pub fn verify(src: &str, compile_mode: bool) {
     // ~L2142) and the per-module reporter → DiagCtxt → HumanEmitter path in
     // `verify_stage`, so they land in the DIAGNOSTICS section — we just
     // swallow the `Result`s here and emit whatever we accumulated.
-    // Two mutually exclusive modes:
-    //   * Verification mode (default): full HIR → VIR → AIR → SMT pipeline,
-    //     populates every IR tab. `verus_keep_ghost{,_body}` cfgs are set
-    //     so the `verus!` proc-macro's `cfg_erase()` returns `EraseGhost::Keep`
-    //     and ghost code survives lowering.
-    //   * Compile mode: only the Rust IR tabs (AST_PRE / AST / HIR / HIR_TYPED),
-    //     showing the post-erasure view. The `verus_keep_ghost{,_body}` cfgs
-    //     are unset so `cfg_erase()` returns `EraseGhost::EraseAll`. No VIR /
-    //     AIR / SMT pipeline runs — those tabs simply won't appear. Useful
-    //     for "what does rustc see when Verus compiles this?".
-    rustc_interface::interface::run_compiler(build_rustc_config(src, /* keep_ghost */ !compile_mode), |compiler| {
+    rustc_interface::interface::run_compiler(build_rustc_config(src, /* keep_ghost */ true, /* crate_type_bin */ false), |compiler| {
         let krate = time("rustc_parse", || rustc_interface::passes::parse(&compiler.sess));
         // Pretty-print the parser output — essentially verbatim source wrapped
         // in `verus! { ... }` (plus the implicit `no_std` / register_tool
@@ -132,9 +131,6 @@ pub fn verify(src: &str, compile_mode: bool) {
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             dump_ast(tcx);
             dump_hir(tcx);
-            if compile_mode {
-                return;
-            }
             let Ok((raw_krate, krate, global_ctx, crate_name, spans)) =
                 time("build_vir", || build_vir(compiler, tcx))
             else {
@@ -155,5 +151,84 @@ pub fn verify(src: &str, compile_mode: bool) {
             output.write();
         });
     });
+}
+
+
+/// Drives Miri on the user's source — interprets the program's `fn main`.
+/// Separate wasm-bindgen entry from `verify` so the JS side can opt in
+/// (and so the Miri call site is statically reachable, which prevents the
+/// release-profile linker from DCE'ing all of Miri). Uses the same
+/// `keep_ghost = false` cfg the compile-mode pass uses, so ghost code is
+/// erased at macro expansion before MIR-building. Returns silently when
+/// the source has no entry function (e.g., a verify-only library); any
+/// Miri-reported exit code is currently dropped.
+#[wasm_bindgen]
+pub fn run(src: &str) {
+    let src = src.to_string();
+    // `crate_type = "bin"` flips rustc into binary-crate mode so
+    // `tcx.entry_fn(())` resolves the user's `fn main` as the entry.
+    // The verify / compile-mode passes use `lib` because we never want
+    // rustc to require an entry function for those.
+    rustc_interface::interface::run_compiler(
+        build_rustc_config(src, /* keep_ghost */ false, /* crate_type_bin */ true),
+        |compiler| {
+            let krate = time("run.parse", || rustc_interface::passes::parse(&compiler.sess));
+            // Populate the Rust IR tabs (AST_PRE / AST / HIR / HIR_TYPED)
+            // with the post-erasure view — what `verus --compile` sees,
+            // and what Miri actually interprets. Verify mode populates
+            // them with the ghost-present view via the same dumpers in
+            // `verify`; user toggling between modes swaps which view
+            // shows up.
+            dump_ast_pre_expansion(&krate);
+            rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                dump_ast(tcx);
+                dump_hir(tcx);
+                dump_mir(tcx);
+                // Skip Miri when its preconditions aren't met — both
+                // would otherwise `tcx.dcx().fatal(...)` and trap the
+                // wasm instance (panic=abort on wasm32, no recovery).
+                // Underlying rustc errors ("can't find crate for
+                // `std`", "main function not found in crate") have
+                // already streamed through the diagnostics pane.
+                if tcx.lang_items().start_fn().is_some()
+                    && let Some((entry_id, entry_ty)) = tcx.entry_fn(())
+                {
+                    // Trade soundness checks for interactive speed —
+                    // we're a browser playground, not a UB-finding tool.
+                    // Mirrors Rubri's `-Zmiri-disable-validation` style
+                    // setup. StackedBorrows alone can add 5-10× to
+                    // simple programs; data race + weak memory each
+                    // add another constant factor. Leak backtraces
+                    // are off for a similar reason.
+                    let mut config = miri::MiriConfig::default();
+                    config.validation = miri::ValidationMode::No;
+                    config.borrow_tracker = None;
+                    config.check_alignment = miri::AlignmentCheck::None;
+                    config.data_race_detector = false;
+                    config.weak_memory_emulation = false;
+                    config.collect_leak_backtraces = false;
+                    config.ignore_leaks = true;
+                    config.preemption_rate = 0.0;
+                    config.fixed_scheduling = true;
+                    let result = time("run.miri", || {
+                        miri::eval_entry(tcx, entry_id, miri::MiriEntryFnType::Rustc(entry_ty), &config, None)
+                    });
+                    let summary = match result {
+                        Ok(()) => "[run] program exited with code 0\n".to_string(),
+                        Err(code) => format!("[run] program exited with code {}\n", code.get()),
+                    };
+                    wasm::verus_run_stderr(&summary);
+                }
+                // `run_compiler` calls `dcx().abort_if_errors()` after
+                // this closure returns — which panics on wasm32 if any
+                // diagnostic raised an error during compilation (e.g.
+                // a parse error in the user's source). Reset the
+                // counter so we exit cleanly. The actual error text
+                // already flowed through the JsonEmitter to
+                // `verus_diagnostic`, so the user sees it.
+                tcx.dcx().reset_err_count();
+            });
+        },
+    );
 }
 

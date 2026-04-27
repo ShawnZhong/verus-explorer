@@ -14,3 +14,9 @@
 	path = third_party/rust
 	url = https://github.com/ShawnZhong/rust.git
 	branch = main
+[submodule "third_party/browser_wasi_shim"]
+	path = third_party/browser_wasi_shim
+	url = https://github.com/bjorn3/browser_wasi_shim
+[submodule "third_party/rubri"]
+	path = third_party/rubri
+	url = https://github.com/LyonSyonII/rubri

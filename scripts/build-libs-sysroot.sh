@@ -18,12 +18,15 @@
 #
 # Produces, in order:
 #   1. core + alloc + std (+ their wasm32 dep graph: libc, dlmalloc,
-#      hashbrown, unwind, panic_{abort,unwind}, std_detect,
+#      hashbrown, unwind, panic_{adopt,unwind}, std_detect,
 #      rustc_demangle, cfg_if, compiler_builtins) — the check-only
-#      rmeta flavor from `x.py check`. Lacks the non-const-fn MIR that
-#      x.py's full build bakes in for downstream codegen, so ~5.8 MB
-#      gzipped slimmer and safe because rustc-in-wasm never codegens
-#      user code.
+#      rmeta flavor from `x.py check`, but with `-Zalways-encode-mir`
+#      so the rmeta carries function MIR in addition to the metadata
+#      surface. Miri (linked into the wasm crate) needs MIR for every
+#      function the user's program transitively calls — without the
+#      flag, `create_ecx` tcx.dcx().fatal()s on the libcore sentinel
+#      check (`core::ascii::escape_default`'s MIR availability). The
+#      cost is about 5.8 MB gzipped on top of the bare check rmetas.
 #   2. verus_builtin — registers the `#[rustc_diagnostic_item = ...]`
 #      names Verus looks up.
 #   3. verus_builtin_macros, verus_state_machines_macros — `--cfg=
@@ -48,7 +51,29 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 repo="$PWD"
 
-out="${1:-target/libs-sysroot}"
+# Two-flavor build:
+#   * verify sysroot — small, no MIR. Verify mode never interprets MIR
+#     so we ship the lean rmeta-only flavor: ~3 MB gzipped libcore.
+#   * execute sysroot — MIR-encoded (`-Zalways-encode-mir`) +
+#     `--cfg=verus_explorer` so libstd's wasm32 stdio routes through
+#     Miri's `miri_write_to_*` shims. ~13 MB gzipped libcore — Miri
+#     needs the MIR to interpret std fns the user's program calls.
+#
+# Usage: $0 [out-dir] [--mir]
+#   out-dir defaults to `target/libs-sysroot-verify` (lean) when
+#   `--mir` is not passed, `target/libs-sysroot-execute` when it is.
+flavor=verify
+extra_rustflags=
+out=
+for a in "$@"; do
+    case "$a" in
+        --mir) flavor=execute;
+               extra_rustflags="-Zalways-encode-mir --cfg=verus_explorer --check-cfg=cfg(verus_explorer)" ;;
+        --*)   echo "unknown flag '$a'" >&2; exit 1 ;;
+        *)     out="$a" ;;
+    esac
+done
+: "${out:=target/libs-sysroot-$flavor}"
 lib="$out/lib/rustlib/wasm32-unknown-unknown/lib"
 
 # Wipe any stale artifacts — otherwise a renamed or removed crate would
@@ -66,12 +91,40 @@ export RUSTC_BOOTSTRAP=1
 HOST_TRIPLE=$("$RUSTC" -vV | awk '/^host:/ {print $2}')
 
 # Step 1: run `x.py check` against the already-built stage1 compiler.
-# Emits metadata-only rmetas (no non-const-fn MIR) into
-# third_party/rust/build/<host>/stage1-std/wasm32-unknown-unknown/
-# release/deps/, distinguished from `x.py build`'s rlib+rmeta pairs by
-# SVH hash. Incremental — near-no-op on re-run.
+# Emits rmetas into third_party/rust/build/<host>/stage1-std/
+# wasm32-unknown-unknown/release/deps/, distinguished from `x.py
+# build`'s rlib+rmeta pairs by SVH hash. Incremental — near-no-op on
+# re-run.
+#
+# `RUSTFLAGS_NOT_BOOTSTRAP="-Zalways-encode-mir"` forces non-const-fn
+# MIR into the rmetas so Miri (linked into our wasm) can interpret
+# libcore/liballoc/libstd. Bootstrap's RUSTFLAGS conventions:
+# `RUSTFLAGS_BOOTSTRAP` flows to stage 0 (the bootstrap compiler
+# itself); `RUSTFLAGS_NOT_BOOTSTRAP` flows to stage 1+ rustc
+# invocations of "normal" target crates — which is exactly the stage1
+# libstd build we drive here. Plain `RUSTFLAGS` gets scrubbed by
+# bootstrap. Set both to be safe in case the conventions ever flip.
+# Wipe x.py's stage1-std incremental cache to force a from-scratch
+# rebuild every time. Without this, toggling RUSTFLAGS_NOT_BOOTSTRAP
+# (e.g., when adding/removing `-Zalways-encode-mir`) leaves a stale
+# libstd compiled against the previous flag set's libcore — vstd
+# downstream then trips E0460 "found possibly newer version of crate
+# core which std depends on" because the SVHs no longer line up.
+# x.py's own incremental tracking doesn't catch this since the flag
+# is supplied via env, not via its config.toml.
+rm -rf "$repo/third_party/rust/build/$HOST_TRIPLE/stage1-std"
+
+# Execute-flavor extras (set above): `-Zalways-encode-mir` so Miri can
+# interpret libcore/liballoc/libstd, plus `--cfg=verus_explorer` which
+# our patches in `library/std/src/sys/stdio/unsupported.rs` read to
+# route wasm32 `Stdout`/`Stderr` through Miri's `miri_write_to_*`
+# shims (forwarded to the `__verus_explorer_stdout/stderr` externs).
+# Verify flavor builds without these — leaner rmetas, faster cold load.
 set -x
-(cd "$repo/third_party/rust" && ./x.py check --stage 1 library --target wasm32-unknown-unknown)
+(cd "$repo/third_party/rust" && \
+    RUSTFLAGS_BOOTSTRAP="$extra_rustflags" \
+    RUSTFLAGS_NOT_BOOTSTRAP="$extra_rustflags" \
+    ./x.py check --stage 1 library --target wasm32-unknown-unknown)
 { set +x; } 2>/dev/null
 
 stage1_std_deps="$repo/third_party/rust/build/$HOST_TRIPLE/stage1-std/wasm32-unknown-unknown/release/deps"

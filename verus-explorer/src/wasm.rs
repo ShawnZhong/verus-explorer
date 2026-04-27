@@ -104,6 +104,33 @@ extern "C" {
 
     #[wasm_bindgen(js_name = verus_bench)]
     pub(crate) fn verus_bench(label: &str, ms: f64);
+
+    // Stdout / stderr from Miri-interpreted user programs. Each call is
+    // one `write()` syscall the program made (typically a buffered chunk
+    // from `print!`/`println!`); the host concatenates them into a
+    // run-output pane.
+    #[wasm_bindgen(js_name = verus_run_stdout)]
+    pub(crate) fn verus_run_stdout(text: &str);
+    #[wasm_bindgen(js_name = verus_run_stderr)]
+    pub(crate) fn verus_run_stderr(text: &str);
+}
+
+// Bridges from Miri's patched `impl FileDescription for io::Stdout/Stderr`
+// (see `third_party/rust/src/tools/miri/src/shims/files.rs`) to the
+// `verus_run_stdout` / `verus_run_stderr` JS externs above. Bytes come
+// straight from interpreter memory via `read_bytes_ptr_strip_provenance`,
+// so they're trusted-sourced (Miri already validated provenance) and
+// utf-8-lossy is safe — non-utf8 user output renders as replacement
+// chars rather than panicking.
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __verus_explorer_stdout(ptr: *const u8, len: usize) {
+    let text = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(ptr, len) });
+    verus_run_stdout(&text);
+}
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __verus_explorer_stderr(ptr: *const u8, len: usize) {
+    let text = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(ptr, len) });
+    verus_run_stderr(&text);
 }
 
 // -------- In-wasm libs filesystem --------
@@ -205,4 +232,20 @@ fn wasm_libs_read(path: &Path) -> Option<&'static [u8]> {
 /// surfaces as a clean bincode deserialization error upstream.
 pub(crate) fn wasm_libs_vstd_vir() -> &'static [u8] {
     wasm_libs().files.iter().find(|(n, _)| *n == VSTD_VIR).map(|(_, d)| *d).unwrap_or_default()
+}
+
+// `getrandom 0.3` custom backend, paired with `getrandom_backend="custom"`
+// in `.cargo/config.toml` and `features = ["custom"]` on the dep. Miri
+// pulls `rand`/`getrandom` in across its core for non-deterministic
+// scheduling, allocation, and intrinsics; with this stub returning all
+// zeros, every `StdRng` Miri seeds is a fixed-point — exactly what we
+// want for reproducible explorer output (and avoids a JS `crypto`
+// roundtrip per RNG call).
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    unsafe { core::ptr::write_bytes(dest, 0, len) };
+    Ok(())
 }

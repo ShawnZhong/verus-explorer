@@ -66,4 +66,10 @@ rustflags = ["--allow=unexpected_cfgs"]
 rustflags = [
     "--allow=unexpected_cfgs",
     "-C", "link-arg=-zstack-size=67108864",
+    # Miri pulls in `getrandom 0.3`, which on wasm32-unknown-unknown
+    # requires both the `custom` feature (set in rustc-rlibs/Cargo.toml)
+    # and this cfg so the crate's backend dispatch routes through our
+    # `__getrandom_v03_custom` stub in `verus-explorer/src/wasm.rs`
+    # rather than firing its `compile_error!` for the unsupported target.
+    "--cfg=getrandom_backend=\"custom\"",
 ]

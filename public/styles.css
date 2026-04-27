@@ -248,13 +248,42 @@ pre {
   gap: .5em 1em;
   margin-top: .5em;
 }
-/* Hold width across the Verify ↔ Verify… label swap so the row
-   doesn't reflow. Sized to fit "Verify…" with default button padding;
-   cold-load labels still push past, but the button is disabled then
-   and the one-time width shift isn't perceived as jitter. */
-#verify-run {
-  min-width: 7em;
+/* Push the trailing checkboxes (Auto, Use std) to the right edge of
+   the controls row. `margin-left: auto` on a flex child collapses the
+   gap before it, so this acts as a spacer regardless of how many
+   items sit on its left. */
+.controls-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 1em;
 }
+/* Pin the idle width so a click-then-busy swap (label disappears,
+   spinner appears) doesn't shrink the button mid-flight. Sized to
+   fit "Run" with default button padding — the cold-load
+   `Loading … libs…` text intentionally pushes past during pre-roll;
+   the button is disabled then so the one-time width shift isn't
+   perceived as jitter. */
+#action-run {
+  min-width: 4em;
+}
+/* Busy state: hide the label, show a small CSS ring centered in the
+   button's place. `.busy` is toggled by `runVerify` / `runProgram`
+   on entry / cleanup. Pure CSS animation — browser handles the
+   frame loop. */
+#action-run.busy #action-run-label { display: none; }
+#action-run.busy::after {
+  content: '';
+  display: inline-block;
+  width: .9em;
+  height: .9em;
+  vertical-align: -.15em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: action-spin .8s linear infinite;
+}
+@keyframes action-spin { to { transform: rotate(360deg); } }
 /* Prev/next buttons flanking the example dropdown: small chevron pills
    that sit inline with the dropdown at matching height. */
 .source-nav {
@@ -435,6 +464,18 @@ label.hint > input[type="checkbox"] {
   border: 1px solid var(--bad-border);
 }
 .verdict-status { font-size: 1rem; font-weight: bold; }
+/* Run output: distinct from rustc diagnostics — monospace block per
+   stream (stdout vs stderr), inside the verdict-style container so it
+   sits in the same visual band as the verify verdict. Stderr is dimmed
+   slightly so a stack of `[run]` status lines doesn't overpower the
+   user's actual `print!` output. */
+.run-output {
+  font-family: var(--mono, monospace);
+  font-size: .85em;
+  margin: .3em 0 0;
+  white-space: pre-wrap;
+}
+.run-output-stderr { color: var(--muted-fg, #888); }
 /* Per-span colors keep the ✓ green and ✗ red inside the headline
    even when the row is bad-state (any failure → bad-bg container).
    Plain spans (e.g. the trailing error count) inherit the regular

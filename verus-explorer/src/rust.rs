@@ -53,7 +53,11 @@ pub(crate) fn dump_ast_pre_expansion(krate: &rustc_ast::Crate) {
 //     matching what `verus --compile` hands rustc for codegen. We don't
 //     use `EraseGhost::EraseAll` (neither cfg set) because that path is
 //     for third-party deps Verus never touched, not for the user's crate.
-pub(crate) fn build_rustc_config(src: String, keep_ghost: bool) -> rustc_interface::interface::Config {
+//
+// `crate_type_bin` flips `--crate-type` between `lib` (verify / compile-
+// mode) and `bin` (run-mode, where Miri needs `tcx.entry_fn()` to
+// resolve the user's `fn main`).
+pub(crate) fn build_rustc_config(src: String, keep_ghost: bool, crate_type_bin: bool) -> rustc_interface::interface::Config {
     // Put `vstd` and `verus_builtin` in the edition-2018+ extern prelude so
     // user code can `use vstd::prelude::*;` / `use verus_builtin::*;` directly
     // — same flags native Verus's driver and test harness pass. We used to
@@ -61,16 +65,26 @@ pub(crate) fn build_rustc_config(src: String, keep_ghost: bool) -> rustc_interfa
     // diagnostic's line number by one, breaking the editor's error-line
     // highlight. No `=PATH` needed: rustc's crate locator finds the rmetas
     // via the libs sysroot bundle.
-    let mut argv: Vec<String> = ["--edition=2021", "--crate-type=lib", "--crate-name=v",
+    let crate_type = if crate_type_bin { "--crate-type=bin" } else { "--crate-type=lib" };
+    let mut argv: Vec<String> = ["--edition=2021", crate_type, "--crate-name=v",
         "--sysroot=/virtual", "--extern=vstd", "--extern=verus_builtin"]
         .into_iter().map(String::from).collect();
+    // `--crate-type=bin` would otherwise drive rustc all the way through
+    // codegen + link, which fails because our sysroot ships rmetas (not
+    // rlibs). Miri uses tcx queries directly — it doesn't need linked
+    // output — so `--emit=metadata` short-circuits before codegen.
+    if crate_type_bin {
+        argv.push("--emit=metadata".into());
+    }
     // Feature gates, `register_tool(...)`, and the native subset of lint
     // allows come straight from `rust_verify::config`, so any upstream rustc
     // flag drift tracks automatically instead of requiring a hand-maintained
     // mirror. `syntax_macro = true` because user input always runs through
-    // `verus!`; `erase_ghost = false` is currently ignored by the function.
+    // `verus!`. `erase_ghost` is currently ignored by the upstream
+    // function (parameter is `_`-prefixed); we still pass `!keep_ghost`
+    // so intent is correct if Verus ever wires it up.
     rust_verify::config::enable_default_features_and_verus_attr(
-        &mut argv, /* syntax_macro */ true, /* erase_ghost */ false,
+        &mut argv, /* syntax_macro */ true, /* erase_ghost */ !keep_ghost,
     );
     // Explorer-specific additions on top of the upstream set:
     //   * `proc_macro_hygiene` — the wasm shim registers Verus macros via
@@ -92,7 +106,14 @@ pub(crate) fn build_rustc_config(src: String, keep_ghost: bool) -> rustc_interfa
     // `use vstd::prelude::*` but can't reach into std::*. Std mode
     // (default) omits the attr; rustc then injects the std prelude and
     // the full-fat vstd bundle is active.
-    if !std_mode() {
+    //
+    // Run mode (`crate_type_bin = true`) forces std regardless of the
+    // toggle: Miri needs the `start` lang item (in libstd), and user
+    // programs typically use `println!` / `eprintln!` (in libstd's
+    // prelude). The std libs are loaded by JS only in std mode, so a
+    // nostd-mode page that hits Run will still fail at libcore/libstd
+    // resolution — the JS side surfaces a clearer message there.
+    if !std_mode() && !crate_type_bin {
         argv.push("-Zcrate-attr=no_std".into());
     }
 
@@ -299,6 +320,70 @@ pub(crate) fn dump_hir(tcx: TyCtxt<'_>) {
             }
         });
         emit_section("HIR_TYPED", body);
+    });
+}
+
+// Walk top-level functions and pretty-print each one's MIR at three
+// lowering stages, the form Miri ultimately interprets being the last:
+//   * `mir_built` — raw MIR right after THIR lowering. Borrows still
+//     implicit, drops not yet inserted.
+//   * `mir_drops_elaborated_and_const_checked` — drops made explicit,
+//     const-checking applied. The "ready to optimize" form.
+//   * `optimized_mir` — post all MIR opt passes. Exactly what Miri
+//     consumes via `eval_entry`.
+// Order matters: each query returns `&Steal<Body>` and the next stage
+// steals the previous one's output. Once stolen, accessing the
+// earlier query panics — so we walk the stages in lowering order and
+// don't hold a `Ref` across query calls. Methods inside `impl` blocks
+// are reached via `hir_impl_item` so they don't silently drop.
+// Constants / statics also have MIR but we skip them for now — most
+// user programs care about fn bodies.
+pub(crate) fn dump_mir(tcx: TyCtxt<'_>) {
+    use rustc_hir::{ItemKind, def_id::LocalDefId};
+    use rustc_middle::mir::pretty::MirWriter;
+    time("dump.mir", || {
+        // Collect mir-available fn LocalDefIds once; the per-stage
+        // loops below all walk the same set in the same order.
+        let mut def_ids = Vec::<LocalDefId>::new();
+        let mut collect = |did: LocalDefId| {
+            if tcx.is_mir_available(did.to_def_id()) {
+                def_ids.push(did);
+            }
+        };
+        for item_id in tcx.hir_free_items() {
+            let item = tcx.hir_item(item_id);
+            match item.kind {
+                ItemKind::Fn { .. } => collect(item.owner_id.def_id),
+                ItemKind::Impl(impl_) => {
+                    for impl_item_ref in impl_.items {
+                        let impl_item = tcx.hir_impl_item(*impl_item_ref);
+                        if let rustc_hir::ImplItemKind::Fn(_, _) = impl_item.kind {
+                            collect(impl_item.owner_id.def_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let writer = MirWriter::new(tcx);
+        let emit_stage = |section: &'static str, write: &mut dyn FnMut(LocalDefId, &mut Vec<u8>)| {
+            let mut buf = Vec::<u8>::new();
+            for &did in &def_ids {
+                write(did, &mut buf);
+                buf.extend_from_slice(b"\n");
+            }
+            emit_section(section, String::from_utf8_lossy(&buf).into_owned());
+        };
+        emit_stage("MIR_BUILT", &mut |did, buf| {
+            let _ = writer.write_mir_fn(&tcx.mir_built(did).borrow(), buf);
+        });
+        emit_stage("MIR_DROPS", &mut |did, buf| {
+            let _ = writer.write_mir_fn(&tcx.mir_drops_elaborated_and_const_checked(did).borrow(), buf);
+        });
+        emit_stage("MIR_OPT", &mut |did, buf| {
+            let _ = writer.write_mir_fn(tcx.optimized_mir(did.to_def_id()), buf);
+        });
     });
 }
 

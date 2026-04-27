@@ -23,25 +23,45 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 OUT=target/libs
-SYSROOT_LIB=target/libs-sysroot/lib/rustlib/wasm32-unknown-unknown/lib
 LIBS_VIR=target/libs-vir
+VERIFY_SYSROOT=target/libs-sysroot-verify/lib/rustlib/wasm32-unknown-unknown/lib
+EXEC_SYSROOT=target/libs-sysroot-execute/lib/rustlib/wasm32-unknown-unknown/lib
 
-# Full libs pipeline in source order — Make only invokes this script
-# when an upstream dep moved, so unconditionally re-running each stage
-# here is correct. The stages themselves are internally incremental
-# where they can be (`x.py check` in build-libs-sysroot.sh), but the
-# top-level `rm -rf + rebuild` they each do is fine because Make's
-# dep tracking already gates this script on changes worth rebuilding
-# for.
+# Layout produced (one subdir per `(mode, std-flag)` combination —
+# JS picks based on `?std=1` + the mode radio):
+#
+#   target/libs/
+#     nostd/  — verify, no_std       — lean rmetas + alloc-flavor vstd
+#     std/    — verify, with libstd  — lean rmetas + std-flavor vstd
+#     exec/   — execute, with libstd — MIR-encoded rmetas + libpanic_abort
+#                                    + std-flavor vstd (no MIR)
+#
+# `nostd` and `std` share a verify-flavor sysroot (no MIR). `exec`
+# uses the execute-flavor sysroot (MIR-encoded). `exec` ships vstd
+# too — `use vstd::prelude::*` and `verus!{}` need to type-check /
+# macro-expand even when run-mode code never calls a vstd item at
+# runtime. vstd itself is built without MIR (rust_verify doesn't
+# thread `-Zalways-encode-mir` today), so a Miri call into a vstd
+# fn would fail — rare for run-mode programs.
+#
+# Two `x.py check` invocations + two vstd builds. Cold rebuild ~5 min
+# more than single-flavor; incremental near-zero (x.py's own caches
+# subset by RUSTFLAGS). Worth it: verify-only users (the majority)
+# save ~22 MB gzipped on cold load by not carrying execute-flavor MIR.
 ./scripts/build-libs-sysroot.sh
-./scripts/build-libs-vir.sh std
-./scripts/build-libs-vir.sh nostd
+./scripts/build-libs-sysroot.sh --mir
+SYSROOT=target/libs-sysroot-verify  ./scripts/build-libs-vir.sh std
+SYSROOT=target/libs-sysroot-verify  ./scripts/build-libs-vir.sh nostd
+# Execute-flavor vstd: built against the execute sysroot so libstd
+# SVHs line up with the rest of the exec/ bundle. Output dir is
+# `target/libs-vir/exec` (3rd arg to build-libs-vir.sh); without it
+# we'd clobber the verify-flavor `target/libs-vir/std/`.
+SYSROOT=target/libs-sysroot-execute ./scripts/build-libs-vir.sh std target/libs-vir/exec
 
-# Needed by both modes. libcore + liballoc + libcompiler_builtins cover
-# the no_std dependency graph; the verus_* rmetas are the Verus runtime
-# shims (verus_builtin) and decl_macro stubs (the two `*_macros` ones)
-# that every vstd / user build needs for name resolution.
-SHARED=(
+# `verus_*` rmetas (verus_builtin + the two macro stubs) plus the
+# nostd dep graph (libcore / liballoc / libcompiler_builtins) — needed
+# by every variant.
+NOSTD_BASE=(
     libcore.rmeta
     liballoc.rmeta
     libcompiler_builtins.rmeta
@@ -49,10 +69,9 @@ SHARED=(
     libverus_builtin_macros.rmeta
     libverus_state_machines_macros.rmeta
 )
-
 # libstd plus the wasm32 dep chain rustc's crate locator eagerly walks
-# when libstd is present (std-mode only).
-STD_ONLY=(
+# when libstd is present.
+STD_EXTRAS=(
     libstd.rmeta
     libcfg_if.rmeta
     libdlmalloc.rmeta
@@ -64,19 +83,30 @@ STD_ONLY=(
     libstd_detect.rmeta
     libunwind.rmeta
 )
+# Execute mode adds the panic runtime — `--crate-type=bin` requires
+# one even at `--emit=metadata`, and wasm32's default is `panic_abort`.
+EXEC_EXTRAS=("${STD_EXTRAS[@]}" libpanic_abort.rmeta)
 
 # `rm -rf` keeps the directory clean: if a name disappears from
-# `SHARED` / `STD_ONLY` above, the old `.rmeta(.gz)` sibling doesn't
-# linger in dist/ and confuse the rustc-in-wasm crate locator.
+# the lists above, the old `.rmeta(.gz)` sibling doesn't linger in
+# dist/ and confuse the rustc-in-wasm crate locator.
 rm -rf "$OUT"
-mkdir -p "$OUT/std" "$OUT/nostd"
+mkdir -p "$OUT/nostd" "$OUT/std" "$OUT/exec"
 
-for f in "${SHARED[@]}";   do cp -l "$SYSROOT_LIB/$f" "$OUT/$f";      done
-for f in "${STD_ONLY[@]}"; do cp -l "$SYSROOT_LIB/$f" "$OUT/std/$f";  done
-
-cp "$LIBS_VIR/std/libvstd.rmeta"   "$LIBS_VIR/std/vstd.vir"   "$OUT/std/"
+# nostd: verify sysroot, alloc-flavor vstd.
+for f in "${NOSTD_BASE[@]}"; do cp -l "$VERIFY_SYSROOT/$f" "$OUT/nostd/$f"; done
 cp "$LIBS_VIR/nostd/libvstd.rmeta" "$LIBS_VIR/nostd/vstd.vir" "$OUT/nostd/"
 
-gzip -kf9 "$OUT"/*.rmeta \
-          "$OUT/std"/*.rmeta "$OUT/std/vstd.vir" \
-          "$OUT/nostd"/*.rmeta "$OUT/nostd/vstd.vir"
+# std (verify): verify sysroot, std-flavor vstd.
+for f in "${NOSTD_BASE[@]}";  do cp -l "$VERIFY_SYSROOT/$f" "$OUT/std/$f";   done
+for f in "${STD_EXTRAS[@]}"; do cp -l "$VERIFY_SYSROOT/$f" "$OUT/std/$f";   done
+cp "$LIBS_VIR/std/libvstd.rmeta"   "$LIBS_VIR/std/vstd.vir"   "$OUT/std/"
+
+# exec: execute sysroot (MIR-encoded everything) + execute-flavor vstd.
+for f in "${NOSTD_BASE[@]}"; do cp -l "$EXEC_SYSROOT/$f" "$OUT/exec/$f"; done
+for f in "${EXEC_EXTRAS[@]}"; do cp -l "$EXEC_SYSROOT/$f" "$OUT/exec/$f"; done
+cp "$LIBS_VIR/exec/libvstd.rmeta"  "$LIBS_VIR/exec/vstd.vir"  "$OUT/exec/"
+
+gzip -kf9 "$OUT/nostd"/*.rmeta "$OUT/nostd/vstd.vir" \
+          "$OUT/std"/*.rmeta   "$OUT/std/vstd.vir" \
+          "$OUT/exec"/*.rmeta  "$OUT/exec/vstd.vir"
