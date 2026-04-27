@@ -131,24 +131,32 @@ pub fn verify(src: &str) {
         rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             dump_ast(tcx);
             dump_hir(tcx);
-            let Ok((raw_krate, krate, global_ctx, crate_name, spans)) =
+            if let Ok((raw_krate, krate, global_ctx, crate_name, spans)) =
                 time("build_vir", || build_vir(compiler, tcx))
-            else {
-                return;
-            };
-            dump_vir(&raw_krate, &krate);
-            // `output` threaded in by-ref so dumps from earlier pipeline
-            // stages survive a later failure — upstream Verus bails with `?`
-            // on the first module error, which would otherwise discard every
-            // SST / AIR / SMT section accumulated and leave the UI showing
-            // only VIR.
-            let mut output = VerifyOutput::default();
-            let _ = time("verify", || {
-                verify_simplified_krate(
-                    krate, global_ctx, crate_name, compiler, &spans, &mut output,
-                )
-            });
-            output.write();
+            {
+                dump_vir(&raw_krate, &krate);
+                // `output` threaded in by-ref so dumps from earlier pipeline
+                // stages survive a later failure — upstream Verus bails with `?`
+                // on the first module error, which would otherwise discard every
+                // SST / AIR / SMT section accumulated and leave the UI showing
+                // only VIR.
+                let mut output = VerifyOutput::default();
+                let _ = time("verify", || {
+                    verify_simplified_krate(
+                        krate, global_ctx, crate_name, compiler, &spans, &mut output,
+                    )
+                });
+                output.write();
+            }
+            // `run_compiler` calls `dcx().abort_if_errors()` after this
+            // closure returns — which panics on wasm32 (panic=abort) if
+            // any diagnostic raised an error. Verification failures /
+            // type errors / build_vir failures all set the err count,
+            // so we'd trap on every failed verify. Reset unconditionally
+            // — the JsonEmitter already streamed every diagnostic to the
+            // JS side, so the user sees the real errors regardless. Same
+            // pattern as `run()`.
+            tcx.dcx().reset_err_count();
         });
     });
 }
