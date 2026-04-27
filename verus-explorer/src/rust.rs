@@ -76,7 +76,7 @@ pub(crate) fn build_rustc_config(src: String, mode: Mode) -> rustc_interface::in
     // highlight. No `=PATH` needed: rustc's crate locator finds the rmetas
     // via the libs sysroot bundle.
     let crate_type = if exec_mode { "--crate-type=bin" } else { "--crate-type=lib" };
-    let mut argv: Vec<String> = ["--edition=2021", crate_type, "--crate-name=v",
+    let mut argv: Vec<String> = ["--edition=2021", crate_type, "--crate-name=verus_explorer",
         "--sysroot=/virtual", "--extern=vstd", "--extern=verus_builtin"]
         .into_iter().map(String::from).collect();
     // `--crate-type=bin` would otherwise drive rustc all the way through
